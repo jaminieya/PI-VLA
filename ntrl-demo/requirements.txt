@@ -1,0 +1,19 @@
+# Pip dependencies for ntrl-demo
+# Use after: conda env create -f environment.yml && conda activate ntrl-demo
+# Or for manual PyTorch+CUDA install: pip install -r requirements.txt
+# (with: pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 torchaudio==0.12.1 --extra-index-url https://download.pytorch.org/whl/cu113)
+
+# Core (usually installed via conda environment.yml)
+pickle5
+libigl
+pytorch_kinematics
+configargparse
+scipy
+
+# KD-tree and autodiff (used in speed_sampling_arm_normal.py)
+torch-kdtree
+functorch
+
+# Visualization (used in tests/arm_plan_stat.py)
+trimesh
+pyglet<2  # trimesh.viewer.windowed requires pyglet 1.x

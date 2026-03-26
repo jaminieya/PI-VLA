@@ -971,7 +971,6 @@ if __name__ == '__main__':
 
     envs = []
     ur5e_handles = []
-    body_cam_handles = []
     camera_candidates = []
     # chosen_object = []
     chosen_scale = []
@@ -1091,12 +1090,13 @@ if __name__ == '__main__':
             objs_manager.registerObjects(obstacle_objs)
             objs_manager.setup()
 
-        # set up global camera to record configuration
-        body_cam_handles.append(gym.create_camera_sensor(envs[-1], camera_props))
-        viewpoint_candidate = gymapi.Vec3(3, 0, 0.3)
-        gym.set_camera_location(body_cam_handles[-1], envs[-1],
-                                viewpoint_candidate,
-                                camera_focus)
+        # Top-down camera above table (only camera - wrist view removed)
+        # top_cam_handle = gym.create_camera_sensor(envs[-1], camera_props)
+        # table_center_x = table_pose.p.x
+        # table_center_y = table_pose.p.y
+        # top_cam_pos = gymapi.Vec3(table_center_x, table_center_y, 3.2)
+        # top_cam_target = gymapi.Vec3(table_center_x, table_center_y, 0.1)
+        # gym.set_camera_location(top_cam_handle, envs[-1], top_cam_pos, top_cam_target)
 
         # Top-down camera above table
         top_cam_handle = gym.create_camera_sensor(envs[-1], camera_props)
@@ -1104,23 +1104,24 @@ if __name__ == '__main__':
         table_center_y = table_pose.p.y
         
         # Keep the tiny 1mm offset to Y to prevent the vertical singularity (gimbal lock)
-        top_cam_pos = gymapi.Vec3(table_pose.p.x, table_pose.p.y + 0.001, 2)
-        top_cam_target = gymapi.Vec3(table_pose.p.x - 0.5, table_pose.p.y, table_pose.p.z)
+        top_cam_pos = gymapi.Vec3(table_center_x, table_center_y + 0.001, 1.6)
+        top_cam_target = gymapi.Vec3(table_center_x, table_center_y, 0.0)
         
         # camera_handle goes first, then the environment
         gym.set_camera_location(top_cam_handle, envs[-1], top_cam_pos, top_cam_target)
 
-        # Side view camera (same as viewer: 2.2, 0, 0.5 looking at 0, 0, 0.5)
+        # Side view camera (from +X, looking at table center)
         side_cam_handle = gym.create_camera_sensor(envs[-1], camera_props)
-        side_cam_pos = gymapi.Vec3(2.2, 0, 0.5)
-        side_cam_target = gymapi.Vec3(0, 0, 0.5)
+        side_cam_pos = gymapi.Vec3(table_center_x + 1.2, table_center_y, table_dims.z + 0.5)
+        side_cam_target = gymapi.Vec3(table_center_x, table_center_y, table_dims.z + 0.05)
         gym.set_camera_location(side_cam_handle, envs[-1], side_cam_pos, side_cam_target)
 
     #*************************************************************************************************#
 
     #*************************************************************************************************#
-    cam_pos = gymapi.Vec3(2.2, 0, 0.5)
-    cam_target = gymapi.Vec3(0, 0, 0.5)
+    # Viewer camera: top-down over the table center
+    cam_pos = gymapi.Vec3(table_pose.p.x, table_pose.p.y + 0.001, 1.8)
+    cam_target = gymapi.Vec3(table_pose.p.x, table_pose.p.y, table_pose.p.z)
     if viewer is not None:
         gym.viewer_camera_look_at(viewer, None, cam_pos, cam_target)
     gym.set_light_parameters(sim, 0, gymapi.Vec3(0.3, 0.3, 0.3), gymapi.Vec3(1.0, 1.0, 1.0),

@@ -1,3 +1,46 @@
 # GitHub rejects files > 100 MB; keep large archives out of the repo
 hanwen_grasping/archive/Starter_code.zip
+
+# Byte-compiled / cache
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables & secrets (do not commit)
+.env
+.env.*
+!.env.example
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs & temp
+*.log
+*.tmp
+*.swp
+*~
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+
+# ML / experiment tooling (local runs)
+wandb/
+mlruns/
+lightning_logs/

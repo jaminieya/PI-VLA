@@ -44,3 +44,15 @@ Thumbs.db
 wandb/
 mlruns/
 lightning_logs/
+
+# Training checkpoints & run outputs (large; regenerate locally)
+ntrl-demo/Experiments/
+
+# Collected runtime outputs from grasping scripts
+hanwen_grasping/saved_as_result/
+
+# Large meshes / URDF / point clouds — keep locally or fetch via script/release
+hanwen_grasping/assets/
+
+# Scene & robot datasets — download or prepare locally; paths stay in code
+ntrl-demo/datasets/

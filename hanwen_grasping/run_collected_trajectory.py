@@ -6,7 +6,9 @@
 #
 # Run: cd hanwen_grasping && python run_collected_trajectory.py --h5_path ../collected_data/grasp_6dof_demo_YYYYMMDD_HHMMSS.h5
 #      python run_collected_trajectory.py --h5_path ../collected_data/grasp_6dof_demo_20260308_174106.h5 --record
-#      python run_collected_trajectory.py --h5_path ... --object_index 5 --object_pos 0.5,0.0,0.18  # show object at (0.5,0,0.18)
+#      Default --record writes ../output/trajectory_evaluation/YYYYMMDD_HHMMSS/original.mp4 and episode_meta.txt
+#      python run_collected_trajectory.py --h5_path ... --no_h5_object   # replay without YCB object
+#      python run_collected_trajectory.py --h5_path ... --object_index 5 --object_pos 0.5,0.0,0.18  # manual object
 #
 
 from scipy.spatial.transform import Rotation as R
@@ -28,6 +30,7 @@ sys.path.append(grasp_util_dir)
 
 from stl_reader import stl_reader
 from obj_reader import obj_reader
+import h5_episode_viz as h5viz
 
 # Parameters (same structure as new_setup.py)
 num_of_envs = 1
@@ -72,6 +75,34 @@ def load_trajectory_from_h5(h5_path):
     return joint_configs[:, :JOINT_DIM]
 
 
+def _assert_ur5_asset_bundle(asset_root, ur5e_asset_file):
+    """
+    Fail fast if URDF or expected meshes are missing. Isaac Gym often reports only
+    'Failed to parse URDF' while still opening a viewer with just the table.
+    """
+    urdf_path = os.path.join(asset_root, ur5e_asset_file)
+    if not os.path.isfile(urdf_path):
+        raise FileNotFoundError(
+            f"UR5 URDF not found:\n  {urdf_path}\n\n"
+            "Install the full hanwen_grasping/assets tree (UR5 URDF + meshes). "
+            "Partial clones or machines without binary assets commonly miss this path."
+        )
+    coll = os.path.join(asset_root, "urdf/ur5e/meshes/collision")
+    if not os.path.isdir(coll):
+        raise FileNotFoundError(
+            f"UR5 collision meshes directory missing:\n  {coll}\n"
+            f"  urdf: {urdf_path}\n\n"
+            "Without meshes, Isaac reports 'Failed to parse URDF' and the viewer may show only the table."
+        )
+    n_stl = sum(1 for name in os.listdir(coll) if name.lower().endswith(".stl"))
+    if n_stl < 3:
+        raise FileNotFoundError(
+            f"UR5 collision meshes look incomplete under:\n  {coll}\n"
+            f"(found {n_stl} .stl files; expected several for UR5). "
+            "Copy the full urdf/ur5e/meshes tree from your data-collection setup."
+        )
+
+
 if __name__ == '__main__':
     gym = gymapi.acquire_gym()
 
@@ -86,11 +117,17 @@ if __name__ == '__main__':
              'help': 'Steps between waypoints for smoother playback (0 = no interpolation)'},
             {'name': '--record', 'action': 'store_true', 'help': 'Record video to --record_output'},
             {'name': '--record_output', 'type': str, 'default': 'collected_replay.mp4',
-             'help': 'Output video path when --record (default: PI-VLA/visualization/trained_trajectory_YYYYMMDD_HHMMSS.mp4)'},
+             'help': 'Output video path when --record (default: PI-VLA/output/trajectory_evaluation/YYYYMMDD_HHMMSS/original.mp4 from h5 name)'},
             {'name': '--object_index', 'type': int, 'default': None,
              'help': 'Object index (0-5) to show. Requires --object_pos. If omitted, no objects are shown.'},
             {'name': '--object_pos', 'type': str, 'default': None,
-             'help': 'Object position "x,y,z" (e.g. 0.5,0.0,0.18). Requires --object_index. If omitted, no objects are shown.'},
+             'help': 'Object position "x,y,z" (e.g. 0.5,0.0,0.18). Requires --object_index. If omitted, uses HDF5 object_location + prompt when available.'},
+            {'name': '--no_h5_object', 'action': 'store_true',
+             'help': 'Do not spawn object from HDF5 object_location / prompt (overrides automatic placement).'},
+            {'name': '--no_walls', 'action': 'store_true',
+             'help': 'Match new_setup.py --no_walls: table only, no side rails / upper cover'},
+            {'name': '--headless', 'action': 'store_true',
+             'help': 'No interactive viewer; run fixed-length replay (for recording on servers without DISPLAY). Still uses step_graphics + camera sensors.'},
         ],
     )
 
@@ -98,8 +135,6 @@ if __name__ == '__main__':
         print("Error: --h5_path is required. Example: --h5_path ../collected_data/grasp_6dof_demo_20260308_174106.h5")
         sys.exit(1)
 
-    # Object visibility: only show object when both --object_index and --object_pos are provided
-    show_object = args.object_index is not None and args.object_pos is not None
     if args.object_index is not None and args.object_pos is None:
         print("Error: --object_index requires --object_pos (e.g. --object_pos 0.5,0.0,0.18)")
         sys.exit(1)
@@ -121,21 +156,76 @@ if __name__ == '__main__':
                 h5_path = cand2
             elif os.path.isfile(os.path.join(pi_vla_root, h5_path)):
                 h5_path = os.path.join(pi_vla_root, h5_path)
+            else:
+                _c3 = os.path.normpath(os.path.join(file_dir, h5_path))
+                if os.path.isfile(_c3):
+                    h5_path = _c3
+
+    if not os.path.isfile(h5_path):
+        raise FileNotFoundError(
+            f"HDF5 not found after path resolution: {h5_path}\n"
+            f"Try: --h5_path ../output/data_collection/test/grasp_6dof_demo_*.h5 (from hanwen_grasping), "
+            f"or an absolute path."
+        )
+
+    pi_vla_root = os.path.dirname(file_dir)
+    _, session_eval_dir = h5viz.trajectory_evaluation_session_dir(pi_vla_root, h5_path)
+
+    h5_ol, h5_prompt = h5viz.read_h5_object_and_prompt(h5_path)
+    user_object = args.object_index is not None and args.object_pos is not None
+    if user_object:
+        show_object = True
+    elif getattr(args, 'no_h5_object', False):
+        show_object = False
+    else:
+        show_object = False
+        if h5_ol is not None and h5_ol.size >= 3:
+            asset_root_infer = os.path.join(file_dir, "assets")
+            ycb_list_path = os.path.join(asset_root_infer, "urdf/ycb/object_urdf_grasp.txt")
+            object_asset_files_infer = []
+            if os.path.isfile(ycb_list_path):
+                with open(ycb_list_path) as f:
+                    for line in f:
+                        object_asset_files_infer.append("urdf/ycb/" + line.strip())
+            inferred_idx = h5viz.infer_ycb_index_from_prompt(h5_prompt, object_asset_files_infer)
+            if inferred_idx is not None:
+                args.object_index = inferred_idx
+                args.object_pos = ",".join(str(float(x)) for x in h5_ol[:3])
+                show_object = True
+                print(
+                    f"HDF5 object: prompt={h5_prompt!r} -> YCB index {inferred_idx} at ({args.object_pos})"
+                )
+            elif h5_prompt:
+                print(
+                    f"Warning: could not map prompt {h5_prompt!r} to a YCB asset; "
+                    "replay without object (use --object_index and --object_pos, or check object_urdf_grasp.txt)."
+                )
 
     robot_path = load_trajectory_from_h5(h5_path)
     print(f"Loaded trajectory: {len(robot_path)} waypoints from {h5_path}")
 
-    # Default record output: PI-VLA/visualization/trained_trajectory_YYYYMMDD_HHMMSS.mp4
     if getattr(args, 'record', False) and getattr(args, 'record_output', None) == 'collected_replay.mp4':
-        pi_vla_root = os.path.dirname(file_dir)
-        viz_dir = os.path.join(pi_vla_root, "visualization")
-        os.makedirs(viz_dir, exist_ok=True)
-        h5_basename = os.path.basename(h5_path)
-        m = re.search(r"(\d{8}_\d{6})", h5_basename)
-        if m:
-            args.record_output = os.path.join(viz_dir, f"trained_trajectory_{m.group(1)}.mp4")
+        if session_eval_dir:
+            os.makedirs(session_eval_dir, exist_ok=True)
+            args.record_output = os.path.join(session_eval_dir, "original.mp4")
+            meta_lines = [
+                f"h5_path: {os.path.abspath(h5_path)}",
+                f"prompt: {h5_prompt}",
+                f"object_location (h5): {h5_ol}",
+                f"object_index: {args.object_index}",
+                f"object_pos: {args.object_pos}",
+                f"video_original: original.mp4",
+            ]
+            h5viz.write_session_meta(session_eval_dir, meta_lines)
         else:
-            args.record_output = os.path.join(viz_dir, f"trained_trajectory_{os.path.splitext(h5_basename)[0]}.mp4")
+            viz_dir = os.path.join(pi_vla_root, "visualization")
+            os.makedirs(viz_dir, exist_ok=True)
+            h5_basename = os.path.basename(h5_path)
+            m = re.search(r"(\d{8}_\d{6})", h5_basename)
+            if m:
+                args.record_output = os.path.join(viz_dir, f"trained_trajectory_{m.group(1)}.mp4")
+            else:
+                args.record_output = os.path.join(viz_dir, f"trained_trajectory_{os.path.splitext(h5_basename)[0]}.mp4")
 
     if args.interpolate > 0:
         robot_path = interpolate_path(robot_path, steps_between=args.interpolate)
@@ -180,24 +270,41 @@ if __name__ == '__main__':
     object_collision_files = []
     object_offset = []
     object_common_prefix = "urdf/ycb/"
-    with open(os.path.join(asset_root, "urdf/ycb/object_urdf_grasp.txt")) as f:
-        for line in f:
-            object_asset_files.append(object_common_prefix + line.strip())
-    with open(os.path.join(asset_root, "urdf/ycb/object_collision_grasp.txt")) as f:
-        for line in f:
-            object_collision_files.append(object_common_prefix + line.strip())
-    with open(os.path.join(asset_root, "urdf/ycb/object_offset_grasp.txt")) as f:
-        for line in f:
-            div = line.strip().split(" ")
-            object_offset.append([float(x) for x in div])
+    # YCB lists are only needed when placing an object (--object_index + --object_pos)
+    if show_object:
+        _urdf_list = os.path.join(asset_root, "urdf/ycb/object_urdf_grasp.txt")
+        if not os.path.isfile(_urdf_list):
+            raise FileNotFoundError(
+                f"Missing YCB asset list (needed for --object_index): {_urdf_list}\n"
+                "Replay without objects does not require these files, or install/copy hanwen_grasping/assets."
+            )
+        with open(_urdf_list) as f:
+            for line in f:
+                object_asset_files.append(object_common_prefix + line.strip())
+        with open(os.path.join(asset_root, "urdf/ycb/object_collision_grasp.txt")) as f:
+            for line in f:
+                object_collision_files.append(object_common_prefix + line.strip())
+        with open(os.path.join(asset_root, "urdf/ycb/object_offset_grasp.txt")) as f:
+            for line in f:
+                div = line.strip().split(" ")
+                object_offset.append([float(x) for x in div])
 
     asset_options = gymapi.AssetOptions()
     asset_options.fix_base_link = True
-    asset_options.default_dof_drive_mode = gymapi.DOF_MODE_POS
+    try:
+        asset_options.default_dof_drive_mode = int(gymapi.DOF_MODE_POS)
+    except (TypeError, ValueError):
+        asset_options.default_dof_drive_mode = gymapi.DOF_MODE_POS
     asset_options.mesh_normal_mode = gymapi.COMPUTE_PER_VERTEX
     asset_options.use_mesh_materials = True
 
+    _assert_ur5_asset_bundle(asset_root, ur5e_asset_file)
     ur5e_asset = gym.load_asset(sim, asset_root, ur5e_asset_file, asset_options)
+    if ur5e_asset is None or ur5e_asset == 0:
+        raise RuntimeError(
+            f"gym.load_asset failed for {ur5e_asset_file} under {asset_root}. "
+            "Check Isaac log above for URDF parse errors; meshes paths must resolve."
+        )
     table_asset = gym.create_box(sim, table_dims.x, table_dims.y, table_dims.z, asset_options)
     left_cover_asset = gym.create_box(sim, side_cover_dims.x, side_cover_dims.y, side_cover_dims.z, asset_options)
     right_cover_asset = gym.create_box(sim, side_cover_dims.x, side_cover_dims.y, side_cover_dims.z, asset_options)
@@ -262,9 +369,11 @@ if __name__ == '__main__':
                                  gymapi.CameraFollowMode.FOLLOW_TRANSFORM)
 
         gym.create_actor(envs[-1], table_asset, table_pose, "table" + str(i), 0, 1)
-        gym.create_actor(envs[-1], left_cover_asset, left_cover_pose, "left_cover" + str(i), 0, 1)
-        gym.create_actor(envs[-1], right_cover_asset, right_cover_pose, "right_cover" + str(i), 0, 1)
-        if ADD_COVER:
+        add_walls = not getattr(args, 'no_walls', False)
+        if add_walls:
+            gym.create_actor(envs[-1], left_cover_asset, left_cover_pose, "left_cover" + str(i), 0, 1)
+            gym.create_actor(envs[-1], right_cover_asset, right_cover_pose, "right_cover" + str(i), 0, 1)
+        if add_walls and ADD_COVER:
             gym.create_actor(envs[-1], upper_cover_asset, upper_cover_pose, "upper_cover" + str(i), 0, 1)
 
         # Objects: only shown when --object_index and --object_pos are both provided
@@ -299,13 +408,18 @@ if __name__ == '__main__':
     wj2 = gym.find_actor_dof_handle(envs[-1], ur5e_handles[-1], "wrist_2_joint")
     wj3 = gym.find_actor_dof_handle(envs[-1], ur5e_handles[-1], "wrist_3_joint")
 
-    viewer = gym.create_viewer(sim, gymapi.CameraProperties())
-    if viewer is None:
-        raise ValueError("*** Failed to create viewer")
-
-    cam_pos = gymapi.Vec3(2.2, 0, 0.5)
-    cam_target = gymapi.Vec3(0, 0, 0.5)
-    gym.viewer_camera_look_at(viewer, None, cam_pos, cam_target)
+    viewer = None
+    if not getattr(args, 'headless', False):
+        viewer = gym.create_viewer(sim, gymapi.CameraProperties())
+        if viewer is None:
+            raise ValueError("*** Failed to create viewer")
+        cam_pos = gymapi.Vec3(2.2, 0, 0.5)
+        cam_target = gymapi.Vec3(0, 0, 0.5)
+        gym.viewer_camera_look_at(viewer, None, cam_pos, cam_target)
+    else:
+        print("Headless mode: no Isaac viewer window (use --record to save MP4).")
+        if not getattr(args, 'record', False):
+            print("Warning: --headless without --record exits after replay; nothing is saved.")
     gym.set_light_parameters(sim, 0, gymapi.Vec3(0.3, 0.3, 0.3), gymapi.Vec3(1.0, 1.0, 1.0), gymapi.Vec3(-1.0, 0.0, 0.0))
     gym.set_light_parameters(sim, 1, gymapi.Vec3(0.3, 0.3, 0.3), gymapi.Vec3(1.0, 1.0, 1.0), gymapi.Vec3(1.0, 0.0, 0.0))
 
@@ -322,39 +436,46 @@ if __name__ == '__main__':
         gym.simulate(sim)
         gym.fetch_results(sim, True)
         gym.step_graphics(sim)
-        gym.draw_viewer(viewer, sim, True)
-        gym.sync_frame_time(sim)
+        if viewer is not None:
+            gym.draw_viewer(viewer, sim, True)
+            gym.sync_frame_time(sim)
 
-    # Replay trajectory
-    path_id = 0
+    # Replay trajectory (mutable so nested helper can update without nonlocal-at-module-level)
+    path_id_box = [0]
     record_frames = [] if getattr(args, 'record', False) else None
+    headless_hold_frames = 90
 
-    while not gym.query_viewer_has_closed(viewer):
+    def _replay_step():
+        path_id = path_id_box[0]
         if path_id >= len(robot_path):
-            path_id = len(robot_path) - 1  # Hold at goal
+            path_id = len(robot_path) - 1
         dof_result = robot_path[path_id]
-
         gym.set_dof_target_position(envs[-1], spj, dof_result[0])
         gym.set_dof_target_position(envs[-1], slj, dof_result[1])
         gym.set_dof_target_position(envs[-1], ej, dof_result[2])
         gym.set_dof_target_position(envs[-1], wj1, dof_result[3])
         gym.set_dof_target_position(envs[-1], wj2, dof_result[4])
         gym.set_dof_target_position(envs[-1], wj3, dof_result[5])
-
         gym.simulate(sim)
         gym.fetch_results(sim, True)
         gym.step_graphics(sim)
-        gym.draw_viewer(viewer, sim, True)
-        gym.sync_frame_time(sim)
-
+        if viewer is not None:
+            gym.draw_viewer(viewer, sim, True)
+            gym.sync_frame_time(sim)
         if record_frames is not None:
             gym.render_all_camera_sensors(sim)
             raw = gym.get_camera_image(sim, envs[-1], body_cam_handles[-1], gymapi.IMAGE_COLOR)
             rgba = raw.reshape(camera_props.height, camera_props.width, 4)
             rgb = rgba[..., :3].copy()
             record_frames.append(rgb)
+        path_id_box[0] = path_id + 1
 
-        path_id += 1
+    if getattr(args, 'headless', False):
+        for _ in range(len(robot_path) + headless_hold_frames):
+            _replay_step()
+    else:
+        while not gym.query_viewer_has_closed(viewer):
+            _replay_step()
 
     # Save recorded video
     if record_frames and len(record_frames) > 0:
@@ -385,6 +506,7 @@ if __name__ == '__main__':
             print("Install imageio[ffmpeg] or opencv-python for video recording")
 
     print("Replay completed.")
-    gym.destroy_viewer(viewer)
+    if viewer is not None:
+        gym.destroy_viewer(viewer)
     gym.destroy_sim(sim)
     sys.exit(0)

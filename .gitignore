@@ -48,6 +48,9 @@ lightning_logs/
 # Training checkpoints & run outputs (large; regenerate locally)
 ntrl-demo/Experiments/
 
+# Collected robot trajectories (HDF5); large; keep local
+collected_data/
+
 # Collected runtime outputs from grasping scripts
 hanwen_grasping/saved_as_result/
 

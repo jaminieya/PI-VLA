@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Replay an HDF5 trajectory vs NTField-planned trajectory in Isaac Gym; save MP4s under output/trajectory_evaluation/.
 #
-# Typical flow: trajectory_evaluation/collect_data.py collects and saves a new .h5 under
+# Typical flow: trajectory_evaluation/ntfield/collect_data.py saves a new .h5 under
 #   output/trajectory_evaluation/YYYYMMDD_HHMMSS/, then runs this script (unless --no_run_ntfield_demo).
 #
 # Usage (from anywhere):
-#   bash trajectory_evaluation/run_isaac_ntfield_demo.sh
-#   bash trajectory_evaluation/run_isaac_ntfield_demo.sh /path/to/demo.h5 /path/to/Model_Epoch_*.pt
+#   bash trajectory_evaluation/ntfield/run_isaac_ntfield_demo.sh
+#   bash trajectory_evaluation/ntfield/run_isaac_ntfield_demo.sh /path/to/demo.h5 /path/to/Model_Epoch_*.pt
 #
 # Requires: Isaac Gym, conda env with isaacgym + torch + imageio[ffmpeg] or opencv-python.
 # Interactive: needs DISPLAY (open viewer until recording finishes).
@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-PI_VLA_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PI_VLA_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT_DIR="${PI_VLA_ROOT}/output/trajectory_evaluation"
 mkdir -p "${OUT_DIR}"
 

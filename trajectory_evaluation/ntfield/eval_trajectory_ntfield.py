@@ -5,7 +5,7 @@ Evaluate trajectory-trained NTField: field fit (tau vs tau_obs) and planning (gr
 Headless-safe: matplotlib uses non-GUI backend (set MPLBACKEND before run to override, e.g. TkAgg).
 
 Run from PI-VLA root (recommended):
-  python trajectory_evaluation/eval_trajectory_ntfield.py \\
+  python trajectory_evaluation/ntfield/eval_trajectory_ntfield.py \\
     --checkpoint ntrl-demo/Experiments/UR5_trajectory/trajectory_XX_XX_XX_XX/Model_Epoch_00500_*.pt \\
     --data_path ntrl-demo/datasets/arm/UR5_trajectory \\
     --device cuda:0
@@ -28,8 +28,8 @@ from typing import List, Tuple
 import numpy as np
 import torch
 
-# ntrl-demo is a sibling of trajectory_evaluation/ under PI-VLA
-_NTRL_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "ntrl-demo"))
+# ntrl-demo is under PI-VLA; this file lives in trajectory_evaluation/ntfield/
+_NTRL_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "ntrl-demo"))
 if _NTRL_ROOT not in sys.path:
     sys.path.insert(0, _NTRL_ROOT)
 

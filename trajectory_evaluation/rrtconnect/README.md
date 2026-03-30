@@ -1,4 +1,6 @@
-# Trajectory NTField evaluation
+# Trajectory NTField evaluation (RRTConnect-oriented docs)
+
+Canonical command paths live under **`trajectory_evaluation/ntfield/`** (see [`../ntfield/README.md`](../ntfield/README.md)).
 
 Evaluate checkpoints produced by `train_arm_trajectory.py` on trajectory data (`points.npy`, `tau_obs.npy`).
 
@@ -7,7 +9,7 @@ Evaluate checkpoints produced by `train_arm_trajectory.py` on trajectory data (`
 From the **PI-VLA** repository root (with conda env `ntrl-demo` or equivalent):
 
 ```bash
-python trajectory_evaluation/eval_trajectory_ntfield.py \
+python trajectory_evaluation/ntfield/eval_trajectory_ntfield.py \
   --checkpoint ntrl-demo/Experiments/UR5_trajectory/trajectory_MM_DD_HH_MM/Model_Epoch_00500_ValLoss_*.pt \
   --data_path ntrl-demo/datasets/arm/UR5_trajectory_vertical_train \
   --device cuda:0
@@ -28,7 +30,7 @@ Options:
 Command (from repo root, example checkpoint and dataset on `corallabs1`):
 
 ```bash
-python trajectory_evaluation/eval_trajectory_ntfield.py \
+python trajectory_evaluation/ntfield/eval_trajectory_ntfield.py \
   --checkpoint ntrl-demo/Experiments/UR5_trajectory_no_wall_accuracy_check/trajectory_03_25_20_28/Model_Epoch_05000_ValLoss_7.820605e-01.pt \
   --data_path ntrl-demo/datasets/arm/UR5_trajectory_vertical_train \
   --device cuda:0
@@ -68,7 +70,7 @@ Compare **logged joint trajectory** vs **NTField gradient plan** on the same epi
 
 ```bash
 # Defaults: first test H5 + no-wall checkpoint; override with two args: H5_PATH CKPT_PATH
-bash trajectory_evaluation/run_isaac_ntfield_demo.sh
+bash trajectory_evaluation/ntfield/run_isaac_ntfield_demo.sh
 ```
 
 Manual equivalent (from `hanwen_grasping/`):
@@ -94,7 +96,7 @@ Use **`--no_walls`** for both so the table scene matches typical **no-wall** tra
 **Headless / no window:** pass **`--headless`** to both Python scripts, or run the demo with:
 
 ```bash
-HEADLESS=1 bash trajectory_evaluation/run_isaac_ntfield_demo.sh
+HEADLESS=1 bash trajectory_evaluation/ntfield/run_isaac_ntfield_demo.sh
 ```
 
 That skips `create_viewer` and runs a **fixed number of physics frames** (replay length + a short hold at the goal), then saves the video. Isaac still runs **`step_graphics`** and camera sensors; on some Linux servers you may need **`EGL` / OSMesa** (or a virtual framebuffer) for GPU rendering without X11—if frames are black or the process fails, check Isaac Gym docs for your GPU/driver setup.

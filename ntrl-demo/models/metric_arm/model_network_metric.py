@@ -126,79 +126,115 @@ class NN(torch.nn.Module):
         scale = 1 + 1e-5 - self.act(1 - 1 / absrowsum)
         #print(w.shape)
         return w * scale.unsqueeze(1) #[: , None ]
-    
-    def out(self, coords):
-        
-        coords = coords.clone().detach().requires_grad_(True) # allows to take derivative w.r.t. input
+
+    def apply_encoder_norm(self, y):
+        """
+        InstanceNorm1d(h_size) on activations that are (N, C) is ambiguous in PyTorch:
+        - 2D input can error (treated as degenerate L=1).
+        - (N, C, 1) errors in training: 'Expected more than 1 spatial element'.
+
+        Here we apply the same math as InstanceNorm1d on (N, C, 1): per channel, normalize
+        over the batch dimension N, using this module's affine and running buffers.
+        """
+        m = self.encoder_norm
+        if y.dim() != 2:
+            return m(y)
+        if self.training:
+            mean = y.mean(dim=0)
+            var = y.var(dim=0, unbiased=False)
+            if m.track_running_stats:
+                with torch.no_grad():
+                    mom = m.momentum
+                    m.running_mean.mul_(1 - mom).add_(mean, alpha=mom)
+                    m.running_var.mul_(1 - mom).add_(var, alpha=mom)
+            y = (y - mean) / torch.sqrt(var + m.eps)
+        else:
+            rm = m.running_mean
+            rv = m.running_var
+            # InstanceNorm1d defaults: track_running_stats=False -> no running buffers.
+            # Checkpoints trained without encoder_norm state use the same path as training.
+            if rm is None or rv is None:
+                mean = y.mean(dim=0)
+                var = y.var(dim=0, unbiased=False)
+                y = (y - mean) / torch.sqrt(var + m.eps)
+            else:
+                y = (y - rm) / torch.sqrt(rv + m.eps)
+        if m.affine:
+            y = y * m.weight + m.bias
+        return y
+
+    def _embed_start_goal(self, coords):
+        """
+        Map concatenated (q_start, q_goal) rows to per-configuration latents before the metric head.
+
+        coords: (B, 2*dim) same convention as ``out`` (training / planning input space).
+        Returns:
+            z_start, z_goal: (B, H) each
+            w: last linear weight (lip-normed), same as ``out``
+            coords: differentiable coords tensor (for gradient through ``out``)
+        """
+        coords = coords.clone().detach().requires_grad_(True)
         size = coords.shape[0]
-        x0 = coords[:,:self.dim]
-        x1 = coords[:,self.dim:]
-        
-        x = torch.vstack((x0,x1))
-        
-        
+        x0 = coords[:, : self.dim]
+        x1 = coords[:, self.dim :]
+
+        x = torch.vstack((x0, x1))
+
         x = self.input_mapping(x)
 
         w = self.pe_gate[0].weight
         b = self.pe_gate[0].bias
         w = self.lip_norm(w)
-        u = torch.sin(x@w.T+b)
+        u = torch.sin(x @ w.T + b)
 
         w = self.pe_gate[1].weight
         b = self.pe_gate[1].bias
         w = self.lip_norm(w)
-        v = torch.sin(x@w.T+b)
+        v = torch.sin(x @ w.T + b)
 
-        for ii in range(0,self.nl1):
-            #i0 = x
+        for ii in range(0, self.nl1):
             x_tmp = x
-            
-            w = self.encoder[3*ii+1].weight
-            b = self.encoder[3*ii+1].bias
 
+            w = self.encoder[3 * ii + 1].weight
+            b = self.encoder[3 * ii + 1].bias
             w = self.lip_norm(w)
+            y = x @ w.T + b
+            x = u * torch.sin(y) + v * (1 - torch.sin(y))
 
-            y = x@w.T+b
-
-            x  = u*torch.sin(y)+v*(1-torch.sin(y))
-
-            w = self.encoder[3*ii+2].weight
-            b = self.encoder[3*ii+2].bias
-
+            w = self.encoder[3 * ii + 2].weight
+            b = self.encoder[3 * ii + 2].bias
             w = self.lip_norm(w)
+            y = x @ w.T + b
+            x = u * torch.sin(y) + v * (1 - torch.sin(y))
 
-            y = x@w.T+b
-
-            x  = u*torch.sin(y)+v*(1-torch.sin(y))
-
-            w = self.encoder[3*ii+3].weight
-            b = self.encoder[3*ii+3].bias
-
+            w = self.encoder[3 * ii + 3].weight
+            b = self.encoder[3 * ii + 3].bias
             w = self.lip_norm(w)
+            y = x @ w.T + b
+            weight = torch.sigmoid(0.1 * self.gate[ii].weight)
+            x = (1 - weight) * x_tmp + (weight) * torch.sin(y)
 
-            y = x@w.T+b
-
-            weight = torch.sigmoid(0.1*self.gate[ii].weight)
-
-            x  = (1-weight)*x_tmp+(weight)*torch.sin(y)
-            #x  = u*torch.sin(y)+v*x_tmp
-            #x  = (1-weight)*x_tmp+weight*(u*torch.sin(y)+v*(1-torch.sin(y)))
-            
-        
         w = self.encoder[-1].weight
         b = self.encoder[-1].bias
-
         w = self.lip_norm(w)
-        
-        y = x@w.T+b
+        y = x @ w.T + b
+        y = self.apply_encoder_norm(y)
 
-        y = self.encoder_norm(y)
+        z_start = y[:size, ...]
+        z_goal = y[size:, ...]
+        return z_start, z_goal, w, coords
 
-        x0 = y[:size,...]
-        x1 = y[size:,...]
+    def encode_pair_latents(self, coords):
+        """Return (z_start, z_goal) latent rows (B, H) before the OT / metric head."""
+        z_start, z_goal, _, _ = self._embed_start_goal(coords)
+        return z_start, z_goal
+
+    def out(self, coords):
+
+        z_start, z_goal, w, coords = self._embed_start_goal(coords)
 
         #OURS
-        x = torch.sqrt((x0-x1)**2+1e-6)
+        x = torch.sqrt((z_start - z_goal) ** 2 + 1e-6)
         x = x.view(x.shape[0],-1,16)
         x = (torch.logsumexp(10*x, 2)-np.log(16))/10
         x = 0.1*(torch.sum(x,dim=1,keepdim=True))

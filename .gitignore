@@ -56,3 +56,5 @@ hanwen_grasping/assets/
 
 # Scene & robot datasets — download or prepare locally; paths stay in code
 ntrl-demo/datasets/
+
+*.mp4

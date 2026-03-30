@@ -694,6 +694,58 @@ def move_objs(gym, object_collision_files, gymapi, new_obj_pos_list):
 
 #*************************************************************************************************#
 
+
+def resolve_collected_h5_path(h5_path, script_dir, repo_root):
+    """Resolve grasp_6dof_demo_*.h5 relative to hanwen_grasping or PI-VLA/collected_data."""
+    if not h5_path:
+        return None
+    if os.path.isfile(h5_path):
+        return os.path.abspath(h5_path)
+    cand = os.path.join(script_dir, h5_path)
+    if os.path.isfile(cand):
+        return os.path.abspath(cand)
+    cand2 = os.path.join(repo_root, h5_path)
+    if os.path.isfile(cand2):
+        return os.path.abspath(cand2)
+    cand3 = os.path.join(repo_root, "collected_data", os.path.basename(h5_path))
+    if os.path.isfile(cand3):
+        return os.path.abspath(cand3)
+    return os.path.abspath(h5_path)
+
+
+def read_h5_object_world_xyz(h5_path):
+    """
+    Return (x,y,z) actor root on the table for replay, or None.
+
+    Older collect_data.h5 files stored mesh-local bbox centers in object_location
+    (small values near origin) — those are ignored so we do not spawn under the robot.
+    """
+    import h5py
+    if not h5_path or not os.path.isfile(h5_path):
+        return None
+    with h5py.File(h5_path, "r") as f:
+        if "object_actor_world" in f:
+            v = np.array(f["object_actor_world"][:], dtype=np.float64).reshape(-1)
+            if v.size >= 3:
+                return v[:3].copy()
+            return None
+        if "object_location" in f:
+            v = np.array(f["object_location"][:], dtype=np.float64).reshape(-1)
+            if v.size < 3:
+                return None
+            # Table objects in this scene sit at x ~ 0.35+ (see placement loop).
+            if float(v[0]) < 0.28:
+                print(
+                    "Warning: HDF5 object_location looks like legacy mesh-local coords; "
+                    "skipping fixed object pose (object will be placed randomly)."
+                )
+                return None
+            return v[:3].copy()
+    return None
+
+
+#*************************************************************************************************#
+
 if __name__ == '__main__':
     #initialize gym
     #*************************************************************************************************#
@@ -710,13 +762,20 @@ if __name__ == '__main__':
             {'name': '--checkpoint', 'type': str, 'default': None, 'help': 'NTField checkpoint path (required with --ntfield)'},
             {'name': '--q_start', 'type': str, 'default': None, 'help': 'Start joint config: 6 values in radians. Use = for negative values, e.g. --q_start="0.2,-0.5,-1.0,1.57,1.57,0"'},
             {'name': '--q_goal', 'type': str, 'default': None, 'help': 'Goal joint config: 6 values in radians. Use = for negative values, e.g. --q_goal="-0.2,-0.5,-0.35,0.63,1.57,0"'},
-            {'name': '--h5_path', 'type': str, 'default': None, 'help': 'HDF5 with joint_configs; use first/last as q_start/q_goal (alternative to --q_start/--q_goal)'},
+            {'name': '--h5_path', 'type': str, 'default': None, 'help': 'collected_data grasp_6dof_demo_*.h5: joint_configs[0] -> q_start, final_joint_config (or last row) -> q_goal; object_location places object when NUM_OF_OBJECTS==1'},
             {'name': '--record', 'action': 'store_true', 'help': 'Record video of the simulation to --record_output'},
             {'name': '--record_output', 'type': str, 'default': 'ntfield_record.mp4', 'help': 'Output video path when --record. Auto: ntfield_YYYYMMDD_HHMMSS.mp4 from h5, or ntfield_q_<goal>.mp4 from q_start/q_goal'},
             {'name': '--no_walls', 'action': 'store_true', 'help': 'Remove side walls and upper cover on table (keep table only)'},
+            {'name': '--headless', 'action': 'store_true', 'help': 'No OpenGL viewer (use on SSH/servers without DISPLAY); use --record to save video'},
         ],
     )
     env_id = int(args.env_id)
+    ntfield_h5_object_xyz = None
+    if getattr(args, 'ntfield', False) and args.h5_path:
+        args.h5_path = resolve_collected_h5_path(args.h5_path, file_dir, pi_vla_root)
+        ntfield_h5_object_xyz = read_h5_object_world_xyz(args.h5_path)
+        if ntfield_h5_object_xyz is not None:
+            print(f"HDF5 object world pose (actor root): {ntfield_h5_object_xyz}")
     #*************************************************************************************************#
 
     #create a simulator
@@ -822,11 +881,18 @@ if __name__ == '__main__':
 
     #*************************************************************************************************#
 
-    # create viewer using the default camera properties
+    # create viewer using the default camera properties (optional; GLFW needs a display)
     #*************************************************************************************************#
-    viewer = gym.create_viewer(sim, gymapi.CameraProperties())
-    if viewer is None:
-        raise ValueError('*** Failed to create viewer')
+    if getattr(args, 'headless', False):
+        viewer = None
+        print('Headless mode: no viewer window (GLFW/DISPLAY not required).')
+    else:
+        viewer = gym.create_viewer(sim, gymapi.CameraProperties())
+        if viewer is None:
+            raise ValueError(
+                '*** Failed to create viewer (no DISPLAY / GLFW?). '
+                'Re-run with --headless or set DISPLAY / use X11 forwarding.'
+            )
     #*************************************************************************************************#
 
     #set up the environment grid
@@ -1046,53 +1112,76 @@ if __name__ == '__main__':
 
         for k in range(NUM_OF_OBJECTS):
             object_pose = gymapi.Transform()
-            is_collision = True
-
-            # random selec obj location
-            while is_collision:
-                tx = np.random.uniform(0.35, table_dims.x + 0.2)
-                ty = np.random.uniform(-table_dims.y/2 + 0.1, table_dims.y/2 - 0.2)
-                tz = table_dims.z + 0.08
-
+            use_h5_obj = (
+                ntfield_h5_object_xyz is not None
+                and NUM_OF_OBJECTS == 1
+                and k == 0
+            )
+            if use_h5_obj:
+                tx = float(ntfield_h5_object_xyz[0])
+                ty = float(ntfield_h5_object_xyz[1])
+                tz = float(ntfield_h5_object_xyz[2])
                 object_pose.p = gymapi.Vec3(tx, ty, tz)
-
                 file_path = object_collision_files[target_file_idx[k]]
                 collision_mesh = obj_reader(asset_root + file_path)
                 collision_mesh.set_scale(object_scaling_factor[k])
                 collision_mesh.add_offset(object_offset[target_file_idx[k]])
-                
                 verts, tris = collision_mesh.get_bounding_box_mesh()
                 temp_center = collision_mesh.get_center()
                 temp_bounding_box = collision_mesh.get_bounding_box()
-
-                # new obj
                 m = fcl.BVHModel()
                 m.beginModel(len(verts), len(tris))
                 m.addSubModel(verts, tris)
                 m.endModel()
-                t = fcl.Transform(np.array([tx,ty,tz]))
-                
+                t = fcl.Transform(np.array([tx, ty, tz]))
+            else:
+                is_collision = True
 
-                # check collision
-                req = fcl.CollisionRequest()
-                rdata = fcl.CollisionData(request = req)
-                objs_manager.collide(fcl.CollisionObject(m, t), rdata, fcl.defaultCollisionCallback)
+                # random selec obj location
+                while is_collision:
+                    tx = np.random.uniform(0.35, table_dims.x + 0.2)
+                    ty = np.random.uniform(-table_dims.y/2 + 0.1, table_dims.y/2 - 0.2)
+                    tz = table_dims.z + 0.08
 
-                is_collision = rdata.result.is_collision # update collision status
+                    object_pose.p = gymapi.Vec3(tx, ty, tz)
 
-                if not is_collision:
-                    dist = np.sqrt((tx - GT_TARGET_POS[0])**2 + (ty - GT_TARGET_POS[1])**2)
-                    if dist <= 0.2:
-                        is_collision = True
-                        print("target contact recalc")
-                        continue
+                    file_path = object_collision_files[target_file_idx[k]]
+                    collision_mesh = obj_reader(asset_root + file_path)
+                    collision_mesh.set_scale(object_scaling_factor[k])
+                    collision_mesh.add_offset(object_offset[target_file_idx[k]])
+                    
+                    verts, tris = collision_mesh.get_bounding_box_mesh()
+                    temp_center = collision_mesh.get_center()
+                    temp_bounding_box = collision_mesh.get_bounding_box()
 
-                    for obj in GT_OBJ_POS_LIST:
-                        dist = np.sqrt((tx - obj[0])**2 + (ty - obj[1])**2)
-                        if dist <= 0.16:
+                    # new obj
+                    m = fcl.BVHModel()
+                    m.beginModel(len(verts), len(tris))
+                    m.addSubModel(verts, tris)
+                    m.endModel()
+                    t = fcl.Transform(np.array([tx,ty,tz]))
+                    
+
+                    # check collision
+                    req = fcl.CollisionRequest()
+                    rdata = fcl.CollisionData(request = req)
+                    objs_manager.collide(fcl.CollisionObject(m, t), rdata, fcl.defaultCollisionCallback)
+
+                    is_collision = rdata.result.is_collision # update collision status
+
+                    if not is_collision:
+                        dist = np.sqrt((tx - GT_TARGET_POS[0])**2 + (ty - GT_TARGET_POS[1])**2)
+                        if dist <= 0.2:
                             is_collision = True
-                            print("recalc")
+                            print("target contact recalc")
                             continue
+
+                        for obj in GT_OBJ_POS_LIST:
+                            dist = np.sqrt((tx - obj[0])**2 + (ty - obj[1])**2)
+                            if dist <= 0.16:
+                                is_collision = True
+                                print("recalc")
+                                continue
 
             GT_OBJ_POS_LIST.append([object_pose.p.x, object_pose.p.y])
 
@@ -1120,7 +1209,8 @@ if __name__ == '__main__':
     #*************************************************************************************************#
     cam_pos = gymapi.Vec3(2.2, 0, 0.5)
     cam_target = gymapi.Vec3(0, 0, 0.5)
-    gym.viewer_camera_look_at(viewer, None, cam_pos, cam_target)
+    if viewer is not None:
+        gym.viewer_camera_look_at(viewer, None, cam_pos, cam_target)
     gym.set_light_parameters(sim, 0, gymapi.Vec3(0.3, 0.3, 0.3), gymapi.Vec3(1.0, 1.0, 1.0),
                                     gymapi.Vec3(-1.0, 0.0, 0.0))
     gym.set_light_parameters(sim, 1, gymapi.Vec3(0.3, 0.3, 0.3), gymapi.Vec3(1.0, 1.0, 1.0),
@@ -1176,9 +1266,10 @@ if __name__ == '__main__':
 
         # update the viewer
         gym.step_graphics(sim)
-        gym.draw_viewer(viewer, sim, True)
+        if viewer is not None:
+            gym.draw_viewer(viewer, sim, True)
+            gym.sync_frame_time(sim)
 
-        gym.sync_frame_time(sim)
     #*************************************************************************************************#
 
     robot_path = None
@@ -1191,7 +1282,8 @@ if __name__ == '__main__':
         _ntfield_ntrl = ntrl_demo_path if os.path.isdir(ntrl_demo_path) else os.path.normpath(os.path.join(pi_vla_root, '..', 'ntrl-demo'))
         if not os.path.isdir(_ntfield_ntrl):
             print(f"Error: ntrl-demo not found. Tried: {ntrl_demo_path}")
-            gym.destroy_viewer(viewer)
+            if viewer is not None:
+                gym.destroy_viewer(viewer)
             gym.destroy_sim(sim)
             sys.exit(1)
         if _ntfield_ntrl not in sys.path:
@@ -1202,20 +1294,29 @@ if __name__ == '__main__':
         checkpoint_path = os.path.abspath(args.checkpoint)
         if not args.checkpoint or not os.path.isfile(checkpoint_path):
             print("Error: --ntfield requires --checkpoint with a valid .pt file")
-            gym.destroy_viewer(viewer)
+            if viewer is not None:
+                gym.destroy_viewer(viewer)
             gym.destroy_sim(sim)
             sys.exit(1)
         if args.h5_path:
             if not os.path.isfile(args.h5_path):
                 print(f"Error: HDF5 not found: {args.h5_path}")
-                gym.destroy_viewer(viewer)
+                if viewer is not None:
+                    gym.destroy_viewer(viewer)
                 gym.destroy_sim(sim)
                 sys.exit(1)
             with h5py.File(args.h5_path, "r") as f:
                 joint_configs = np.array(f["joint_configs"][:], dtype=np.float64)
-            q_start = np.array(joint_configs[0], dtype=np.float64)
-            q_goal = np.array(joint_configs[-1], dtype=np.float64)
-            print(f"Using q_start/q_goal from HDF5: {args.h5_path}")
+                if joint_configs.ndim == 1:
+                    joint_configs = joint_configs.reshape(1, -1)
+                q_start = np.array(joint_configs[0, :6], dtype=np.float64).reshape(6)
+                if "final_joint_config" in f:
+                    q_goal = np.array(f["final_joint_config"][:], dtype=np.float64).reshape(-1)[:6]
+                else:
+                    q_goal = np.array(joint_configs[-1, :6], dtype=np.float64).reshape(6)
+            print(f"Using q_start / q_goal from HDF5: {args.h5_path}")
+            print(f"  q_start (rad): {q_start}")
+            print(f"  q_goal  (rad): {q_goal}")
             # Auto-name video from H5 date/time when --record and default output
             if getattr(args, 'record', False) and getattr(args, 'record_output', None) == 'ntfield_record.mp4':
                 basename = os.path.basename(args.h5_path)
@@ -1225,7 +1326,8 @@ if __name__ == '__main__':
         else:
             if not args.q_start or not args.q_goal:
                 print("Error: --ntfield requires --q_start and --q_goal, or --h5_path")
-                gym.destroy_viewer(viewer)
+                if viewer is not None:
+                    gym.destroy_viewer(viewer)
                 gym.destroy_sim(sim)
                 sys.exit(1)
             q_start = np.array(parse_q_ntfield(args.q_start), dtype=np.float64)
@@ -1326,14 +1428,26 @@ if __name__ == '__main__':
 
     if robot_path is None or len(robot_path) == 0:
         print("Error: No path to animate (grasp planning failed or --ntfield path empty)")
-        gym.destroy_viewer(viewer)
+        if viewer is not None:
+            gym.destroy_viewer(viewer)
         gym.destroy_sim(sim)
         sys.exit(1)
 
     path_id = 0
     record_frames = [] if getattr(args, 'record', False) else None
+    headless_anim = viewer is None
+    headless_steps = 0
+    # Headless: one pass through waypoints + hold last pose (matches headed "hold until close")
+    max_headless_steps = len(robot_path) + 120 if headless_anim else None
 
-    while not gym.query_viewer_has_closed(viewer):
+    while True:
+        if viewer is not None:
+            if gym.query_viewer_has_closed(viewer):
+                break
+        else:
+            if headless_steps >= max_headless_steps:
+                break
+            headless_steps += 1
 
         if path_id >= len(robot_path):
             path_id -= 1
@@ -1352,8 +1466,9 @@ if __name__ == '__main__':
 
         # update the viewer
         gym.step_graphics(sim)
-        gym.draw_viewer(viewer, sim, True)
-        gym.sync_frame_time(sim)
+        if viewer is not None:
+            gym.draw_viewer(viewer, sim, True)
+            gym.sync_frame_time(sim)
 
         # record frame from global camera
         if record_frames is not None:
@@ -1394,6 +1509,7 @@ if __name__ == '__main__':
             print("Install imageio[ffmpeg] or opencv-python for video recording: pip install imageio[ffmpeg]")
 
     print('Test Completed Successfully!!')
-    gym.destroy_viewer(viewer)
+    if viewer is not None:
+        gym.destroy_viewer(viewer)
     gym.destroy_sim(sim)
     sys.exit(1)

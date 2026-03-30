@@ -253,112 +253,123 @@ def MPPI(womodel, XP):
     point0.append(XP[:,6:12].clone())
     return point0, iter
 
-parser = argparse.ArgumentParser(description='Arm planning test with visualization')
-parser.add_argument('--checkpoint', '-c', type=str, default=None,
-                    help='Path to model checkpoint (.pt). If omitted, run_arm.sh finds latest.')
-parser.add_argument('--save', '-s', type=str, default=None,
-                    help='Save visualization to file (e.g. arm_path.html) instead of opening window. Use when no display.')
-args = parser.parse_args()
 
-modelPath = './Experiments/UR5'
-dataPath = './datasets/arm/UR5'
-
-womodel = md.Model(modelPath, dataPath, 6, [0, 0.0, 0.0, 0, 0.0, 0.0], device='cuda')
-pt = args.checkpoint or './Experiments/UR5/arm_09_19_01_14/Model_Epoch_01700_ValLoss_4.005805e-03.pt'
-if not os.path.exists(pt):
-    print(f'Error: Checkpoint not found: {pt}')
-    print('Train first with: ./run_arm.sh train')
-    sys.exit(1)
-print('Checkpoint:', pt)
-womodel.load(pt)
-womodel.network.eval()
-
-#dataPath = './datasets/Gib'
-paths = dataPath
-scale = math.pi/0.5
+def default_base_tensor(device):
+    """Same joint offset as the original script (applied to start and goal before scaling)."""
+    return torch.tensor(
+        [[0, -0.5 * np.pi, 0.0, -0.5 * np.pi, 0.0, 0.0,
+          0, -0.5 * np.pi, 0.0, -0.5 * np.pi, 0.0, 0.0]],
+        dtype=torch.float32,
+        device=device,
+    )
 
 
+def run_plan_and_viz(
+    checkpoint_path,
+    start6,
+    goal6,
+    *,
+    save_path=None,
+    obstacle_mesh='datasets/arm/UR5/realpc_scaled.off',
+    model_path='./Experiments/UR5',
+    data_path='./datasets/arm/UR5',
+    apply_base=True,
+    scale=None,
+    mppi_runs=5,
+    seed=None,
+):
+    """
+    Load checkpoint, run MPPI from start6 to goal6 (6D joints in the same convention as
+    arm_plan_stat.py before BASE+scale), visualize against obstacle_mesh.
+    Requires CUDA (MPPI / FK use .cuda()).
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError('CUDA is required (MPPI and FK in this module use .cuda()).')
+    if scale is None:
+        scale = math.pi / 0.5
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+    dev = torch.device('cuda')
+    womodel = md.Model(model_path, data_path, 6, [0, 0.0, 0.0, 0, 0.0, 0.0], device='cuda')
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f'Checkpoint not found: {checkpoint_path}')
+    print('Checkpoint:', checkpoint_path)
+    womodel.load(checkpoint_path)
+    womodel.network.eval()
+
+    s = torch.tensor(start6, dtype=torch.float32, device=dev).view(1, 6)
+    g = torch.tensor(goal6, dtype=torch.float32, device=dev).view(1, 6)
+    XP = torch.cat([s, g], dim=1)
+    if apply_base:
+        XP = XP + default_base_tensor(dev)
+    XP = XP / scale
+
+    last_iter = 0
+    for _ in range(mppi_runs):
+        t0 = timer()
+        with torch.no_grad():
+            point, last_iter = MPPI(womodel, XP.clone())
+        print('Time:', timer() - t0)
+
+    if last_iter == 199:
+        print('Failed')
+
+    query_points = torch.cat(point).detach().cpu().numpy()
+    chain, mesh_list = build_chain()
+    p_list = FK(query_points * scale, chain, mesh_list)
+    points = torch.cat(p_list, dim=1)
+
+    color1 = np.random.randint(256, size=(1, 4))
+    color1[0, 0] = 50
+    color1[0, 1] = 50
+    color1[0, 2] = 200
+    color1[0, 3] = 100
+    color2 = np.random.randint(256, size=(1, 4))
+    color2[0, 0] = 200
+    color2[0, 1] = 50
+    color2[0, 2] = 50
+    color2[0, 3] = 100
+    n_steps = points.shape[0]
+    interpolation = np.linspace(0, 1, n_steps)
+    colors = np.outer(1 - interpolation, color1) + np.outer(interpolation, color2)
+    colors = np.expand_dims(colors, axis=1)
+    colors = np.repeat(colors, repeats=points.shape[1], axis=1)
+
+    points_np = points.detach().cpu().numpy()
+    print(points_np.shape)
+    centers = points_np[..., 0:3]
+    radii = points_np[..., 3]
+    Viz_line_pc(
+        centers,
+        radii,
+        colors.reshape(-1, 4).astype(np.int64),
+        obstacle_mesh,
+        save_path=save_path,
+    )
+    return query_points * scale, last_iter
 
 
-XP=torch.tensor([[0.00,0.0,0.0,-0.00,0.00,-0.00,
-                        0.2, -0.5, -1.2, 0.5*np.pi,0.5*np.pi,0.0]]).cuda()
-XP=torch.tensor([[-0.2, -0.5, -0.35, 0.2*np.pi,0.5*np.pi,0.0,
-                  0.00,0.0,0.0,-0.00,0.00,-0.00]]).cuda()
-XP=torch.tensor([[0.4, -0.5, -0.35, 0.3*np.pi,0.5*np.pi,0.0,
-                     0.2, -0.7, -0.9, 0.2*np.pi,0.7*np.pi,0.0]]).cuda()
-XP=torch.tensor([[0.2, -0.5, -1.2, 0.5*np.pi,0.5*np.pi,0.0,
-                     -0.2, -0.5, -0.35, 0.2*np.pi,0.5*np.pi,0.0]]).cuda()
+def main():
+    parser = argparse.ArgumentParser(description='Arm planning test with visualization')
+    parser.add_argument('--checkpoint', '-c', type=str, default=None,
+                        help='Path to model checkpoint (.pt). If omitted, run_arm.sh finds latest.')
+    parser.add_argument('--save', '-s', type=str, default=None,
+                        help='Save visualization to file (e.g. arm_path.html) instead of opening window.')
+    args = parser.parse_args()
 
-XP=torch.tensor([[0.2, -0.7, -1.0, 0.5*np.pi,0.5*np.pi,0.0,
-                        -0.2, -0.5, -0.35, 0.2*np.pi,0.5*np.pi,0.0]]).cuda()
-    
+    pt = args.checkpoint or './Experiments/UR5/arm_09_19_01_14/Model_Epoch_01700_ValLoss_4.005805e-03.pt'
+    if not os.path.exists(pt):
+        print(f'Error: Checkpoint not found: {pt}')
+        print('Train first with: ./run_arm.sh train')
+        sys.exit(1)
 
-   
-BASE=torch.tensor([[0, -0.5*np.pi, 0.0, -0.5*np.pi,0.0,0.0,
-                        0, -0.5*np.pi, 0.0, -0.5*np.pi,0.0,0.0]]).cuda()
-#XP = start_goal
-XP = XP+BASE #Variable(Tensor(XP)).to('cuda').unsqueeze(0)
-XP = XP/scale
-
-for ii in range(5):
-    
-    start = timer()
-    with torch.no_grad():
-        point, iter = MPPI(womodel, XP.clone())
-
-    end = timer()
-
-    print('Time:', end-start)
-if iter == 199:
-    print('Failed')
-    #continue
-
-query_points = torch.cat(point).to('cpu').data.numpy()#np.asarray(point)
+    start6 = [0.2, -0.7, -1.0, 0.5 * np.pi, 0.5 * np.pi, 0.0]
+    goal6 = [-0.2, -0.5, -0.35, 0.2 * np.pi, 0.5 * np.pi, 0.0]
+    run_plan_and_viz(pt, start6, goal6, save_path=args.save)
 
 
-chain, mesh_list = build_chain()
-
-p_list = FK(query_points*scale, chain, mesh_list)
-
-
-
-points = torch.cat(p_list,dim=1)
-
-#np.save('Evaluations/Arm/ur5_points_list.npy', query_points*scale)
-
-
-color1 = np.random.randint(256, size=(1, 4))
-color1[0,0] = 50
-color1[0,1] = 50
-color1[0,2] = 200
-color1[0,3] = 100
-color2 = np.random.randint(256, size=(1, 4))
-color2[0,0] = 200
-color2[0,1] = 50
-color2[0,2] = 50
-color2[0,3] = 100
-n_steps = points.shape[0]
-interpolation = np.linspace(0, 1, n_steps)
-colors = np.outer(1 - interpolation, color1) + np.outer(interpolation, color2)
-colors = np.expand_dims(colors, axis=1)
-colors = np.repeat(colors, repeats=points.shape[1], axis=1)
-
-#colors[:int(colors.shape[0]/2),...] = color1
-#colors[int(colors.shape[0]/2):,...] = color2
-
-'''
-
-'''
-#points = points.view(-1,4)
-points = points.detach().cpu().numpy()
-print(points.shape)
-file_path = 'datasets/arm/'
-mesh_name = 'realpc_scaled.off'
-
-path = file_path + 'UR5' + '/' + mesh_name
-
-centers = points[...,0:3]
-radii = points[...,3]
-
-Viz_line_pc(centers, radii, colors.reshape(-1, 4).astype(np.int64), path, save_path=args.save)
-
+if __name__ == '__main__':
+    main()

@@ -1373,6 +1373,7 @@ if __name__ == '__main__':
             f.create_dataset("joint_configs", data=joint_configs_arr)
             f.create_dataset("final_joint_config", data=final_joint_config)
             f.create_dataset("object_location", data=object_location)
+            f.create_dataset("object_actor_world", data=object_location)
             f.attrs["prompt"] = str(prompt)
             f.attrs["object_name"] = str(object_name)
             f.attrs["num_samples"] = int(num_samples)

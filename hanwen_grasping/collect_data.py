@@ -1026,6 +1026,9 @@ if __name__ == '__main__':
                          np.random.uniform(-table_dims.y/2 + 0.1, table_dims.y/2 - 0.2),
                          table_dims.z + 0.08]
 
+        # World-space actor root (tx,ty,tz) per object — not mesh-local bbox center.
+        object_actor_roots = []
+
         for k in range(NUM_OF_OBJECTS):
             object_pose = gymapi.Transform()
             is_collision = True
@@ -1077,6 +1080,9 @@ if __name__ == '__main__':
                             continue
 
             GT_OBJ_POS_LIST.append([object_pose.p.x, object_pose.p.y])
+            object_actor_roots.append(
+                [float(object_pose.p.x), float(object_pose.p.y), float(object_pose.p.z)]
+            )
 
             object_handles.append(gym.create_actor(envs[-1], 
                                                 object_assets[target_file_idx[k]], 
@@ -1288,9 +1294,9 @@ if __name__ == '__main__':
     dataset_samples = []
     prompt = f"grasp the {get_object_display_name(object_asset_files[target_file_idx[target_idx]])}"
 
-    # Get object location (static during trajectory - xyz in world frame)
-    # object_status_list[i][0] = mesh center + translation from rigid body state (updated at t=999)
-    object_location = np.array(object_status_list[target_idx][0], dtype=np.float32)
+    # World-frame actor root used for create_actor (NOT mesh-local bbox center).
+    object_actor_world = np.array(object_actor_roots[target_idx], dtype=np.float32)
+    object_location = object_actor_world.copy()
     num_waypoints = len(init2grasp_path) if init2grasp_path else 0
     total_frames = num_waypoints * SETTLE_STEPS
     if viewer is not None:
@@ -1369,11 +1375,12 @@ if __name__ == '__main__':
             f.create_dataset("images_side", data=images_side_arr, compression="gzip")
             f.create_dataset("joint_configs", data=joint_configs_arr)
             f.create_dataset("final_joint_config", data=final_joint_config)
+            f.create_dataset("object_actor_world", data=object_actor_world)
             f.create_dataset("object_location", data=object_location)
             f.attrs["prompt"] = str(prompt)
             f.attrs["num_samples"] = int(num_samples)
             f.attrs["joint_dim"] = int(JOINT_DIM)
-        print(f"Saved {num_samples} samples (images + images_side + joint_configs + final_joint_config + object_location) to {out_path}")
+        print(f"Saved {num_samples} samples (+ object_actor_world / object_location world xyz) to {out_path}")
     else:
         print(f"No samples captured. Keep the viewer open longer (~0.5 sec per waypoint).")
         print(f"Would have saved to: {collected_dir}/grasp_6dof_demo_*.h5")

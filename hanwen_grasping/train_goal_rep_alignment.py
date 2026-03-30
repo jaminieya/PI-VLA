@@ -39,6 +39,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 
+import torchvision.models as models
+from transformers import DistilBertModel, DistilBertTokenizer
+
 # NTField input normalization (same as planning/gradient_planner_trajectory.py)
 SCALE = float(np.pi / 0.5)
 
@@ -47,7 +50,7 @@ _PI_VLA_ROOT = os.path.dirname(_FILE_DIR)
 _NTRL_DEMO = os.path.join(_PI_VLA_ROOT, "ntrl-demo")
 if os.path.isdir(_NTRL_DEMO) and _NTRL_DEMO not in sys.path:
     sys.path.insert(0, _NTRL_DEMO)
-
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def _maybe_torchvision():
     try:
@@ -73,113 +76,157 @@ def build_coords_batch(
         q_goal = q_goal / SCALE
     return torch.cat([q_start, q_goal], dim=1)
 
-
-class CharTextEncoder(nn.Module):
-    """Lightweight character-level encoder (no transformers dependency)."""
-
-    def __init__(self, vocab: Dict[str, int], max_len: int, emb_dim: int, out_dim: int):
+# ==========================================
+# 1. Frozen Pre-Trained Image Encoder
+# ==========================================
+class PretrainedImageEncoder(nn.Module):
+    """
+    Acts as a proxy for R3M / VC-1. 
+    Uses a pre-trained ResNet, frozen to prevent downstream catastrophic forgetting.
+    """
+    def __init__(self, out_dim: int = 2048):
         super().__init__()
-        self.vocab = vocab
-        self.max_len = max_len
-        self.pad_idx = vocab["<pad>"]
-        self.emb = nn.Embedding(len(vocab), emb_dim, padding_idx=self.pad_idx)
-        self.net = nn.Sequential(
-            nn.Linear(emb_dim * max_len, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, out_dim),
-            nn.ReLU(inplace=True),
-        )
-
-    def encode(self, prompts: List[str]) -> torch.Tensor:
-        ids = []
-        for p in prompts:
-            row = []
-            for ch in p[: self.max_len]:
-                row.append(self.vocab.get(ch, self.vocab["<unk>"]))
-            while len(row) < self.max_len:
-                row.append(self.pad_idx)
-            ids.append(row)
-        t = torch.tensor(ids, dtype=torch.long, device=self.emb.weight.device)
-        e = self.emb(t).flatten(1)
-        return self.net(e)
-
-
-def build_vocab_from_prompts(prompts: List[str]) -> Dict[str, int]:
-    chars = set()
-    for p in prompts:
-        for ch in p:
-            chars.add(ch)
-    special = ["<pad>", "<unk>"]
-    vocab = {s: i for i, s in enumerate(special)}
-    for i, ch in enumerate(sorted(chars)):
-        if ch not in vocab:
-            vocab[ch] = len(vocab)
-    return vocab
-
-
-class SmallImageEncoder(nn.Module):
-    def __init__(self, in_ch: int, latent_dim: int):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, 32, 5, stride=2, padding=2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, 5, stride=2, padding=2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, 5, stride=2, padding=2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, 3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((4, 4)),
-        )
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * 4 * 4, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, latent_dim),
-            nn.ReLU(inplace=True),
-        )
+        # Load a pre-trained ResNet50 (Standard practice for R3M base)
+        # Note: If using the actual r3m library, you would load it here:
+        # self.backbone = r3m.load_model("resnet50")
+        resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        
+        # Strip the final classification layer to get the raw feature vector
+        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
+        self.out_dim = out_dim
+        
+        # FREEZE the visual backbone
+        self.backbone.eval()
+        for param in self.backbone.parameters():
+            param.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc(self.conv(x))
+        # Ensure gradients are not tracked for the backbone
+        with torch.no_grad():
+            features = self.backbone(x)
+        return features.flatten(1) # Output shape: (B, 2048)
 
 
-class GoalLatentPredictor(nn.Module):
+# ==========================================
+# 2. Frozen Pre-Trained Text Encoder
+# ==========================================
+class PretrainedTextEncoder(nn.Module):
     """
-    Predicts NTField goal latent dim H (256 for current UR5 NN) from
-    (image features, text features, q_start).
+    Extracts rich language embeddings using a pre-trained Transformer.
     """
-
-    def __init__(
-        self,
-        text_vocab: Dict[str, int],
-        text_max_len: int,
-        ntfield_h: int,
-        text_emb_dim: int = 48,
-        text_out_dim: int = 128,
-        image_out_dim: int = 256,
-    ):
+    def __init__(self, model_name: str = 'distilbert-base-uncased', out_dim: int = 768):
         super().__init__()
-        self.text_enc = CharTextEncoder(text_vocab, text_max_len, text_emb_dim, text_out_dim)
-        self.img_enc = SmallImageEncoder(3, image_out_dim)
+        self.tokenizer = DistilBertTokenizer.from_pretrained(model_name)
+        self.transformer = DistilBertModel.from_pretrained(model_name)
+        self.out_dim = out_dim
+        
+        # FREEZE the language backbone
+        self.transformer.eval()
+        for param in self.transformer.parameters():
+            param.requires_grad = False
+
+    def forward(self, prompts: list[str], device: torch.device) -> torch.Tensor:
+        # Tokenize and pad the batch of text prompts
+        inputs = self.tokenizer(
+            prompts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=64
+        ).to(device)
+        
+        with torch.no_grad():
+            outputs = self.transformer(**inputs)
+            
+        # Extract the [CLS] token representation as the sentence embedding
+        sentence_embedding = outputs.last_hidden_state[:, 0, :]
+        return sentence_embedding # Output shape: (B, 768)
+
+
+# ==========================================
+# 3. FiLM (Feature-wise Linear Modulation)
+# ==========================================
+class FiLMConditioning(nn.Module):
+    """
+    Injects language embeddings into the visual representation by learning 
+    scale (gamma) and shift (beta) parameters from the text.
+    """
+    def __init__(self, text_dim: int, image_dim: int):
+        super().__init__()
+        # Maps the text embedding to the exact dimensions of the image embedding
+        # Output is 2 * image_dim because we need both gamma and beta
+        self.film_generator = nn.Linear(text_dim, image_dim * 2)
+
+    def forward(self, image_features: torch.Tensor, text_features: torch.Tensor) -> torch.Tensor:
+        # Generate conditioning parameters from text
+        film_params = self.film_generator(text_features)
+        
+        # Split into scale (gamma) and shift (beta)
+        # Note: We add 1 to gamma so that the default scale (before learning) is 1, not 0
+        gamma, beta = film_params.chunk(2, dim=1)
+        gamma = gamma + 1.0 
+        
+        # Apply FiLM: condition the image features using the text parameters
+        conditioned_features = (image_features * gamma) + beta
+        return conditioned_features
+
+
+# ==========================================
+# 4. The Updated Student Model
+# ==========================================
+class GoalLatentPredictorWithFiLM(nn.Module):
+    """
+    Predicts NTField goal latent using frozen Foundation Models and FiLM.
+    """
+    def __init__(self, ntfield_h: int = 256):
+        super().__init__()
+        
+        # 1. Initialize Frozen Encoders
+        self.img_enc = PretrainedImageEncoder(out_dim=2048)
+        self.text_enc = PretrainedTextEncoder(out_dim=768)
+        
+        # 2. Initialize FiLM Fusion Module
+        self.film = FiLMConditioning(text_dim=self.text_enc.out_dim, image_dim=self.img_enc.out_dim)
+        
+        # 3. Start Joint Encoder (q_start) - actively trained
         self.q_enc = nn.Sequential(
             nn.Linear(6, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, 128),
             nn.ReLU(inplace=True),
         )
-        fused = text_out_dim + image_out_dim + 128
+        
+        # 4. Final Policy/Metric Head - actively trained
+        # Input = Conditioned Image Features (2048) + Encoded Joints (128)
+        fused_dim = self.img_enc.out_dim + 128
         self.head = nn.Sequential(
-            nn.Linear(fused, 512),
+            nn.Linear(fused_dim, 1024),
+            nn.ReLU(inplace=True),
+            nn.Linear(1024, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, ntfield_h),
         )
 
-    def forward(self, images_bchw: torch.Tensor, prompts: List[str], q_start: torch.Tensor) -> torch.Tensor:
-        t = self.text_enc.encode(prompts)
-        im = self.img_enc(images_bchw)
+    def forward(self, images_bchw: torch.Tensor, prompts: list[str], q_start: torch.Tensor) -> torch.Tensor:
+        # Device management
+        device = images_bchw.device
+        
+        # 1. Extract Frozen Features
+        im_feats = self.img_enc(images_bchw)
+        text_feats = self.text_enc(prompts, device)
+        
+        # 2. Fuse Vision and Language via FiLM
+        # The visual features are actively shifted and scaled based on the text instruction
+        vis_lang_fused = self.film(im_feats, text_feats)
+        
+        # 3. Encode Proprioception (Joints)
         q = self.q_enc(q_start)
-        return self.head(torch.cat([t, im, q], dim=1))
-
+        
+        # 4. Predict the Goal Latent
+        final_input = torch.cat([vis_lang_fused, q], dim=1)
+        z_goal_hat = self.head(final_input)
+        
+        return z_goal_hat
 
 class H5GraspDemoDataset(Dataset):
     """One sample = (image_i, prompt, q_start_i, q_goal_final)."""
@@ -201,8 +248,9 @@ class H5GraspDemoDataset(Dataset):
             self._tfm = self._T.Compose(
                 [
                     self._T.ToPILImage(),
-                    self._T.Resize((img_size, img_size)),
+                    self._T.Resize((224, 224)), # Standard ResNet size
                     self._T.ToTensor(),
+                    self._T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # CRITICAL
                 ]
             )
         else:
@@ -319,9 +367,7 @@ def main() -> None:
     print(f"Using {len(paths)} HDF5 files")
 
     ds_full = H5GraspDemoDataset(paths, image_key=args.image_key)
-    prompts = [ds_full.prompts_per_file[ds_full.samples[i][0]] for i in range(len(ds_full))]
-    vocab = build_vocab_from_prompts(prompts)
-    print(f"Vocab size {len(vocab)}, samples {len(ds_full)}")
+    print(f"Samples {len(ds_full)}")
 
     n = len(ds_full)
     n_val = max(1, int(0.1 * n))
@@ -350,8 +396,10 @@ def main() -> None:
     )
 
     teacher, nt_h = load_teacher(args.checkpoint, device)
-    student = GoalLatentPredictor(vocab, text_max_len=96, ntfield_h=nt_h).to(device)
-    opt = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=1e-4)
+    student = GoalLatentPredictorWithFiLM(ntfield_h=nt_h).to(device)
+    # Only pass parameters that actually require gradients
+    trainable_params = filter(lambda p: p.requires_grad, student.parameters())
+    opt = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
 
     def teacher_z_goal(qs: torch.Tensor, qg: torch.Tensor) -> torch.Tensor:
         coords = build_coords_batch(qs, qg, args.normalize_coords).to(device)
@@ -405,7 +453,6 @@ def main() -> None:
 
     payload = {
         "student_state_dict": student.state_dict(),
-        "vocab": vocab,
         "ntfield_h": nt_h,
         "normalize_coords": args.normalize_coords,
         "loss": args.loss,

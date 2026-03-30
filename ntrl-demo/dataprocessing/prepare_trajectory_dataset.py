@@ -6,6 +6,10 @@ Loads RRT-generated trajectories from HDF5 files (produced by
 hanwen_grasping/new_setup_dataset_collect.py), samples (q_s, q_g) pairs
 with tau_obs (path length), and saves to points.npy and tau_obs.npy.
 
+For the same file format without RRT/OMPL supervision, use
+`dataprocessing/generate_straightline_collision_dataset.py` (collision-checked
+joint straight-line paths + table scene from robot_arm_configuration).
+
 Usage:
     python dataprocessing/prepare_trajectory_dataset.py \\
         --data_dir ../collected_data \\

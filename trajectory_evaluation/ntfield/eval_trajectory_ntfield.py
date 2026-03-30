@@ -2,8 +2,10 @@
 """
 Evaluate trajectory-trained NTField: field fit (tau vs tau_obs) and planning (gradient plan to q_goal).
 
+Headless-safe: matplotlib uses non-GUI backend (set MPLBACKEND before run to override, e.g. TkAgg).
+
 Run from PI-VLA root (recommended):
-  python trajectory_evaluation/eval_trajectory_ntfield.py \\
+  python trajectory_evaluation/ntfield/eval_trajectory_ntfield.py \\
     --checkpoint ntrl-demo/Experiments/UR5_trajectory/trajectory_XX_XX_XX_XX/Model_Epoch_00500_*.pt \\
     --data_path ntrl-demo/datasets/arm/UR5_trajectory \\
     --device cuda:0
@@ -16,14 +18,18 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+
+# Before ntrl-demo imports matplotlib/pyplot (training utilities), force a non-GUI backend.
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 from dataclasses import dataclass
 from typing import List, Tuple
 
 import numpy as np
 import torch
 
-# ntrl-demo is a sibling of trajectory_evaluation/ under PI-VLA
-_NTRL_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "ntrl-demo"))
+# ntrl-demo is under PI-VLA; this file lives in trajectory_evaluation/ntfield/
+_NTRL_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "ntrl-demo"))
 if _NTRL_ROOT not in sys.path:
     sys.path.insert(0, _NTRL_ROOT)
 
@@ -50,6 +56,61 @@ class _ModelShim:
 
     def __init__(self, function: model_function.Function):
         self.function = function
+
+
+def _trajectory_dataset_hint(data_path: str) -> str:
+    """If data_path is wrong, suggest sibling dirs that contain points.npy + tau_obs.npy."""
+    parent = os.path.dirname(os.path.abspath(data_path))
+    if not os.path.isdir(parent):
+        return ""
+    found = []
+    try:
+        for name in sorted(os.listdir(parent)):
+            d = os.path.join(parent, name)
+            if not os.path.isdir(d):
+                continue
+            if os.path.isfile(os.path.join(d, "points.npy")) and os.path.isfile(
+                os.path.join(d, "tau_obs.npy")
+            ):
+                found.append(d)
+    except OSError:
+        return ""
+    if not found:
+        return ""
+    rel = [os.path.relpath(p, os.getcwd()) for p in found[:5]]
+    extra = f"\n\nFound trajectory datasets under {parent}:\n  " + "\n  ".join(rel)
+    if len(found) > 5:
+        extra += f"\n  ... and {len(found) - 5} more"
+    return extra
+
+
+def _checkpoint_hint(missing_path: str) -> str:
+    """If checkpoint path is wrong, suggest paths under ntrl-demo/Experiments with same filename."""
+    base = os.path.basename(missing_path)
+    if not base or base == missing_path:
+        return ""
+    experiments = os.path.join(_NTRL_ROOT, "Experiments")
+    if not os.path.isdir(experiments):
+        return ""
+    matches = []
+    for dirpath, _, filenames in os.walk(experiments):
+        if base in filenames:
+            matches.append(os.path.join(dirpath, base))
+            if len(matches) >= 8:
+                break
+    if not matches:
+        return ""
+    lines = []
+    cwd = os.getcwd()
+    for p in matches[:8]:
+        try:
+            lines.append(os.path.relpath(p, cwd))
+        except ValueError:
+            lines.append(p)
+    extra = f"\n\nSame filename under ntrl-demo/Experiments:\n  " + "\n  ".join(lines)
+    if len(matches) >= 8:
+        extra += "\n  ..."
+    return extra
 
 
 def load_network_and_function(
@@ -167,7 +228,9 @@ def evaluate_planner(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate trajectory NTField checkpoint")
+    parser = argparse.ArgumentParser(
+        description="Evaluate trajectory NTField checkpoint (no display; MPLBACKEND=Agg unless set in env)"
+    )
     parser.add_argument("--checkpoint", type=str, required=True, help="Model_Epoch_*.pt from train_arm_trajectory")
     parser.add_argument("--data_path", type=str, required=True, help="Directory with points.npy and tau_obs.npy")
     parser.add_argument("--experiment_dir", type=str, default=None, help="Function log dir (default: checkpoint parent)")
@@ -202,7 +265,13 @@ def main() -> None:
     points_path = os.path.join(data_path, "points.npy")
     tau_path = os.path.join(data_path, "tau_obs.npy")
     if not os.path.isfile(points_path) or not os.path.isfile(tau_path):
-        raise FileNotFoundError(f"Need {points_path} and {tau_path}")
+        msg = (
+            f"Missing trajectory dataset files:\n  {points_path}\n  {tau_path}\n"
+            "These are produced by ntrl-demo/dataprocessing/prepare_trajectory_dataset.py "
+            "(--output_dir). Pass the directory that contains both .npy files as --data_path."
+        )
+        msg += _trajectory_dataset_hint(data_path)
+        raise FileNotFoundError(msg)
 
     points_np = np.load(points_path)
     tau_np = np.load(tau_path).astype(np.float64)
@@ -218,15 +287,24 @@ def main() -> None:
     points_t = torch.tensor(points_np, dtype=torch.float32)
     tau_t = torch.tensor(tau_np, dtype=torch.float32)
 
+    ckpt_path = os.path.abspath(args.checkpoint)
+    if not os.path.isfile(ckpt_path):
+        msg = (
+            f"Checkpoint not found: {ckpt_path}\n"
+            "(Pass --checkpoint as one line, e.g. .../Model_Epoch_05000_ValLoss_7.820605e-01.pt)"
+        )
+        msg += _checkpoint_hint(ckpt_path)
+        raise FileNotFoundError(msg)
+
     _, function = load_network_and_function(
-        os.path.abspath(args.checkpoint),
+        ckpt_path,
         args.experiment_dir,
         device,
         dim=6,
     )
 
     print(f"Dataset: n={n}, val holdout: {n_val} (val_ratio={args.val_ratio}, seed={args.seed})")
-    print(f"Checkpoint: {args.checkpoint}")
+    print(f"Checkpoint: {ckpt_path}")
     print(f"Device: {device}")
 
     val_points = points_t[val_idx]

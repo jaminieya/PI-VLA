@@ -51,6 +51,9 @@ ntrl-demo/Experiments/
 # Collected robot trajectories (HDF5); large; keep local
 collected_data/
 
+# Runtime outputs (eval videos, logs, local experiment artifacts)
+output/
+
 # Collected runtime outputs from grasping scripts
 hanwen_grasping/saved_as_result/
 

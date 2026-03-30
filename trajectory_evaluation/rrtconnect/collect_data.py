@@ -1,15 +1,13 @@
 #
-# File:          trajectory_evaluation/collect_data.py
-# Brief:         Same pipeline as hanwen_grasping/collect_data/collect_data.py (RRT*/grasp, Isaac capture).
-#                HDF5: images = new_setup.py global camera (3,0,0.3)->(0,0,0); images_side = top view.
-#                Saves under PI-VLA/output/trajectory_evaluation/YYYYMMDD_HHMMSS/grasp_6dof_demo_*.h5,
-#                writes collection_meta.txt, then runs run_isaac_ntfield_demo.sh (unless disabled).
+# File:          trajectory_evaluation/rrtconnect/collect_data.py
+# Brief:         RRTConnect + grasp + Isaac HDF5 capture (same idea as hanwen_grasping/collect_data).
+#                After save, optional demos via trajectory_evaluation/ntfield/run_isaac_ntfield_demo.sh:
+#                  (1) original.mp4 = logged RRT trajectory replay
+#                  (2) ntfield.mp4   = NTField trained on RRT/trajectory data (--ntfield_checkpoint)
+#                  (3) ntfield_straightline.mp4 = NTField NOT from RRT labels (--ntfield_checkpoint_straightline)
 #
-# Run (from anywhere):
-#   python trajectory_evaluation/collect_data.py
-#   python trajectory_evaluation/collect_data.py --use_viewer
-#   python trajectory_evaluation/collect_data.py --no_run_ntfield_demo
-# Default: headless (no Isaac viewer). Cameras still render for HDF5.
+# Run (from PI-VLA root): python trajectory_evaluation/rrtconnect/collect_data.py ...
+# Default: headless. Cameras still render for HDF5.
 #
 
 from datetime import datetime
@@ -25,7 +23,7 @@ from trac_ik_python.trac_ik import IK
 import sys
 import os
 
-_PI_VLA_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PI_VLA_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 HANWEN_GRASPING_ROOT = os.path.join(_PI_VLA_ROOT, "hanwen_grasping")
 file_dir = os.path.join(HANWEN_GRASPING_ROOT, "collect_data")
 util_dir = os.path.join(file_dir, "./util")
@@ -763,7 +761,13 @@ if __name__ == '__main__':
                 "name": "--ntfield_checkpoint",
                 "type": str,
                 "default": None,
-                "help": "Optional .pt path for run_isaac_ntfield_demo.sh (second argument)",
+                "help": "Optional .pt trained on RRT/trajectory data — 2nd arg to run_isaac_ntfield_demo.sh (ntfield.mp4)",
+            },
+            {
+                "name": "--ntfield_checkpoint_straightline",
+                "type": str,
+                "default": None,
+                "help": "Optional .pt trained WITHOUT RRT (e.g. generate_straightline_collision_dataset) — 3rd arg; writes ntfield_straightline.mp4",
             },
             {
                 "name": "--save_legacy_collected",
@@ -1412,8 +1416,14 @@ if __name__ == '__main__':
             f"prompt: {prompt}",
             f"object_location: {object_location}",
             f"num_samples: {num_samples}",
-            f"source: trajectory_evaluation/collect_data.py",
+            f"source: trajectory_evaluation/rrtconnect/collect_data.py",
         ]
+        if getattr(args, "ntfield_checkpoint", None):
+            meta_lines.append(f"ntfield_checkpoint_rrt: {os.path.abspath(args.ntfield_checkpoint)}")
+        if getattr(args, "ntfield_checkpoint_straightline", None):
+            meta_lines.append(
+                f"ntfield_checkpoint_straightline: {os.path.abspath(args.ntfield_checkpoint_straightline)}"
+            )
         with open(os.path.join(session_dir, "collection_meta.txt"), "w") as mf:
             mf.write("\n".join(meta_lines) + "\n")
 
@@ -1425,13 +1435,20 @@ if __name__ == '__main__':
             print(f"Legacy copy: {legacy_path}")
 
         if not getattr(args, "no_run_ntfield_demo", False):
-            demo_sh = os.path.join(pi_vla_root, "trajectory_evaluation", "run_isaac_ntfield_demo.sh")
+            demo_sh = os.path.join(
+                pi_vla_root, "trajectory_evaluation", "ntfield", "run_isaac_ntfield_demo.sh"
+            )
             if not os.path.isfile(demo_sh):
                 print(f"Warning: demo script not found at {demo_sh}; skipping.")
             else:
                 demo_cmd = ["bash", demo_sh, out_path]
                 ckpt = getattr(args, "ntfield_checkpoint", None)
-                if ckpt:
+                ckpt_sl = getattr(args, "ntfield_checkpoint_straightline", None)
+                # Shell expects: H5 [CKPT_RRT] [CKPT_SL]. If only straight-line ckpt given, pass "" for RRT slot so bash uses DEFAULT_CKPT.
+                if ckpt_sl:
+                    demo_cmd.append(os.path.abspath(ckpt) if ckpt else "")
+                    demo_cmd.append(os.path.abspath(ckpt_sl))
+                elif ckpt:
                     demo_cmd.append(os.path.abspath(ckpt))
                 print(f"Running: {' '.join(demo_cmd)}")
                 demo_env = os.environ.copy()

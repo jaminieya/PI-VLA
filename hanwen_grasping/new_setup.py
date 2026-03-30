@@ -1458,6 +1458,9 @@ if __name__ == '__main__':
     if record_frames and len(record_frames) > 0:
         out_path = getattr(args, 'record_output', 'ntfield_record.mp4')
         out_path = os.path.abspath(out_path)
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         saved = False
         try:
             import imageio
@@ -1504,4 +1507,4 @@ if __name__ == '__main__':
     if viewer is not None:
         gym.destroy_viewer(viewer)
     gym.destroy_sim(sim)
-    sys.exit(1)
+    sys.exit(0)

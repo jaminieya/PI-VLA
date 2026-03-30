@@ -2,6 +2,24 @@
 
 Canonical command paths live under **`trajectory_evaluation/ntfield/`** (see [`../ntfield/README.md`](../ntfield/README.md)).
 
+## `rrtconnect/collect_data.py` — three-way comparison videos
+
+After an HDF5 is saved, [`run_isaac_ntfield_demo.sh`](../ntfield/run_isaac_ntfield_demo.sh) can produce:
+
+1. **`original.mp4`** — replay of the **logged RRTConnect** joint trajectory from the HDF5.  
+2. **`ntfield.mp4`** — **`new_setup.py --ntfield`** with **`--ntfield_checkpoint`** (model trained on **RRT / trajectory** `points.npy` + `tau_obs.npy`).  
+3. **`ntfield_straightline.mp4`** — same HDF5 start/goal, with **`--ntfield_checkpoint_straightline`** (model trained **without** RRT labels, e.g. `generate_straightline_collision_dataset.py`).
+
+Example:
+
+```bash
+python trajectory_evaluation/rrtconnect/collect_data.py \
+  --ntfield_checkpoint ntrl-demo/Experiments/.../Model_RRT_train.pt \
+  --ntfield_checkpoint_straightline ntrl-demo/Experiments/.../Model_straightline_train.pt
+```
+
+Pass **`--no_run_ntfield_demo`** to skip all demos.
+
 Evaluate checkpoints produced by `train_arm_trajectory.py` on trajectory data (`points.npy`, `tau_obs.npy`).
 
 ## Usage

@@ -20,6 +20,9 @@ Usage (recommended from PI-VLA root):
     --output_dir ntrl-demo/datasets/arm/UR5_straightline \\
     --num_pairs 100000
 
+Default ``--sample_mode gaussian`` draws poses near the collect_data UR5 home (high acceptance).
+Wide ``--sample_mode uniform`` is collision-sparse; use a large ``--max_tries_factor``.
+
 The script temporarily changes cwd to hanwen_grasping so URDF/STL paths resolve like new_setup.py.
 """
 
@@ -42,6 +45,9 @@ from trajectory_sampler import SCALE
 
 if not os.path.isdir(_HANWEN_ROOT):
     raise FileNotFoundError(f"Expected hanwen_grasping at {_HANWEN_ROOT}")
+
+# Matches hanwen_grasping get_path2grasp / collect_data nominal home configuration (radians).
+UR5E_HOME_JOINTS = np.array([0.7, -2.0, 2.5, -0.3, 0.7, 0.0], dtype=np.float64)
 
 
 def segment_collision_free(rac, q_s, q_g, plane_obj, static_env_models, n_checks: int) -> bool:
@@ -71,8 +77,8 @@ def main() -> None:
     parser.add_argument(
         "--max_tries_factor",
         type=int,
-        default=50,
-        help="Stop after max_tries_factor * num_pairs proposals if undersampled",
+        default=500,
+        help="Stop after max_tries_factor * num_pairs proposals if undersampled (uniform mode needs large values)",
     )
     parser.add_argument("--tau_min", type=float, default=0.01)
     parser.add_argument("--tau_max", type=float, default=2.0)
@@ -89,7 +95,39 @@ def main() -> None:
         "--norm_limit",
         type=float,
         default=0.5,
-        help="Sample q/SCALE uniformly in [-norm_limit, norm_limit] per joint (matches common NTField box)",
+        help="With --sample_mode uniform: q in [-norm_limit*SCALE, norm_limit*SCALE] per joint",
+    )
+    parser.add_argument(
+        "--sample_mode",
+        type=str,
+        choices=("gaussian", "uniform"),
+        default="gaussian",
+        help="gaussian: q_s,q_g ~ N(nominal, sigma^2) per joint (high accept rate); uniform: wide box (very sparse)",
+    )
+    parser.add_argument(
+        "--nominal",
+        type=float,
+        nargs=6,
+        default=None,
+        metavar=("q1", "q2", "q3", "q4", "q5", "q6"),
+        help="Joint reference for gaussian mode (radians). Default: UR5e home from collect_data.",
+    )
+    parser.add_argument(
+        "--sigma",
+        type=float,
+        default=0.85,
+        help="Std (rad) per joint for gaussian sampling around nominal",
+    )
+    parser.add_argument(
+        "--q_clip",
+        type=float,
+        default=None,
+        help="If set, clip each joint to [-q_clip, q_clip] after sampling (radians)",
+    )
+    parser.add_argument(
+        "--allow_partial",
+        action="store_true",
+        help="If set, save as many pairs as collected before max_tries instead of raising",
     )
     args = parser.parse_args()
 
@@ -98,6 +136,9 @@ def main() -> None:
 
     _saved_cwd = os.getcwd()
     try:
+        # Imports resolve against sys.path, not cwd; chdir alone does not load hanwen_grasping.
+        if _HANWEN_ROOT not in sys.path:
+            sys.path.insert(0, _HANWEN_ROOT)
         os.chdir(_HANWEN_ROOT)
         import fcl  # noqa: F401 — ensures same env as rest of hanwen stack
         import robot_arm_configuration as RC
@@ -119,21 +160,40 @@ def main() -> None:
     span = 2.0 * args.norm_limit * SCALE
     low = -span * 0.5 + 0.0  # [-norm_limit * SCALE, norm_limit * SCALE]
     high = span * 0.5
+    nominal = np.asarray(args.nominal if args.nominal is not None else UR5E_HOME_JOINTS, dtype=np.float64).reshape(
+        6
+    )
+    q_clip = float(args.q_clip) if args.q_clip is not None else None
 
     points_list: list[np.ndarray] = []
     tau_list: list[float] = []
     max_tries = max(args.num_pairs * args.max_tries_factor, args.num_pairs + 1)
     tries = 0
 
-    print(
-        f"Sampling collision-free straight-line pairs (joint box [{low:.4f}, {high:.4f}] rad per dim), "
-        f"tau in [{args.tau_min}, {args.tau_max}], scene_info={scene_info}..."
-    )
+    if args.sample_mode == "gaussian":
+        print(
+            f"Sampling collision-free straight-line pairs (mode=gaussian, nominal={nominal.tolist()}, "
+            f"sigma={args.sigma}, tau in [{args.tau_min}, {args.tau_max}], scene_info={scene_info})..."
+        )
+    else:
+        print(
+            f"Sampling collision-free straight-line pairs (mode=uniform, joint box [{low:.4f}, {high:.4f}] rad/dim, "
+            f"tau in [{args.tau_min}, {args.tau_max}], scene_info={scene_info})..."
+        )
+
+    def draw_pair() -> tuple[np.ndarray, np.ndarray]:
+        if args.sample_mode == "uniform":
+            return rng.uniform(low, high, size=6), rng.uniform(low, high, size=6)
+        q_s = nominal + rng.normal(0.0, args.sigma, size=6)
+        q_g = nominal + rng.normal(0.0, args.sigma, size=6)
+        if q_clip is not None:
+            q_s = np.clip(q_s, -q_clip, q_clip)
+            q_g = np.clip(q_g, -q_clip, q_clip)
+        return q_s, q_g
 
     while len(points_list) < args.num_pairs and tries < max_tries:
         tries += 1
-        q_s = rng.uniform(low, high, size=6)
-        q_g = rng.uniform(low, high, size=6)
+        q_s, q_g = draw_pair()
         tau = float(np.linalg.norm(q_g - q_s))
         if tau < args.tau_min or tau > args.tau_max:
             continue
@@ -148,14 +208,22 @@ def main() -> None:
         points_list.append(np.concatenate([q_s_norm, q_g_norm]))
         tau_list.append(tau)
 
-        if len(points_list) % 10000 == 0:
+        if len(points_list) % 10000 == 0 and len(points_list) > 0:
             print(f"  accepted {len(points_list)} / {args.num_pairs} (tries={tries})")
 
     if len(points_list) < args.num_pairs:
-        raise RuntimeError(
-            f"Only collected {len(points_list)} pairs (need {args.num_pairs}). "
-            "Relax tau bounds, increase --norm_limit, reduce clutter, or raise --max_tries_factor."
+        msg = (
+            f"Only collected {len(points_list)} pairs (need {args.num_pairs}) after {tries} tries. "
+            "Try: --sample_mode gaussian (default), adjust --sigma/--nominal, widen --tau_max, "
+            "raise --max_tries_factor, or --allow_partial to save what was found."
         )
+        if args.allow_partial and len(points_list) > 0:
+            print(f"Warning: {msg}\nSaving partial dataset.")
+        else:
+            raise RuntimeError(msg)
+
+    if len(points_list) == 0:
+        raise RuntimeError("No samples accepted; try gaussian mode, larger sigma, or looser tau bounds.")
 
     points = np.stack(points_list, axis=0)
     tau_obs = np.array(tau_list, dtype=np.float32)

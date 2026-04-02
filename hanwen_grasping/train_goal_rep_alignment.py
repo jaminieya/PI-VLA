@@ -89,22 +89,34 @@ class PretrainedImageEncoder(nn.Module):
         # Load a pre-trained ResNet50 (Standard practice for R3M base)
         # Note: If using the actual r3m library, you would load it here:
         # self.backbone = r3m.load_model("resnet50")
-        resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        # torchvision compatibility:
+        # - newer: resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        # - older: resnet50(pretrained=True)
+        try:
+            resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        except AttributeError:
+            resnet = models.resnet50(pretrained=True)
         
         # Strip the final classification layer to get the raw feature vector
+        # and keep access to named stages so we can selectively unfreeze layer4.
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
         self.out_dim = out_dim
         
-        # FREEZE the visual backbone
+        # Freeze all visual backbone parameters first.
         self.backbone.eval()
         for param in self.backbone.parameters():
             param.requires_grad = False
+        # Then unfreeze only the last residual stage (layer4) to adapt to
+        # overhead grasping-domain imagery while keeping earlier features stable.
+        # In torchvision ResNet child ordering, index 7 corresponds to layer4.
+        for param in self.backbone[7].parameters():
+            param.requires_grad = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Ensure gradients are not tracked for the backbone
-        with torch.no_grad():
-            features = self.backbone(x)
-        return features.flatten(1) # Output shape: (B, 2048)
+        # No no_grad wrapper — layer4 needs to receive gradients.
+        # Frozen layers won't update anyway since requires_grad=False.
+        features = self.backbone(x)
+        return features.flatten(1)
 
 
 # ==========================================
@@ -117,7 +129,12 @@ class PretrainedTextEncoder(nn.Module):
     def __init__(self, model_name: str = 'distilbert-base-uncased', out_dim: int = 768):
         super().__init__()
         self.tokenizer = DistilBertTokenizer.from_pretrained(model_name)
-        self.transformer = DistilBertModel.from_pretrained(model_name)
+        # Older torch versions (e.g., 1.x) can fail loading safetensors
+        # due to missing torch.frombuffer; force .bin checkpoint loading.
+        self.transformer = DistilBertModel.from_pretrained(
+            model_name,
+            use_safetensors=False,
+        )
         self.out_dim = out_dim
         
         # FREEZE the language backbone
@@ -240,6 +257,9 @@ class H5GraspDemoDataset(Dataset):
     ):
         self.samples: List[Tuple[str, int]] = []
         self.prompts_per_file: Dict[str, str] = {}
+        self._bad_samples: set[Tuple[str, int]] = set()
+        self._bad_files: set[str] = set()
+        self._bad_file_hits: Dict[str, int] = {}
         self.image_key = image_key
         self.img_size = img_size
         self._T = _maybe_torchvision()
@@ -260,16 +280,20 @@ class H5GraspDemoDataset(Dataset):
 
         for path in h5_paths:
             path = os.path.abspath(path)
-            with h5py.File(path, "r") as f:
-                if image_key not in f or "joint_configs" not in f or "final_joint_config" not in f:
-                    continue
-                n = f[image_key].shape[0]
-                pr = f.attrs.get("prompt", "")
-                if isinstance(pr, bytes):
-                    pr = pr.decode("utf-8", errors="replace")
-                self.prompts_per_file[path] = str(pr)
-                for i in range(n):
-                    self.samples.append((path, i))
+            try:
+                with h5py.File(path, "r") as f:
+                    if image_key not in f or "joint_configs" not in f or "final_joint_config" not in f:
+                        continue
+                    n = f[image_key].shape[0]
+                    pr = f.attrs.get("prompt", "")
+                    if isinstance(pr, bytes):
+                        pr = pr.decode("utf-8", errors="replace")
+                    self.prompts_per_file[path] = str(pr)
+                    for i in range(n):
+                        self.samples.append((path, i))
+            except OSError:
+                print(f"[warn] Skipping non-HDF5 or corrupted file: {path}")
+                continue
 
         if not self.samples:
             raise ValueError("No samples found. Check --h5_glob and HDF5 keys (images, joint_configs).")
@@ -295,14 +319,36 @@ class H5GraspDemoDataset(Dataset):
     def __getitem__(self, idx: int):
         import h5py
 
-        path, i = self.samples[idx]
-        with h5py.File(path, "r") as f:
-            img = np.array(f[self.image_key][i])
-            q_start = np.array(f["joint_configs"][i, :6], dtype=np.float32)
-            q_goal = np.array(f["final_joint_config"][:6], dtype=np.float32)
-        pr = self.prompts_per_file[path]
-        x = self._image_to_tensor(img)
-        return x, pr, torch.from_numpy(q_start), torch.from_numpy(q_goal)
+        n = len(self.samples)
+        max_retries = min(256, n)
+        # Probe varied indices to avoid getting stuck in one corrupted region/file.
+        for step in range(max_retries):
+            # Large odd stride gives good coverage across the dataset index space.
+            j = (idx + step * 9973) % n
+            path, i = self.samples[j]
+            if path in self._bad_files or (path, i) in self._bad_samples:
+                continue
+            try:
+                with h5py.File(path, "r") as f:
+                    img = np.array(f[self.image_key][i])
+                    q_start = np.array(f["joint_configs"][i, :6], dtype=np.float32)
+                    q_goal = np.array(f["final_joint_config"][:6], dtype=np.float32)
+                pr = self.prompts_per_file[path]
+                x = self._image_to_tensor(img)
+                return x, pr, torch.from_numpy(q_start), torch.from_numpy(q_goal)
+            except OSError:
+                self._bad_samples.add((path, i))
+                hits = self._bad_file_hits.get(path, 0) + 1
+                self._bad_file_hits[path] = hits
+                print(f"[warn] Skipping unreadable sample: file={path} idx={i}")
+                if hits >= 32:
+                    self._bad_files.add(path)
+                    print(f"[warn] Marking file as bad after repeated read failures: {path}")
+                continue
+
+        raise RuntimeError(
+            f"Failed to read dataset sample at idx={idx}; no readable sample found after {max_retries} attempts."
+        )
 
 
 def collate_fn(batch):
@@ -340,6 +386,12 @@ def main() -> None:
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument(
+        "--warmup_pct",
+        type=float,
+        default=0.1,
+        help="Fraction of total OneCycle steps used for linear warmup.",
+    )
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--image_key", type=str, default="images", help="HDF5 dataset name (images or image)")
     p.add_argument(
@@ -354,6 +406,18 @@ def main() -> None:
         choices=["mse", "cosine"],
         default="mse",
         help="cosine = 1 - cos(z_hat, z_goal); useful if scales drift",
+    )
+    p.add_argument(
+        "--triplet_weight",
+        type=float,
+        default=0.1,
+        help="Weight for batch triplet margin loss added to base loss.",
+    )
+    p.add_argument(
+        "--triplet_margin",
+        type=float,
+        default=0.5,
+        help="Margin used by batch triplet loss (anchor=z_hat, pos=z_goal_i, neg=z_goal_j).",
     )
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
@@ -398,14 +462,52 @@ def main() -> None:
     teacher, nt_h = load_teacher(args.checkpoint, device)
     student = GoalLatentPredictorWithFiLM(ntfield_h=nt_h).to(device)
     # Only pass parameters that actually require gradients
-    trainable_params = filter(lambda p: p.requires_grad, student.parameters())
+    trainable_params = [p for p in student.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        opt,
+        max_lr=args.lr,
+        steps_per_epoch=len(loader_tr),
+        epochs=args.epochs,
+        pct_start=args.warmup_pct,
+    )
 
     def teacher_z_goal(qs: torch.Tensor, qg: torch.Tensor) -> torch.Tensor:
         coords = build_coords_batch(qs, qg, args.normalize_coords).to(device)
         with torch.no_grad():
             _, zg = teacher.encode_pair_latents(coords)
         return zg
+
+    def base_alignment_loss(z_hat: torch.Tensor, z_tgt: torch.Tensor) -> torch.Tensor:
+        if args.loss == "mse":
+            return F.mse_loss(z_hat, z_tgt)
+        z_hat_n = F.normalize(z_hat, dim=1)
+        z_tgt_n = F.normalize(z_tgt, dim=1)
+        return (1.0 - (z_hat_n * z_tgt_n).sum(dim=1)).mean()
+
+    def batch_triplet_loss(z_hat: torch.Tensor, z_tgt: torch.Tensor, margin: float = 0.5) -> torch.Tensor:
+        if z_hat.shape[0] <= 1:
+            return z_hat.new_tensor(0.0)
+
+        # Normalize FIRST — margin is meaningful in unit-sphere geometry.
+        z_hat = F.normalize(z_hat, dim=1)
+        z_tgt = F.normalize(z_tgt, dim=1)
+
+        # Hard negatives: closest distinct target in the batch.
+        # Mask out near-identical vectors (including the diagonal and duplicates)
+        # to avoid false negatives that produce uninformative triplet gradients.
+        with torch.no_grad():
+            dists = torch.cdist(z_tgt, z_tgt, p=2)
+            dists[dists < 1e-5] = float("inf")
+            if torch.isinf(dists).all():
+                return z_hat.new_tensor(0.0)
+            neg_idx = dists.argmin(dim=1)
+
+        neg_z = z_tgt[neg_idx]
+
+        return F.triplet_margin_loss(z_hat, z_tgt, neg_z, margin=margin)
+
+    out_path = os.path.abspath(args.out)
 
     for epoch in range(args.epochs):
         student.train()
@@ -417,15 +519,13 @@ def main() -> None:
             qg = qg.to(device)
             z_tgt = teacher_z_goal(qs, qg)
             z_hat = student(imgs, prs, qs)
-            if args.loss == "mse":
-                loss = F.mse_loss(z_hat, z_tgt)
-            else:
-                z_hat_n = F.normalize(z_hat, dim=1)
-                z_tgt_n = F.normalize(z_tgt, dim=1)
-                loss = (1.0 - (z_hat_n * z_tgt_n).sum(dim=1)).mean()
+            align_loss = base_alignment_loss(z_hat, z_tgt)
+            trip_loss = batch_triplet_loss(z_hat, z_tgt, margin=args.triplet_margin)
+            loss = align_loss + args.triplet_weight * trip_loss
             opt.zero_grad()
             loss.backward()
             opt.step()
+            scheduler.step()
             run += float(loss.item())
             n_b += 1
         train_loss = run / max(1, n_b)
@@ -440,30 +540,56 @@ def main() -> None:
                 qg = qg.to(device)
                 z_tgt = teacher_z_goal(qs, qg)
                 z_hat = student(imgs, prs, qs)
-                if args.loss == "mse":
-                    loss = F.mse_loss(z_hat, z_tgt)
-                else:
-                    z_hat_n = F.normalize(z_hat, dim=1)
-                    z_tgt_n = F.normalize(z_tgt, dim=1)
-                    loss = (1.0 - (z_hat_n * z_tgt_n).sum(dim=1)).mean()
+                align_loss = base_alignment_loss(z_hat, z_tgt)
+                trip_loss = batch_triplet_loss(z_hat, z_tgt, margin=args.triplet_margin)
+                loss = align_loss + args.triplet_weight * trip_loss
                 vrun += float(loss.item())
                 vb += 1
         val_loss = vrun / max(1, vb)
-        print(f"epoch {epoch+1}/{args.epochs}  train_{args.loss}={train_loss:.6f}  val_{args.loss}={val_loss:.6f}")
+        print(
+            f"epoch {epoch+1}/{args.epochs}  train_{args.loss}={train_loss:.6f}  val_{args.loss}={val_loss:.6f}",
+            flush=True,
+        )
 
-    payload = {
+        # Save checkpoint every epoch with an epoch-specific suffix.
+        epoch_suffix = f"_epoch{epoch+1:03d}"
+        base, ext = os.path.splitext(out_path)
+        epoch_path = base + epoch_suffix + (ext or ".pt")
+        payload_epoch = {
+            "student_state_dict": student.state_dict(),
+            "ntfield_h": nt_h,
+            "normalize_coords": args.normalize_coords,
+            "loss": args.loss,
+            "triplet_weight": args.triplet_weight,
+            "triplet_margin": args.triplet_margin,
+            "lr_scheduler": "OneCycleLR",
+            "warmup_pct": args.warmup_pct,
+            "image_key": args.image_key,
+            "checkpoint_teacher": os.path.abspath(args.checkpoint),
+            "epoch": int(epoch + 1),
+        }
+        torch.save(payload_epoch, epoch_path)
+        with open(epoch_path + ".json", "w") as f:
+            json.dump({k: v for k, v in payload_epoch.items() if k != "student_state_dict"}, f, indent=2)
+
+    # Final checkpoint at the user-specified output path (no epoch suffix).
+    payload_final = {
         "student_state_dict": student.state_dict(),
         "ntfield_h": nt_h,
         "normalize_coords": args.normalize_coords,
         "loss": args.loss,
+        "triplet_weight": args.triplet_weight,
+        "triplet_margin": args.triplet_margin,
+        "lr_scheduler": "OneCycleLR",
+        "warmup_pct": args.warmup_pct,
         "image_key": args.image_key,
         "checkpoint_teacher": os.path.abspath(args.checkpoint),
+        "epoch": int(args.epochs),
     }
-    out_path = os.path.abspath(args.out)
-    torch.save(payload, out_path)
+    torch.save(payload_final, out_path)
     with open(out_path + ".json", "w") as f:
-        json.dump({k: v for k, v in payload.items() if k != "student_state_dict"}, f, indent=2)
-    print(f"Saved student to {out_path}")
+        json.dump({k: v for k, v in payload_final.items() if k != "student_state_dict"}, f, indent=2)
+    print(f"Saved final student to {out_path}", flush=True)
 
 
 if __name__ == "__main__":

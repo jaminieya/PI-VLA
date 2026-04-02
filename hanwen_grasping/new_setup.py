@@ -1061,6 +1061,7 @@ if __name__ == '__main__':
     envs = []
     ur5e_handles = []
     body_cam_handles = []
+    top_cam_handles = []
     camera_candidates = []
     # chosen_object = []
     chosen_scale = []
@@ -1226,12 +1227,18 @@ if __name__ == '__main__':
                                 viewpoint_candidate, 
                                 camera_focus)
 
+        # Top-down camera matching starter_code/collect_data.py angle
+        top_cam_handles.append(gym.create_camera_sensor(envs[-1], camera_props))
+        top_cam_pos = gymapi.Vec3(table_pose.p.x, table_pose.p.y + 0.001, 2)
+        top_cam_target = gymapi.Vec3(table_pose.p.x - 0.5, table_pose.p.y, table_pose.p.z)
+        gym.set_camera_location(top_cam_handles[-1], envs[-1], top_cam_pos, top_cam_target)
+
     #*************************************************************************************************#
 
     #*************************************************************************************************#
     if viewer is not None:
-        cam_pos = gymapi.Vec3(2.2, 0, 0.5)
-        cam_target = gymapi.Vec3(0, 0, 0.5)
+        cam_pos = gymapi.Vec3(table_pose.p.x, table_pose.p.y + 0.001, 2)
+        cam_target = gymapi.Vec3(table_pose.p.x - 0.5, table_pose.p.y, table_pose.p.z)
         gym.viewer_camera_look_at(viewer, None, cam_pos, cam_target)
     gym.set_light_parameters(sim, 0, gymapi.Vec3(0.3, 0.3, 0.3), gymapi.Vec3(1.0, 1.0, 1.0),
                                     gymapi.Vec3(-1.0, 0.0, 0.0))
@@ -1498,7 +1505,7 @@ if __name__ == '__main__':
 
         if record_frames is not None:
             gym.render_all_camera_sensors(sim)
-            raw = gym.get_camera_image(sim, envs[-1], body_cam_handles[-1], gymapi.IMAGE_COLOR)
+            raw = gym.get_camera_image(sim, envs[-1], top_cam_handles[-1], gymapi.IMAGE_COLOR)
             rgba = raw.reshape(camera_props.height, camera_props.width, 4)
             rgb = rgba[..., :3].copy()
             record_frames.append(rgb)

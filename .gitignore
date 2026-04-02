@@ -64,3 +64,6 @@ hanwen_grasping/assets/
 ntrl-demo/datasets/
 
 *.mp4
+
+
+hanwen_grasping/checkpoints/

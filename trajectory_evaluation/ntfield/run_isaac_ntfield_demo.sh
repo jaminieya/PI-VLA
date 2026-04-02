@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Replay an HDF5 trajectory vs NTField-planned trajectory in Isaac Gym; save MP4s under output/trajectory_evaluation/.
 #
-# Typical flow: trajectory_evaluation/ntfield/collect_data.py saves a new .h5 under
-#   output/trajectory_evaluation/YYYYMMDD_HHMMSS/, then runs this script (unless --no_run_ntfield_demo).
+# Typical flow: trajectory_evaluation/rrtconnect/collect_data*.py saves a new .h5, then runs this script
+#   (unless --no_run_ntfield_demo).
+#
+# Video order: set DEMO_ORDER=rrt_first (default) or DEMO_ORDER=ntfield_first
+#   rrt_first:      run_collected_trajectory (original.mp4) then new_setup --ntfield (ntfield.mp4)
+#   ntfield_first:  new_setup --ntfield then run_collected_trajectory
 #
 # Usage (from anywhere):
 #   bash trajectory_evaluation/ntfield/run_isaac_ntfield_demo.sh
@@ -68,11 +72,25 @@ else
   echo "=== No YYYYMMDD_HHMMSS in h5 basename; writing flat under output/trajectory_evaluation/"
 fi
 
-echo "=== Original trajectory replay -> ${ORIG_MP4}"
-python run_collected_trajectory.py "${RC_ARGS[@]}"
+DEMO_ORDER="${DEMO_ORDER:-rrt_first}"
 
-echo "=== NTField plan (RRT / trajectory-supervised checkpoint) -> ${NT_MP4}"
-python new_setup.py "${NS_ARGS[@]}"
+run_rrt_replay() {
+  echo "=== Original trajectory replay (HDF5 joint_configs) -> ${ORIG_MP4}"
+  python run_collected_trajectory.py "${RC_ARGS[@]}"
+}
+
+run_ntfield_plan() {
+  echo "=== NTField plan (RRT / trajectory-supervised checkpoint) -> ${NT_MP4}"
+  python new_setup.py "${NS_ARGS[@]}"
+}
+
+if [[ "${DEMO_ORDER}" == "ntfield_first" ]]; then
+  run_ntfield_plan
+  run_rrt_replay
+else
+  run_rrt_replay
+  run_ntfield_plan
+fi
 
 if [[ -n "${CKPT_STRAIGHTLINE}" ]]; then
   if [[ ! -f "${CKPT_STRAIGHTLINE}" ]]; then
@@ -86,7 +104,7 @@ if [[ -n "${CKPT_STRAIGHTLINE}" ]]; then
   python new_setup.py "${NS_SL_ARGS[@]}"
 fi
 
-echo "Done. Videos:"
+echo "Done. DEMO_ORDER=${DEMO_ORDER} videos:"
 echo "  $ORIG_MP4"
 echo "  $NT_MP4"
 if [[ -n "${CKPT_STRAIGHTLINE}" ]]; then

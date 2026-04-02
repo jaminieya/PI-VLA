@@ -1,10 +1,9 @@
 #
 # File:          trajectory_evaluation/rrtconnect/collect_data.py
-# Brief:         RRTConnect + grasp + Isaac HDF5 capture (same idea as hanwen_grasping/collect_data).
-#                After save, optional demos via trajectory_evaluation/ntfield/run_isaac_ntfield_demo.sh:
-#                  (1) original.mp4 = logged RRT trajectory replay
-#                  (2) ntfield.mp4   = NTField trained on RRT/trajectory data (--ntfield_checkpoint)
-#                  (3) ntfield_straightline.mp4 = NTField NOT from RRT labels (--ntfield_checkpoint_straightline)
+# Brief:         RRTConnect + grasp + Isaac HDF5 capture (joint_configs = RRT path).
+#                For HDF5 filled with NTField-planned joints, use collect_data_ntfield_hdf5.py.
+#                After save, optional demos: run_isaac_ntfield_demo.sh with DEMO_ORDER=rrt_first (default):
+#                  (1) original.mp4 = HDF5 (RRT) replay, (2) ntfield.mp4, (3) optional straight-line ckpt.
 #
 # Run (from PI-VLA root): python trajectory_evaluation/rrtconnect/collect_data.py ...
 # Default: headless. Cameras still render for HDF5.
@@ -24,6 +23,17 @@ import sys
 import os
 
 _PI_VLA_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _resolve_pi_vla_checkpoint(path):
+    """Resolve --ntfield_checkpoint paths relative to PI-VLA root, not the shell cwd."""
+    if not path:
+        return path
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+    return os.path.normpath(os.path.join(_PI_VLA_ROOT, path))
+
+
 HANWEN_GRASPING_ROOT = os.path.join(_PI_VLA_ROOT, "hanwen_grasping")
 file_dir = os.path.join(HANWEN_GRASPING_ROOT, "collect_data")
 util_dir = os.path.join(file_dir, "./util")
@@ -463,44 +473,6 @@ def get_swept_volume_size(main_swept):
     return max_y - min_y
 
 
-def interpolate_path(path, steps_between=4):
-    """Interpolate between consecutive waypoints to get denser trajectory.
-    steps_between: number of intermediate points to add between each pair of waypoints.
-    Returns a new path with (len(path)-1)*steps_between + len(path) waypoints."""
-    if not path or len(path) < 2:
-        return path
-    interpolated = []
-    for i in range(len(path) - 1):
-        start = np.array(path[i], dtype=np.float64)
-        end = np.array(path[i + 1], dtype=np.float64)
-        for k in range(steps_between + 1):
-            t = k / (steps_between + 1)
-            pt = start + t * (end - start)
-            interpolated.append(pt.tolist())
-    interpolated.append(np.array(path[-1], dtype=np.float64).tolist())
-    return interpolated
-
-
-def resample_path(path, num_waypoints=20):
-    """Resample path to a fixed number of waypoints for normalized trajectory length."""
-    if not path or len(path) < 2:
-        return path
-    if len(path) == num_waypoints:
-        return path
-    path_arr = np.array(path, dtype=np.float64)
-    indices = np.linspace(0, len(path_arr) - 1, num_waypoints, dtype=np.float64)
-    resampled = []
-    for i in indices:
-        idx_lo, idx_hi = int(np.floor(i)), min(int(np.ceil(i)), len(path_arr) - 1)
-        t = i - idx_lo
-        if idx_lo == idx_hi:
-            pt = path_arr[idx_lo]
-        else:
-            pt = (1 - t) * path_arr[idx_lo] + t * path_arr[idx_hi]
-        resampled.append(pt.tolist())
-    return resampled
-
-
 def get_unobserved_area(scene):
     floor = scene.scene_[:scene.x_limit_, scene.y_left_+1 :(scene.y_left_ + scene.y_limit_-1), scene.g_height_]
     unknown_area = np.argwhere(floor == 0)[:,:2]
@@ -761,7 +733,7 @@ if __name__ == '__main__':
                 "name": "--ntfield_checkpoint",
                 "type": str,
                 "default": None,
-                "help": "Optional .pt trained on RRT/trajectory data — 2nd arg to run_isaac_ntfield_demo.sh (ntfield.mp4)",
+                "help": "Optional .pt for run_isaac_ntfield_demo.sh (HDF5 stays RRT); see collect_data_ntfield_hdf5.py for NTField HDF5",
             },
             {
                 "name": "--ntfield_checkpoint_straightline",
@@ -1304,11 +1276,13 @@ if __name__ == '__main__':
         gym.destroy_sim(sim)
         sys.exit(0)
 
-    # Interpolate path, then resample to fixed length for normalized trajectories
-    if init2grasp_path is not None and len(init2grasp_path) > 1:
-        init2grasp_path = interpolate_path(init2grasp_path, steps_between=2)
-        init2grasp_path = resample_path(init2grasp_path, num_waypoints=10)
-        print(f"Path normalized: {len(init2grasp_path)} waypoints")
+    def _path_as_6_list(path):
+        return [np.asarray(p, dtype=np.float64).reshape(-1)[:6].tolist() for p in path]
+
+    # Full RRT waypoints (no resample to fixed count)
+    if init2grasp_path is not None and len(init2grasp_path) > 0:
+        init2grasp_path = _path_as_6_list(init2grasp_path)
+        print(f"Path replay: {len(init2grasp_path)} steps (full)")
 
     path_id = 0
     frames_at_waypoint = 0
@@ -1419,10 +1393,13 @@ if __name__ == '__main__':
             f"source: trajectory_evaluation/rrtconnect/collect_data.py",
         ]
         if getattr(args, "ntfield_checkpoint", None):
-            meta_lines.append(f"ntfield_checkpoint_rrt: {os.path.abspath(args.ntfield_checkpoint)}")
+            meta_lines.append(
+                f"ntfield_checkpoint_rrt: {_resolve_pi_vla_checkpoint(args.ntfield_checkpoint)}"
+            )
         if getattr(args, "ntfield_checkpoint_straightline", None):
             meta_lines.append(
-                f"ntfield_checkpoint_straightline: {os.path.abspath(args.ntfield_checkpoint_straightline)}"
+                f"ntfield_checkpoint_straightline: "
+                f"{_resolve_pi_vla_checkpoint(args.ntfield_checkpoint_straightline)}"
             )
         with open(os.path.join(session_dir, "collection_meta.txt"), "w") as mf:
             mf.write("\n".join(meta_lines) + "\n")
@@ -1446,12 +1423,13 @@ if __name__ == '__main__':
                 ckpt_sl = getattr(args, "ntfield_checkpoint_straightline", None)
                 # Shell expects: H5 [CKPT_RRT] [CKPT_SL]. If only straight-line ckpt given, pass "" for RRT slot so bash uses DEFAULT_CKPT.
                 if ckpt_sl:
-                    demo_cmd.append(os.path.abspath(ckpt) if ckpt else "")
-                    demo_cmd.append(os.path.abspath(ckpt_sl))
+                    demo_cmd.append(_resolve_pi_vla_checkpoint(ckpt) if ckpt else "")
+                    demo_cmd.append(_resolve_pi_vla_checkpoint(ckpt_sl))
                 elif ckpt:
-                    demo_cmd.append(os.path.abspath(ckpt))
+                    demo_cmd.append(_resolve_pi_vla_checkpoint(ckpt))
                 print(f"Running: {' '.join(demo_cmd)}")
                 demo_env = os.environ.copy()
+                demo_env["DEMO_ORDER"] = "rrt_first"
                 if getattr(args, "headless", False):
                     demo_env["HEADLESS"] = "1"
                 r = subprocess.run(demo_cmd, cwd=pi_vla_root, env=demo_env)

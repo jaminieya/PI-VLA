@@ -1,13 +1,12 @@
 #
-# File:          trajectory_evaluation/ntfield/collect_data.py
-# Brief:         Like rrtconnect/collect_data.py (grasp verify, Isaac Gym capture) but arm motions use
-#                NTField gradient planning (ntrl-demo/planning/gradient_planner_trajectory.py), not OMPL/RRTConnect.
-#                Requires --ntfield_checkpoint (train_arm_trajectory Model_Epoch_*.pt).
+# File:          trajectory_evaluation/rrtconnect/collect_data_ntfield_hdf5.py
+# Brief:         Same as collect_data.py but HDF5 joint_configs come from NTField when
+#                --ntfield_checkpoint is a valid .pt (use --hdf5_rrt_only to force RRT in HDF5).
+#                RRTConnect still validates grasp before NTField replaces the recorded path.
+#                Demo videos: DEMO_ORDER=ntfield_first (ntfield.mp4 then original.mp4).
 #
-# Run (from PI-VLA root or anywhere; pass absolute checkpoint if needed):
-#   python trajectory_evaluation/ntfield/collect_data.py --ntfield_checkpoint ntrl-demo/Experiments/.../Model_*.pt
-#   python trajectory_evaluation/ntfield/collect_data.py --ntfield_checkpoint ... --use_viewer
-# Default: headless (no Isaac viewer). Cameras still render for HDF5.
+# Run (from PI-VLA root): python trajectory_evaluation/rrtconnect/collect_data_ntfield_hdf5.py ...
+# Default: headless. Cameras still render for HDF5.
 #
 
 from datetime import datetime
@@ -24,6 +23,17 @@ import sys
 import os
 
 _PI_VLA_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _resolve_pi_vla_checkpoint(path):
+    """Resolve --ntfield_checkpoint paths relative to PI-VLA root, not the shell cwd."""
+    if not path:
+        return path
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+    return os.path.normpath(os.path.join(_PI_VLA_ROOT, path))
+
+
 HANWEN_GRASPING_ROOT = os.path.join(_PI_VLA_ROOT, "hanwen_grasping")
 file_dir = os.path.join(HANWEN_GRASPING_ROOT, "collect_data")
 util_dir = os.path.join(file_dir, "./util")
@@ -31,13 +41,6 @@ grasp_util_dir = os.path.join(file_dir, "./grasp_util")
 sys.path.insert(0, HANWEN_GRASPING_ROOT)
 sys.path.append(util_dir)
 sys.path.append(grasp_util_dir)
-if _PI_VLA_ROOT not in sys.path:
-    sys.path.insert(0, _PI_VLA_ROOT)
-
-import torch
-from trajectory_evaluation.ntfield.eval_trajectory_ntfield import _ModelShim, load_network_and_function
-from planning.gradient_planner_trajectory import SCALE as NTFIELD_SCALE
-from planning.gradient_planner_trajectory import plan as ntfield_plan
 
 import open3d as o3d
 import fcl
@@ -65,6 +68,22 @@ def get_object_display_name(urdf_path):
 
 #import MCTS_algo_ICRA as mct
 #from rearrangement_planning_util_ICRA import write_result
+
+
+try:
+    import ompl.base as ob
+    import ompl.util as ou
+    import ompl.geometric as og
+except ImportError:
+    # if the ompl module is not in the PYTHONPATH assume it is installed in a
+    # subdirectory of the parent directory called "py-bindings."
+    from os.path import abspath, dirname, join
+    # This file is under PI-VLA/trajectory_evaluation/ (two dirnames -> PI-VLA root).
+    sys.path.insert(
+        0, join(dirname(dirname(abspath(__file__))), 'py-bindings'))
+    from ompl import util as ou
+    from ompl import base as ob
+    from ompl import geometric as og
 
 from stl_reader import stl_reader
 from obj_reader import obj_reader
@@ -110,9 +129,6 @@ MIN_RADIUS = 0.03471716871486391
 
 # Single object
 NUM_OF_OBJECTS = 1
-
-# Matches hanwen_grasping/robot_arm_configuration.py get_path2grasp / get_path2start home config.
-UR5E_HOME_JOINTS = np.array([0.7, -2, 2.5, -0.3, 0.7, 0], dtype=np.float64)
 
 #*************************************************************************************************#
 
@@ -457,6 +473,42 @@ def get_swept_volume_size(main_swept):
     return max_y - min_y
 
 
+def plan_ntfield_trajectory(q_start, q_goal, checkpoint_path, ntrl_root, device=None):
+    """
+    Plan init->grasp path with trajectory-trained NTField (ntrl-demo gradient planner).
+    """
+    import torch
+
+    ckpt_abs = os.path.abspath(checkpoint_path)
+    if not os.path.isfile(ckpt_abs):
+        raise FileNotFoundError(f"NTField checkpoint not found: {ckpt_abs}")
+    if ntrl_root not in sys.path:
+        sys.path.insert(0, ntrl_root)
+    from models.metric_arm import model_test_metric as md
+    from planning import plan as gradient_plan
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_path = os.path.dirname(ckpt_abs)
+    data_path = os.path.join(ntrl_root, "datasets", "arm", "UR5_trajectory")
+    if not os.path.isdir(data_path):
+        alt_dp = os.path.join(ntrl_root, "datasets", "arm", "UR5_trajectory_vertical_train")
+        if os.path.isdir(alt_dp):
+            data_path = alt_dp
+    model = md.Model(model_path, data_path, dim=6, source=[0.0] * 6, device=device)
+    model.load(ckpt_abs)
+    model.network.eval()
+    return gradient_plan(
+        model,
+        q_start,
+        q_goal,
+        step_size=0.02,
+        max_steps=200,
+        tol=0.01,
+        device=device,
+    )
+
+
 def get_unobserved_area(scene):
     floor = scene.scene_[:scene.x_limit_, scene.y_left_+1 :(scene.y_left_ + scene.y_limit_-1), scene.g_height_]
     unknown_area = np.argwhere(floor == 0)[:,:2]
@@ -689,7 +741,6 @@ def move_objs(gym, object_collision_files, gymapi, new_obj_pos_list):
 
 if __name__ == '__main__':
     # Isaac assets and ./assets resolve relative to hanwen_grasping cwd.
-    _invoke_cwd = os.getcwd()
     os.chdir(HANWEN_GRASPING_ROOT)
     #initialize gym
     #*************************************************************************************************#
@@ -718,43 +769,18 @@ if __name__ == '__main__':
                 "name": "--ntfield_checkpoint",
                 "type": str,
                 "default": None,
-                "help": "Required: Model_Epoch_*.pt from train_arm_trajectory (motion planning + demo script)",
+                "help": "Required for NTField HDF5 when valid .pt; also 2nd arg to run_isaac_ntfield_demo.sh. Use --hdf5_rrt_only for RRT joints in HDF5 only.",
             },
             {
-                "name": "--ntfield_experiment_dir",
+                "name": "--hdf5_rrt_only",
+                "action": "store_true",
+                "help": "Write HDF5 joint_configs from RRTConnect even when --ntfield_checkpoint is set",
+            },
+            {
+                "name": "--ntfield_checkpoint_straightline",
                 "type": str,
                 "default": None,
-                "help": "Optional Function log dir (default: checkpoint parent directory)",
-            },
-            {
-                "name": "--ntfield_device",
-                "type": str,
-                "default": "cuda:0",
-                "help": "Torch device for NTField (use cpu if no GPU)",
-            },
-            {
-                "name": "--ntfield_step_size",
-                "type": float,
-                "default": 0.02,
-                "help": "Gradient planner step size (normalized space)",
-            },
-            {
-                "name": "--ntfield_max_steps",
-                "type": int,
-                "default": 200,
-                "help": "Max gradient planner iterations per segment",
-            },
-            {
-                "name": "--ntfield_tol",
-                "type": float,
-                "default": 0.01,
-                "help": "Planner convergence tolerance in normalized joint space",
-            },
-            {
-                "name": "--ntfield_goal_eps_rad",
-                "type": float,
-                "default": None,
-                "help": "Reject plan if ||q_final-q_goal||_2 >= this (rad); default ntfield_tol * SCALE",
+                "help": "Optional .pt trained WITHOUT RRT (e.g. generate_straightline_collision_dataset) — 3rd arg; writes ntfield_straightline.mp4",
             },
             {
                 "name": "--save_legacy_collected",
@@ -767,41 +793,6 @@ if __name__ == '__main__':
     args.headless = not getattr(args, "use_viewer", False)
     if args.headless:
         print("Headless mode: no Isaac viewer (use --use_viewer for interactive).")
-
-    ckpt_arg = getattr(args, "ntfield_checkpoint", None)
-    if not ckpt_arg:
-        print("Error: trajectory_evaluation/ntfield/collect_data.py requires --ntfield_checkpoint")
-        sys.exit(1)
-    if os.path.isabs(ckpt_arg):
-        ckpt_abs = os.path.abspath(ckpt_arg)
-    else:
-        ckpt_abs = os.path.abspath(os.path.normpath(os.path.join(_invoke_cwd, ckpt_arg)))
-    if not os.path.isfile(ckpt_abs):
-        print(f"NTField checkpoint not found: {ckpt_abs}")
-        sys.exit(1)
-
-    if args.ntfield_device != "cpu" and not torch.cuda.is_available():
-        print("Warning: CUDA unavailable; NTField using cpu")
-    ntfield_device = torch.device(
-        "cpu" if args.ntfield_device == "cpu" or not torch.cuda.is_available() else args.ntfield_device
-    )
-    _, _ntfield_function = load_network_and_function(
-        ckpt_abs,
-        getattr(args, "ntfield_experiment_dir", None),
-        ntfield_device,
-        dim=6,
-    )
-    ntfield_model = _ModelShim(_ntfield_function)
-    ntfield_device_str = str(ntfield_device) if ntfield_device.type == "cuda" else "cpu"
-    ntfield_goal_eps_rad = (
-        float(args.ntfield_goal_eps_rad)
-        if args.ntfield_goal_eps_rad is not None
-        else float(args.ntfield_tol * NTFIELD_SCALE)
-    )
-    print(
-        f"NTField motion planning: device={ntfield_device_str}, checkpoint={ckpt_abs}, "
-        f"goal_eps_rad={ntfield_goal_eps_rad:.6f}"
-    )
     #*************************************************************************************************#
 
     #create a simulator
@@ -1261,6 +1252,7 @@ if __name__ == '__main__':
     swept_volume2 = None
     init2grasp_path = None
     grasp2init_path = None
+    grasp_target_q = None  # grasp IK joints (6,) for NTField q_goal when writing HDF5 from NTField
     MAX_CONSECUTIVE_FAILURES = 15  # give up and skip to next episode if stuck
     consecutive_path_failures = 0
     for grasp_idx in grasp_list:
@@ -1284,43 +1276,19 @@ if __name__ == '__main__':
             print("skip collision grasp")
             continue
 
-        q_grasp = np.asarray(init2grasp_angels_temp, dtype=np.float64).reshape(6)
-        init2grasp_path_temp = ntfield_plan(
-            ntfield_model,
-            UR5E_HOME_JOINTS,
-            q_grasp,
-            step_size=args.ntfield_step_size,
-            max_steps=args.ntfield_max_steps,
-            tol=args.ntfield_tol,
-            device=ntfield_device_str,
-        )
-        q_final_ig = np.asarray(init2grasp_path_temp[-2], dtype=np.float64).reshape(6)
-        if np.linalg.norm(q_final_ig - q_grasp) >= ntfield_goal_eps_rad:
-            init2grasp_path_temp = None
+        init2grasp_path_temp = RC.get_path2grasp(rac, init2grasp_angels_temp, scene_info, target_mesh=object_mesh[target_idx], time_limit=30, given_static_model = object_collision_models)
         print(init2grasp_path_temp)
         if init2grasp_path_temp is None:
             consecutive_path_failures += 1
-            print(f"No NTField path to grasp ({consecutive_path_failures}/{MAX_CONSECUTIVE_FAILURES})\n")
+            print(f"No path generated ({consecutive_path_failures}/{MAX_CONSECUTIVE_FAILURES})\n")
             continue
 
         temp_mod_bbox = rac.modify_grasp_bbox(init2grasp_angels_temp, target_mesh=object_mesh[target_idx], visualize=False)
-        q_pregrasp = np.asarray(grasp2init_angels_temp, dtype=np.float64).reshape(6)
-        grasp2init_path_temp = ntfield_plan(
-            ntfield_model,
-            q_pregrasp,
-            UR5E_HOME_JOINTS,
-            step_size=args.ntfield_step_size,
-            max_steps=args.ntfield_max_steps,
-            tol=args.ntfield_tol,
-            device=ntfield_device_str,
-        )
-        q_final_gi = np.asarray(grasp2init_path_temp[-2], dtype=np.float64).reshape(6)
-        if np.linalg.norm(q_final_gi - UR5E_HOME_JOINTS) >= ntfield_goal_eps_rad:
-            grasp2init_path_temp = None
+        grasp2init_path_temp = RC.get_path2start(rac, grasp2init_angels_temp, temp_mod_bbox, scene_info, time_limit=30, given_static_model = object_collision_models)
         print(grasp2init_path_temp)
         if grasp2init_path_temp is None:
             consecutive_path_failures += 1
-            print(f"No NTField path to home ({consecutive_path_failures}/{MAX_CONSECUTIVE_FAILURES})\n")
+            print(f"No path generated ({consecutive_path_failures}/{MAX_CONSECUTIVE_FAILURES})\n")
             continue
         consecutive_path_failures = 0  # reset on success
         swept_volume1_temp, swept_verts1_temp = rac.get_swept_volume(init2grasp_path_temp, frame_rate=60, scene_info=scene_info, animation=False, static_vi=False)
@@ -1339,6 +1307,7 @@ if __name__ == '__main__':
             swept_center = swept_center_temp
             swept_verts = swept_verts_temp
             W_TARGET = temp_mod_bbox
+            grasp_target_q = np.asarray(init2grasp_angels_temp, dtype=np.float64).reshape(-1)[:6]
         if num_grasp == 1:
             break
     print("\n!!!!!!!!!!!!!!!!!!!", num_grasp ,'grasp generated!!!!!!!!!!!!!!!!!!!!!!!\n')
@@ -1350,10 +1319,43 @@ if __name__ == '__main__':
         gym.destroy_sim(sim)
         sys.exit(0)
 
+    JOINT_DIM = 6
+    hdf5_trajectory_source = "rrt"
+    ntrl_root = os.path.join(_PI_VLA_ROOT, "ntrl-demo")
+    use_ntfield_hdf5 = (
+        getattr(args, "ntfield_checkpoint", None)
+        and not getattr(args, "hdf5_rrt_only", False)
+        and os.path.isfile(_resolve_pi_vla_checkpoint(args.ntfield_checkpoint))
+    )
+    if use_ntfield_hdf5:
+        dof_states_live = gym.get_actor_dof_states(envs[-1], ur5e_handles[-1], gymapi.STATE_POS)
+        q_start_live = np.array(dof_states_live["pos"][:JOINT_DIM], dtype=np.float64)
+        q_goal_grasp = grasp_target_q
+        if q_goal_grasp is None:
+            q_goal_grasp = np.array(init2grasp_path[-1][:JOINT_DIM], dtype=np.float64)
+        raw_nt = None
+        try:
+            raw_nt = plan_ntfield_trajectory(
+                q_start_live,
+                q_goal_grasp,
+                _resolve_pi_vla_checkpoint(args.ntfield_checkpoint),
+                ntrl_root,
+            )
+        except Exception as exc:
+            print(f"NTField planning for HDF5 failed ({exc}); using RRT trajectory in HDF5.")
+        if raw_nt is not None and len(raw_nt) >= 2:
+            init2grasp_path = raw_nt
+            hdf5_trajectory_source = "ntfield"
+            print(
+                f"HDF5 trajectory: NTField ({len(init2grasp_path)} planner steps, full polyline)"
+            )
+        else:
+            print("NTField returned an invalid path; HDF5 will use the RRT trajectory.")
+
     def _path_as_6_list(path):
         return [np.asarray(p, dtype=np.float64).reshape(-1)[:6].tolist() for p in path]
 
-    # Full waypoints (no resample to fixed count)
+    # Full planner waypoints (no resample to fixed count)
     if init2grasp_path is not None and len(init2grasp_path) > 0:
         init2grasp_path = _path_as_6_list(init2grasp_path)
         print(f"Path replay: {len(init2grasp_path)} steps (full)")
@@ -1361,7 +1363,6 @@ if __name__ == '__main__':
     path_id = 0
     frames_at_waypoint = 0
     SETTLE_STEPS = 15  # steps per waypoint - fewer = smaller dataset (arm still needs time to reach each pose)
-    JOINT_DIM = 6
     dataset_samples = []
     prompt = f"grasp the {get_object_display_name(object_asset_files[target_file_idx[target_idx]])}"
 
@@ -1454,8 +1455,7 @@ if __name__ == '__main__':
             f.attrs["prompt"] = str(prompt)
             f.attrs["num_samples"] = int(num_samples)
             f.attrs["joint_dim"] = int(JOINT_DIM)
-            f.attrs["motion_planner"] = "ntfield_gradient"
-            f.attrs["ntfield_checkpoint"] = str(ckpt_abs)
+            f.attrs["joint_trajectory_source"] = str(hdf5_trajectory_source)
         print(
             f"Saved {num_samples} samples "
             f"(images=new_setup global cam, images_side=top view + joint_configs + final_joint_config + object_location) to {out_path}"
@@ -1466,10 +1466,18 @@ if __name__ == '__main__':
             f"prompt: {prompt}",
             f"object_location: {object_location}",
             f"num_samples: {num_samples}",
-            f"source: trajectory_evaluation/ntfield/collect_data.py",
-            f"motion_planner: ntfield_gradient",
-            f"ntfield_checkpoint: {ckpt_abs}",
+            f"joint_trajectory_source: {hdf5_trajectory_source}",
+            f"source: trajectory_evaluation/rrtconnect/collect_data_ntfield_hdf5.py",
         ]
+        if getattr(args, "ntfield_checkpoint", None):
+            meta_lines.append(
+                f"ntfield_checkpoint_rrt: {_resolve_pi_vla_checkpoint(args.ntfield_checkpoint)}"
+            )
+        if getattr(args, "ntfield_checkpoint_straightline", None):
+            meta_lines.append(
+                f"ntfield_checkpoint_straightline: "
+                f"{_resolve_pi_vla_checkpoint(args.ntfield_checkpoint_straightline)}"
+            )
         with open(os.path.join(session_dir, "collection_meta.txt"), "w") as mf:
             mf.write("\n".join(meta_lines) + "\n")
 
@@ -1481,13 +1489,24 @@ if __name__ == '__main__':
             print(f"Legacy copy: {legacy_path}")
 
         if not getattr(args, "no_run_ntfield_demo", False):
-            demo_sh = os.path.join(pi_vla_root, "trajectory_evaluation", "ntfield", "run_isaac_ntfield_demo.sh")
+            demo_sh = os.path.join(
+                pi_vla_root, "trajectory_evaluation", "ntfield", "run_isaac_ntfield_demo.sh"
+            )
             if not os.path.isfile(demo_sh):
                 print(f"Warning: demo script not found at {demo_sh}; skipping.")
             else:
-                demo_cmd = ["bash", demo_sh, out_path, ckpt_abs]
+                demo_cmd = ["bash", demo_sh, out_path]
+                ckpt = getattr(args, "ntfield_checkpoint", None)
+                ckpt_sl = getattr(args, "ntfield_checkpoint_straightline", None)
+                # Shell expects: H5 [CKPT_RRT] [CKPT_SL]. If only straight-line ckpt given, pass "" for RRT slot so bash uses DEFAULT_CKPT.
+                if ckpt_sl:
+                    demo_cmd.append(_resolve_pi_vla_checkpoint(ckpt) if ckpt else "")
+                    demo_cmd.append(_resolve_pi_vla_checkpoint(ckpt_sl))
+                elif ckpt:
+                    demo_cmd.append(_resolve_pi_vla_checkpoint(ckpt))
                 print(f"Running: {' '.join(demo_cmd)}")
                 demo_env = os.environ.copy()
+                demo_env["DEMO_ORDER"] = "ntfield_first"
                 if getattr(args, "headless", False):
                     demo_env["HEADLESS"] = "1"
                 r = subprocess.run(demo_cmd, cwd=pi_vla_root, env=demo_env)
@@ -1501,4 +1520,4 @@ if __name__ == '__main__':
     if viewer is not None:
         gym.destroy_viewer(viewer)
     gym.destroy_sim(sim)
-    sys.exit(0)
+    sys.exit(1)

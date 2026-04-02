@@ -216,7 +216,19 @@ if __name__ == '__main__':
                 f"object_pos: {args.object_pos}",
                 f"video_original: original.mp4",
             ]
-            h5viz.write_session_meta(session_eval_dir, meta_lines)
+            meta_path = os.path.join(session_eval_dir, "episode_meta.txt")
+            # If run_isaac_ntfield_demo.sh ran NTField first, episode_meta.txt already exists — append, do not overwrite.
+            if os.path.isfile(meta_path):
+                h5viz.append_session_meta(
+                    session_eval_dir,
+                    [
+                        f"video_original: original.mp4",
+                        f"object_index: {args.object_index}",
+                        f"object_pos: {args.object_pos}",
+                    ],
+                )
+            else:
+                h5viz.write_session_meta(session_eval_dir, meta_lines)
         else:
             viz_dir = os.path.join(pi_vla_root, "visualization")
             os.makedirs(viz_dir, exist_ok=True)

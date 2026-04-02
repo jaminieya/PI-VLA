@@ -1,13 +1,17 @@
 #
-# File:          trajectory_evaluation/ntfield/collect_data.py
-# Brief:         Like rrtconnect/collect_data.py (grasp verify, Isaac Gym capture) but arm motions use
-#                NTField gradient planning (ntrl-demo/planning/gradient_planner_trajectory.py), not OMPL/RRTConnect.
-#                Requires --ntfield_checkpoint (train_arm_trajectory Model_Epoch_*.pt).
+# File:          trajectory_evaluation/ntfield/collect_data_dual_ntfield_videos.py
+# Brief:         Same Isaac grasp pipeline as collect_data.py, but records two comparison videos:
+#                (1) NTField trained WITHOUT RRT expert labels (e.g. straight-line collision dataset)
+#                    -> output/trajectory_evaluation/<stamp>/ntfield.mp4
+#                (2) NTField trained WITH RRT / trajectory supervision (rrtconnect-style expert)
+#                    -> .../ntfield_rrt_trajectory.mp4
+#                Grasp feasibility is chosen using the straight-line checkpoint only; same q_goal for both plans.
+#                Also writes one HDF5 (joint_configs = straight-line model plan) unless --skip_hdf5.
 #
-# Run (from PI-VLA root or anywhere; pass absolute checkpoint if needed):
-#   python trajectory_evaluation/ntfield/collect_data.py --ntfield_checkpoint ntrl-demo/Experiments/.../Model_*.pt
-#   python trajectory_evaluation/ntfield/collect_data.py --ntfield_checkpoint ... --use_viewer
-# Default: headless (no Isaac viewer). Cameras still render for HDF5.
+# Run (from PI-VLA root):
+#   python trajectory_evaluation/ntfield/collect_data_dual_ntfield_videos.py \\
+#     --ntfield_checkpoint_straightline ntrl-demo/Experiments/.../straightline_Model.pt \\
+#     --ntfield_checkpoint_rrt_trajectory ntrl-demo/Experiments/.../RRT_supervised_Model.pt
 #
 
 from datetime import datetime
@@ -45,7 +49,6 @@ import cv2
 import copy
 
 import h5py
-import subprocess
 import shutil
 import robot_arm_configuration as RC
 
@@ -710,15 +713,21 @@ if __name__ == '__main__':
                 "help": "Open Isaac Gym viewer (default: off = headless; cameras still record)",
             },
             {
-                "name": "--no_run_ntfield_demo",
+                "name": "--skip_hdf5",
                 "action": "store_true",
-                "help": "After saving HDF5, do not run run_isaac_ntfield_demo.sh",
+                "help": "Only save MP4s (no grasp_6dof_demo_*.h5)",
             },
             {
-                "name": "--ntfield_checkpoint",
+                "name": "--ntfield_checkpoint_straightline",
                 "type": str,
                 "default": None,
-                "help": "Required: Model_Epoch_*.pt from train_arm_trajectory (motion planning + demo script)",
+                "help": "Required: .pt from non-RRT dataset (e.g. generate_straightline_collision_dataset) — first video ntfield.mp4",
+            },
+            {
+                "name": "--ntfield_checkpoint_rrt_trajectory",
+                "type": str,
+                "default": None,
+                "help": "Required: .pt trained on RRT trajectory data (rrtconnect dataset) — second video ntfield_rrt_trajectory.mp4",
             },
             {
                 "name": "--ntfield_experiment_dir",
@@ -768,16 +777,27 @@ if __name__ == '__main__':
     if args.headless:
         print("Headless mode: no Isaac viewer (use --use_viewer for interactive).")
 
-    ckpt_arg = getattr(args, "ntfield_checkpoint", None)
-    if not ckpt_arg:
-        print("Error: trajectory_evaluation/ntfield/collect_data.py requires --ntfield_checkpoint")
+    def _resolve_ckpt(p):
+        if not p:
+            return None
+        if os.path.isabs(p):
+            return os.path.abspath(p)
+        return os.path.abspath(os.path.normpath(os.path.join(_invoke_cwd, p)))
+
+    ckpt_sl_arg = getattr(args, "ntfield_checkpoint_straightline", None)
+    ckpt_rrt_arg = getattr(args, "ntfield_checkpoint_rrt_trajectory", None)
+    if not ckpt_sl_arg or not ckpt_rrt_arg:
+        print(
+            "Error: requires --ntfield_checkpoint_straightline and --ntfield_checkpoint_rrt_trajectory"
+        )
         sys.exit(1)
-    if os.path.isabs(ckpt_arg):
-        ckpt_abs = os.path.abspath(ckpt_arg)
-    else:
-        ckpt_abs = os.path.abspath(os.path.normpath(os.path.join(_invoke_cwd, ckpt_arg)))
-    if not os.path.isfile(ckpt_abs):
-        print(f"NTField checkpoint not found: {ckpt_abs}")
+    ckpt_sl_abs = _resolve_ckpt(ckpt_sl_arg)
+    ckpt_rrt_abs = _resolve_ckpt(ckpt_rrt_arg)
+    if not os.path.isfile(ckpt_sl_abs):
+        print(f"Straight-line NTField checkpoint not found: {ckpt_sl_abs}")
+        sys.exit(1)
+    if not os.path.isfile(ckpt_rrt_abs):
+        print(f"RRT-trajectory NTField checkpoint not found: {ckpt_rrt_abs}")
         sys.exit(1)
 
     if args.ntfield_device != "cpu" and not torch.cuda.is_available():
@@ -785,13 +805,20 @@ if __name__ == '__main__':
     ntfield_device = torch.device(
         "cpu" if args.ntfield_device == "cpu" or not torch.cuda.is_available() else args.ntfield_device
     )
-    _, _ntfield_function = load_network_and_function(
-        ckpt_abs,
+    _, _fn_sl = load_network_and_function(
+        ckpt_sl_abs,
         getattr(args, "ntfield_experiment_dir", None),
         ntfield_device,
         dim=6,
     )
-    ntfield_model = _ModelShim(_ntfield_function)
+    _, _fn_rrt = load_network_and_function(
+        ckpt_rrt_abs,
+        getattr(args, "ntfield_experiment_dir", None),
+        ntfield_device,
+        dim=6,
+    )
+    ntfield_model_sl = _ModelShim(_fn_sl)
+    ntfield_model_rrt = _ModelShim(_fn_rrt)
     ntfield_device_str = str(ntfield_device) if ntfield_device.type == "cuda" else "cpu"
     ntfield_goal_eps_rad = (
         float(args.ntfield_goal_eps_rad)
@@ -799,8 +826,8 @@ if __name__ == '__main__':
         else float(args.ntfield_tol * NTFIELD_SCALE)
     )
     print(
-        f"NTField motion planning: device={ntfield_device_str}, checkpoint={ckpt_abs}, "
-        f"goal_eps_rad={ntfield_goal_eps_rad:.6f}"
+        f"Dual NTField: device={ntfield_device_str}, straightline_ckpt={ckpt_sl_abs}, "
+        f"rrt_trajectory_ckpt={ckpt_rrt_abs}, goal_eps_rad={ntfield_goal_eps_rad:.6f}"
     )
     #*************************************************************************************************#
 
@@ -1261,6 +1288,7 @@ if __name__ == '__main__':
     swept_volume2 = None
     init2grasp_path = None
     grasp2init_path = None
+    winning_q_grasp = None
     MAX_CONSECUTIVE_FAILURES = 15  # give up and skip to next episode if stuck
     consecutive_path_failures = 0
     for grasp_idx in grasp_list:
@@ -1286,7 +1314,7 @@ if __name__ == '__main__':
 
         q_grasp = np.asarray(init2grasp_angels_temp, dtype=np.float64).reshape(6)
         init2grasp_path_temp = ntfield_plan(
-            ntfield_model,
+            ntfield_model_sl,
             UR5E_HOME_JOINTS,
             q_grasp,
             step_size=args.ntfield_step_size,
@@ -1306,7 +1334,7 @@ if __name__ == '__main__':
         temp_mod_bbox = rac.modify_grasp_bbox(init2grasp_angels_temp, target_mesh=object_mesh[target_idx], visualize=False)
         q_pregrasp = np.asarray(grasp2init_angels_temp, dtype=np.float64).reshape(6)
         grasp2init_path_temp = ntfield_plan(
-            ntfield_model,
+            ntfield_model_sl,
             q_pregrasp,
             UR5E_HOME_JOINTS,
             step_size=args.ntfield_step_size,
@@ -1339,6 +1367,7 @@ if __name__ == '__main__':
             swept_center = swept_center_temp
             swept_verts = swept_verts_temp
             W_TARGET = temp_mod_bbox
+            winning_q_grasp = q_grasp.copy()
         if num_grasp == 1:
             break
     print("\n!!!!!!!!!!!!!!!!!!!", num_grasp ,'grasp generated!!!!!!!!!!!!!!!!!!!!!!!\n')
@@ -1353,30 +1382,76 @@ if __name__ == '__main__':
     def _path_as_6_list(path):
         return [np.asarray(p, dtype=np.float64).reshape(-1)[:6].tolist() for p in path]
 
-    # Full waypoints (no resample to fixed count)
+    # Full planner polyline (no resample to fixed waypoint count)
     if init2grasp_path is not None and len(init2grasp_path) > 0:
         init2grasp_path = _path_as_6_list(init2grasp_path)
-        print(f"Path replay: {len(init2grasp_path)} steps (full)")
+        print(f"Path (non-RRT expert NTField): {len(init2grasp_path)} steps (full)")
 
-    path_id = 0
-    frames_at_waypoint = 0
-    SETTLE_STEPS = 15  # steps per waypoint - fewer = smaller dataset (arm still needs time to reach each pose)
+    if winning_q_grasp is None and init2grasp_path is not None and len(init2grasp_path) > 0:
+        winning_q_grasp = np.asarray(init2grasp_path[-1], dtype=np.float64).reshape(6)
+
+    pi_vla_root = _PI_VLA_ROOT
+    trajectory_eval_dir = os.path.join(pi_vla_root, "output", "trajectory_evaluation")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_dir = os.path.join(trajectory_eval_dir, timestamp)
+    os.makedirs(session_dir, exist_ok=True)
+    mp4_sl = os.path.join(session_dir, "ntfield.mp4")
+    mp4_rrt = os.path.join(session_dir, "ntfield_rrt_trajectory.mp4")
+
+    def _save_mp4_rgb(frames, out_mp4, fps=60.0):
+        if not frames:
+            print(f"No frames; skip {out_mp4}")
+            return
+        try:
+            import imageio
+            imageio.mimsave(out_mp4, frames, fps=fps)
+            print(f"Saved {len(frames)} frames -> {out_mp4}")
+        except Exception as e1:
+            try:
+                import cv2
+                h, w = frames[0].shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                wri = cv2.VideoWriter(out_mp4, fourcc, fps, (w, h))
+                for fr in frames:
+                    wri.write(cv2.cvtColor(fr, cv2.COLOR_RGB2BGR))
+                wri.release()
+                print(f"Saved {len(frames)} frames (OpenCV) -> {out_mp4}")
+            except Exception as e2:
+                print(f"Could not save {out_mp4}: imageio {e1}; cv2 {e2}")
+
+    def _reset_arm_near_home(n_steps=180):
+        for _ in range(n_steps):
+            gym.set_dof_target_position(envs[-1], spj, float(UR5E_HOME_JOINTS[0]))
+            gym.set_dof_target_position(envs[-1], slj, float(UR5E_HOME_JOINTS[1]))
+            gym.set_dof_target_position(envs[-1], ej, float(UR5E_HOME_JOINTS[2]))
+            gym.set_dof_target_position(envs[-1], wj1, float(UR5E_HOME_JOINTS[3]))
+            gym.set_dof_target_position(envs[-1], wj2, float(UR5E_HOME_JOINTS[4]))
+            gym.set_dof_target_position(envs[-1], wj3, float(UR5E_HOME_JOINTS[5]))
+            gym.simulate(sim)
+            gym.fetch_results(sim, True)
+            gym.step_graphics(sim)
+            if viewer is not None:
+                gym.draw_viewer(viewer, sim, True)
+            gym.sync_frame_time(sim)
+
+    SETTLE_STEPS = 15
     JOINT_DIM = 6
     dataset_samples = []
+    record_frames_sl = []
     prompt = f"grasp the {get_object_display_name(object_asset_files[target_file_idx[target_idx]])}"
-
-    # Get object location (static during trajectory - xyz in world frame)
-    # object_status_list[i][0] = mesh center + translation from rigid body state (updated at t=999)
     object_location = np.array(object_status_list[target_idx][0], dtype=np.float32)
     num_waypoints = len(init2grasp_path) if init2grasp_path else 0
     total_frames = num_waypoints * SETTLE_STEPS
     if viewer is not None:
-        print(f"Will capture full trajectory (~{total_frames} frames). Keep viewer open, then close to save.")
+        print(
+            f"Pass 1 — non-RRT-expert NTField: ~{total_frames} frames. Close viewer to finish if interactive."
+        )
     else:
-        print(f"Will capture full trajectory (~{total_frames} frames) in headless mode.")
+        print(f"Pass 1 — non-RRT-expert NTField: ~{total_frames} frames (headless).")
 
+    path_id = 0
+    frames_at_waypoint = 0
     while viewer is None or not gym.query_viewer_has_closed(viewer):
-
         if not init2grasp_path:
             gym.simulate(sim)
             gym.fetch_results(sim, True)
@@ -1386,57 +1461,105 @@ if __name__ == '__main__':
             gym.sync_frame_time(sim)
             continue
 
-        # Use last waypoint when done traversing (keep viewer responsive)
         display_path_id = min(path_id, len(init2grasp_path) - 1)
         dof_result = init2grasp_path[display_path_id]
 
         gym.set_dof_target_position(envs[-1], spj, dof_result[0])
         gym.set_dof_target_position(envs[-1], slj, dof_result[1])
-        gym.set_dof_target_position(envs[-1], ej,  dof_result[2])
+        gym.set_dof_target_position(envs[-1], ej, dof_result[2])
         gym.set_dof_target_position(envs[-1], wj1, dof_result[3])
         gym.set_dof_target_position(envs[-1], wj2, dof_result[4])
         gym.set_dof_target_position(envs[-1], wj3, dof_result[5])
 
-        # step the physics
         gym.simulate(sim)
         gym.fetch_results(sim, True)
-        
-        # update the viewer
         gym.step_graphics(sim)
         if viewer is not None:
             gym.draw_viewer(viewer, sim, True)
         gym.sync_frame_time(sim)
 
-        # Capture full trajectory: one frame per physics step as robot moves
         if path_id < len(init2grasp_path):
             gym.render_all_camera_sensors(sim)
-            # images = new_setup global cam; images_side = top
             raw_main = gym.get_camera_image(sim, envs[-1], main_cam_handle, gymapi.IMAGE_COLOR)
             rgba_main = raw_main.reshape(camera_props.height, camera_props.width, 4)
             rgb = rgba_main[..., :3].copy()
             raw_top = gym.get_camera_image(sim, envs[-1], top_cam_handle, gymapi.IMAGE_COLOR)
             rgba_top = raw_top.reshape(camera_props.height, camera_props.width, 4)
             rgb_top = rgba_top[..., :3].copy()
-            # joint_config = np.array(dof_result[:JOINT_DIM], dtype=np.float32)
+            record_frames_sl.append(rgb.copy())
             dof_states = gym.get_actor_dof_states(envs[-1], ur5e_handles[-1], gymapi.STATE_POS)
-            joint_config = np.array(dof_states['pos'][:JOINT_DIM], dtype=np.float32)
+            joint_config = np.array(dof_states["pos"][:JOINT_DIM], dtype=np.float32)
             dataset_samples.append({"image": rgb, "image_side": rgb_top, "joint_config": joint_config})
             frames_at_waypoint += 1
             if frames_at_waypoint >= SETTLE_STEPS:
                 path_id += 1
                 frames_at_waypoint = 0
         else:
-            # We have captured all waypoints. Break the loop to save the dataset!
-            print("All waypoints captured. Automatically exiting viewer to save data...")
+            print("Pass 1 complete.")
             break
 
-    # Save dataset under output/trajectory_evaluation/YYYYMMDD_HHMMSS/
-    pi_vla_root = _PI_VLA_ROOT
-    trajectory_eval_dir = os.path.join(pi_vla_root, "output", "trajectory_evaluation")
-    if dataset_samples:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        session_dir = os.path.join(trajectory_eval_dir, timestamp)
-        os.makedirs(session_dir, exist_ok=True)
+    _save_mp4_rgb(record_frames_sl, mp4_sl, fps=60.0)
+
+    print("Resetting arm toward home before RRT-trajectory NTField pass...")
+    _reset_arm_near_home(n_steps=180)
+
+    init2grasp_path_rrt = None
+    if winning_q_grasp is not None:
+        init2grasp_path_rrt = ntfield_plan(
+            ntfield_model_rrt,
+            UR5E_HOME_JOINTS,
+            winning_q_grasp,
+            step_size=args.ntfield_step_size,
+            max_steps=args.ntfield_max_steps,
+            tol=args.ntfield_tol,
+            device=ntfield_device_str,
+        )
+        if init2grasp_path_rrt is not None and len(init2grasp_path_rrt) >= 2:
+            q_final_rrt = np.asarray(init2grasp_path_rrt[-2], dtype=np.float64).reshape(6)
+            if np.linalg.norm(q_final_rrt - winning_q_grasp) >= ntfield_goal_eps_rad:
+                print("RRT-trajectory NTField plan did not reach grasp goal; skipping pass 2 video.")
+                init2grasp_path_rrt = None
+
+    if init2grasp_path_rrt is not None and len(init2grasp_path_rrt) > 1:
+        init2grasp_path_rrt = _path_as_6_list(init2grasp_path_rrt)
+        print(f"Path (RRT-trajectory expert NTField): {len(init2grasp_path_rrt)} steps (full)")
+
+        record_frames_rrt = []
+        path_id = 0
+        frames_at_waypoint = 0
+        while viewer is None or not gym.query_viewer_has_closed(viewer):
+            display_path_id = min(path_id, len(init2grasp_path_rrt) - 1)
+            dof_result = init2grasp_path_rrt[display_path_id]
+            gym.set_dof_target_position(envs[-1], spj, dof_result[0])
+            gym.set_dof_target_position(envs[-1], slj, dof_result[1])
+            gym.set_dof_target_position(envs[-1], ej, dof_result[2])
+            gym.set_dof_target_position(envs[-1], wj1, dof_result[3])
+            gym.set_dof_target_position(envs[-1], wj2, dof_result[4])
+            gym.set_dof_target_position(envs[-1], wj3, dof_result[5])
+            gym.simulate(sim)
+            gym.fetch_results(sim, True)
+            gym.step_graphics(sim)
+            if viewer is not None:
+                gym.draw_viewer(viewer, sim, True)
+            gym.sync_frame_time(sim)
+            if path_id < len(init2grasp_path_rrt):
+                gym.render_all_camera_sensors(sim)
+                raw_main = gym.get_camera_image(sim, envs[-1], main_cam_handle, gymapi.IMAGE_COLOR)
+                rgba_main = raw_main.reshape(camera_props.height, camera_props.width, 4)
+                rgb = rgba_main[..., :3].copy()
+                record_frames_rrt.append(rgb.copy())
+                frames_at_waypoint += 1
+                if frames_at_waypoint >= SETTLE_STEPS:
+                    path_id += 1
+                    frames_at_waypoint = 0
+            else:
+                print("Pass 2 complete.")
+                break
+        _save_mp4_rgb(record_frames_rrt, mp4_rrt, fps=60.0)
+    else:
+        print("Skipping second video (no valid RRT-trajectory NTField plan).")
+
+    if dataset_samples and not getattr(args, "skip_hdf5", False):
         out_path = os.path.join(session_dir, f"grasp_6dof_demo_{timestamp}.h5")
         images_arr = np.array([s["image"] for s in dataset_samples], dtype=np.uint8)
         images_side_arr = np.array([s["image_side"] for s in dataset_samples], dtype=np.uint8)
@@ -1454,49 +1577,39 @@ if __name__ == '__main__':
             f.attrs["prompt"] = str(prompt)
             f.attrs["num_samples"] = int(num_samples)
             f.attrs["joint_dim"] = int(JOINT_DIM)
-            f.attrs["motion_planner"] = "ntfield_gradient"
-            f.attrs["ntfield_checkpoint"] = str(ckpt_abs)
+            f.attrs["motion_planner"] = "ntfield_gradient_dual_session"
+            f.attrs["ntfield_checkpoint_straightline"] = str(ckpt_sl_abs)
+            f.attrs["ntfield_checkpoint_rrt_trajectory"] = str(ckpt_rrt_abs)
         print(
-            f"Saved {num_samples} samples "
-            f"(images=new_setup global cam, images_side=top view + joint_configs + final_joint_config + object_location) to {out_path}"
+            f"Saved {num_samples} samples to {out_path} "
+            f"(joint_configs = non-RRT expert NTField motion)"
         )
-
         meta_lines = [
             f"h5_path: {out_path}",
+            f"session_dir: {session_dir}",
+            f"video_non_rrt_expert: {mp4_sl}",
+            f"video_rrt_trajectory_expert: {mp4_rrt}",
             f"prompt: {prompt}",
             f"object_location: {object_location}",
             f"num_samples: {num_samples}",
-            f"source: trajectory_evaluation/ntfield/collect_data.py",
-            f"motion_planner: ntfield_gradient",
-            f"ntfield_checkpoint: {ckpt_abs}",
+            f"source: trajectory_evaluation/ntfield/collect_data_dual_ntfield_videos.py",
+            f"ntfield_checkpoint_straightline: {ckpt_sl_abs}",
+            f"ntfield_checkpoint_rrt_trajectory: {ckpt_rrt_abs}",
         ]
         with open(os.path.join(session_dir, "collection_meta.txt"), "w") as mf:
             mf.write("\n".join(meta_lines) + "\n")
-
         if getattr(args, "save_legacy_collected", False):
             legacy_dir = os.path.join(HANWEN_GRASPING_ROOT, "collected_data")
             os.makedirs(legacy_dir, exist_ok=True)
             legacy_path = os.path.join(legacy_dir, os.path.basename(out_path))
             shutil.copy2(out_path, legacy_path)
             print(f"Legacy copy: {legacy_path}")
-
-        if not getattr(args, "no_run_ntfield_demo", False):
-            demo_sh = os.path.join(pi_vla_root, "trajectory_evaluation", "ntfield", "run_isaac_ntfield_demo.sh")
-            if not os.path.isfile(demo_sh):
-                print(f"Warning: demo script not found at {demo_sh}; skipping.")
-            else:
-                demo_cmd = ["bash", demo_sh, out_path, ckpt_abs]
-                print(f"Running: {' '.join(demo_cmd)}")
-                demo_env = os.environ.copy()
-                if getattr(args, "headless", False):
-                    demo_env["HEADLESS"] = "1"
-                r = subprocess.run(demo_cmd, cwd=pi_vla_root, env=demo_env)
-                if r.returncode != 0:
-                    print(f"run_isaac_ntfield_demo.sh exited with code {r.returncode}")
+    elif not dataset_samples:
+        print("No samples in pass 1; no HDF5.")
     else:
-        print(f"No samples captured. Keep the viewer open longer (~0.5 sec per waypoint).")
-        print(f"Would have saved under: {trajectory_eval_dir}/YYYYMMDD_HHMMSS/grasp_6dof_demo_*.h5")
+        print("--skip_hdf5: not writing .h5")
 
+    print(f"Session directory: {session_dir}")
     print('Test Completed Successfully!!')
     if viewer is not None:
         gym.destroy_viewer(viewer)

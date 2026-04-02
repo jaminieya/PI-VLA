@@ -2,18 +2,27 @@
 
 Canonical command paths live under **`trajectory_evaluation/ntfield/`** (see [`../ntfield/README.md`](../ntfield/README.md)).
 
-## `rrtconnect/collect_data.py` — three-way comparison videos
+## Two collection entry points
 
-After an HDF5 is saved, [`run_isaac_ntfield_demo.sh`](../ntfield/run_isaac_ntfield_demo.sh) can produce:
+| Script | `joint_configs` in HDF5 | Post-save demo order (`run_isaac_ntfield_demo.sh`) |
+|--------|-------------------------|------------------------------------------------------|
+| **`collect_data.py`** | **RRTConnect** path | **`DEMO_ORDER=rrt_first`** (default): **`original.mp4`** then **`ntfield.mp4`** |
+| **`collect_data_ntfield_hdf5.py`** | **NTField** plan (needs valid `--ntfield_checkpoint`; use **`--hdf5_rrt_only`** for RRT in HDF5) | **`DEMO_ORDER=ntfield_first`**: **`ntfield.mp4`** then **`original.mp4`** |
 
-1. **`original.mp4`** — replay of the **logged RRTConnect** joint trajectory from the HDF5.  
-2. **`ntfield.mp4`** — **`new_setup.py --ntfield`** with **`--ntfield_checkpoint`** (model trained on **RRT / trajectory** `points.npy` + `tau_obs.npy`).  
-3. **`ntfield_straightline.mp4`** — same HDF5 start/goal, with **`--ntfield_checkpoint_straightline`** (model trained **without** RRT labels, e.g. `generate_straightline_collision_dataset.py`).
+For any run, you can override video order manually, e.g. `DEMO_ORDER=ntfield_first bash .../run_isaac_ntfield_demo.sh H5 CKPT`.
 
-Example:
+HDF5 attr **`joint_trajectory_source`** (`ntfield` / `rrt`) is written only by **`collect_data_ntfield_hdf5.py`**.
+
+## Example: both collectors + three-way checkpoints
 
 ```bash
+# Classic: RRT in HDF5; videos — replay first, then NTField
 python trajectory_evaluation/rrtconnect/collect_data.py \
+  --ntfield_checkpoint ntrl-demo/Experiments/.../Model_RRT_train.pt \
+  --ntfield_checkpoint_straightline ntrl-demo/Experiments/.../Model_straightline_train.pt
+
+# NTField motion in HDF5; videos — NTField first, then HDF5 replay
+python trajectory_evaluation/rrtconnect/collect_data_ntfield_hdf5.py \
   --ntfield_checkpoint ntrl-demo/Experiments/.../Model_RRT_train.pt \
   --ntfield_checkpoint_straightline ntrl-demo/Experiments/.../Model_straightline_train.pt
 ```

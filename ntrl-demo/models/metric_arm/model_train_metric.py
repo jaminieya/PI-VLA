@@ -418,15 +418,15 @@ class Model():
 
     def load(self, filepath):
         #B = torch.load(self.Params['ModelPath']+'/B.pt')
-        
-        checkpoint = torch.load(
-            filepath, map_location=torch.device(self.Params['Device']))
+
+        dev = torch.device(self.Params['Device'])
+        checkpoint = torch.load(filepath, map_location='cpu')
         self.B = checkpoint['B_state_dict']
 
-        self.network = model_network.NN(self.Params['Device'],self.dim,self.B)
+        self.network = model_network.NN(self.Params['Device'], self.dim, self.B)
 
         self.network.load_state_dict(checkpoint['model_state_dict'], strict=True)
-        self.network.to(torch.device(self.Params['Device']))
+        self.network.to(dev)
         self.network.float()
         self.network.eval()
 

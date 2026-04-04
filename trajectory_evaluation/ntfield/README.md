@@ -5,8 +5,9 @@ Scripts here share the **same Isaac Gym scene and flags** as `hanwen_grasping/ne
 | File | Role |
 |------|------|
 | `collect_data.py` | Collect grasp HDF5; plans arm motion with **NTField** (`--ntfield_checkpoint` required). |
+| `collect_data_dual_ntfield_videos.py` | Same scene as `collect_data.py`: first records **`ntfield.mp4`** using a **non–RRT-expert** checkpoint (e.g. straight-line dataset), then **`ntfield_rrt_trajectory.mp4`** using **RRT trajectory–supervised** checkpoint. Optional HDF5 from pass 1. |
 | `eval_trajectory_ntfield.py` | Held-out **τ** metrics + gradient planner stats on `points.npy` / `tau_obs.npy`. |
-| `run_isaac_ntfield_demo.sh` | Replay **logged** joint trajectory vs **NTField plan** in Isaac; writes `original.mp4` / `ntfield.mp4`. |
+| `run_isaac_ntfield_demo.sh` | Runs **`run_collected_trajectory`** + **`new_setup --ntfield`**; order set by **`DEMO_ORDER`** (`rrt_first` default, or `ntfield_first`). |
 
 ## Train (straight-line dataset, no RRT labels)
 
@@ -30,7 +31,7 @@ Use the resulting `Model_Epoch_*.pt` with `collect_data.py`, `eval_trajectory_nt
 
 **Yes, with one caveat.**
 
-- **`run_isaac_ntfield_demo.sh`** runs `hanwen_grasping/run_collected_trajectory.py` and **`hanwen_grasping/new_setup.py --ntfield`** from the `hanwen_grasping` directory. That **is** the same entry points as an interactive `new_setup.py` session: same default scene style, `--no_walls`, and recording path.
+- **`run_isaac_ntfield_demo.sh`** runs from **`hanwen_grasping/`**. Default **`DEMO_ORDER=rrt_first`**: replay HDF5 → **`original.mp4`**, then NTField → **`ntfield.mp4`**. Use **`DEMO_ORDER=ntfield_first`** for the opposite order. **`collect_data_ntfield_hdf5.py`** sets `ntfield_first` when it invokes the script.
 - Your **checkpoint must match the scenario** the field was trained for (e.g. no-wall training + `--no_walls` at test). A model trained only on straight-line/clearance in a **minimal table** scene may not match cluttered `new_setup` with many obstacles unless you train with matching geometry.
 
 **Ways to visualize**

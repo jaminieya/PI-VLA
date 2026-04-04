@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # Replay an HDF5 trajectory vs NTField-planned trajectory in Isaac Gym; save MP4s under output/trajectory_evaluation/.
 #
-# Typical flow: trajectory_evaluation/ntfield/collect_data.py saves a new .h5 under
-#   output/trajectory_evaluation/YYYYMMDD_HHMMSS/, then runs this script (unless --no_run_ntfield_demo).
+# Typical flow: trajectory_evaluation/rrtconnect/collect_data*.py saves a new .h5, then runs this script
+#   (unless --no_run_ntfield_demo).
+#
+# Video order: set DEMO_ORDER=rrt_first (default) or DEMO_ORDER=ntfield_first
+#   rrt_first:      run_collected_trajectory (original.mp4) then new_setup --ntfield (ntfield.mp4)
+#   ntfield_first:  new_setup --ntfield then run_collected_trajectory
 #
 # Usage (from anywhere):
 #   bash trajectory_evaluation/ntfield/run_isaac_ntfield_demo.sh
-#   bash trajectory_evaluation/ntfield/run_isaac_ntfield_demo.sh /path/to/demo.h5 /path/to/Model_Epoch_*.pt
+#   bash trajectory_evaluation/ntfield/run_isaac_ntfield_demo.sh /path/to/demo.h5 /path/to/Model_RRT_train.pt
+# Optional 3rd arg: checkpoint trained WITHOUT RRT labels (e.g. straight-line dataset) -> ntfield_straightline.mp4
+#   bash trajectory_evaluation/ntfield/run_isaac_ntfield_demo.sh /path/to/demo.h5 /path/to/rrt_ckpt.pt /path/to/straightline_ckpt.pt
 #
 # Requires: Isaac Gym, conda env with isaacgym + torch + imageio[ffmpeg] or opencv-python.
 # Interactive: needs DISPLAY (open viewer until recording finishes).
@@ -25,6 +31,7 @@ DEFAULT_CKPT="${PI_VLA_ROOT}/ntrl-demo/Experiments/UR5_trajectory_no_wall_accura
 
 H5="${1:-$DEFAULT_H5}"
 CKPT="${2:-$DEFAULT_CKPT}"
+CKPT_STRAIGHTLINE="${3:-}"
 
 if [[ ! -f "$H5" ]]; then
   echo "HDF5 not found: $H5"
@@ -65,15 +72,44 @@ else
   echo "=== No YYYYMMDD_HHMMSS in h5 basename; writing flat under output/trajectory_evaluation/"
 fi
 
-echo "=== Original trajectory replay -> ${ORIG_MP4}"
-python run_collected_trajectory.py "${RC_ARGS[@]}"
+DEMO_ORDER="${DEMO_ORDER:-rrt_first}"
 
-echo "=== NTField plan (first/goal from HDF5) -> ${NT_MP4}"
-python new_setup.py "${NS_ARGS[@]}"
+run_rrt_replay() {
+  echo "=== Original trajectory replay (HDF5 joint_configs) -> ${ORIG_MP4}"
+  python run_collected_trajectory.py "${RC_ARGS[@]}"
+}
 
-echo "Done. Videos:"
+run_ntfield_plan() {
+  echo "=== NTField plan (RRT / trajectory-supervised checkpoint) -> ${NT_MP4}"
+  python new_setup.py "${NS_ARGS[@]}"
+}
+
+if [[ "${DEMO_ORDER}" == "ntfield_first" ]]; then
+  run_ntfield_plan
+  run_rrt_replay
+else
+  run_rrt_replay
+  run_ntfield_plan
+fi
+
+if [[ -n "${CKPT_STRAIGHTLINE}" ]]; then
+  if [[ ! -f "${CKPT_STRAIGHTLINE}" ]]; then
+    echo "Straight-line NTField checkpoint not found: ${CKPT_STRAIGHTLINE}"
+    exit 1
+  fi
+  NT_SL_MP4="${SESSION_DIR}/ntfield_straightline.mp4"
+  NS_SL_ARGS=(--ntfield --checkpoint "$CKPT_STRAIGHTLINE" --h5_path "$H5" --record --no_walls "${HEADLESS_ARGS[@]}"
+    --record_output "$NT_SL_MP4")
+  echo "=== NTField plan (NOT RRT-supervised, e.g. straight-line dataset) -> ${NT_SL_MP4}"
+  python new_setup.py "${NS_SL_ARGS[@]}"
+fi
+
+echo "Done. DEMO_ORDER=${DEMO_ORDER} videos:"
 echo "  $ORIG_MP4"
 echo "  $NT_MP4"
+if [[ -n "${CKPT_STRAIGHTLINE}" ]]; then
+  echo "  ${NT_SL_MP4}"
+fi
 if [[ -f "${SESSION_DIR}/episode_meta.txt" ]]; then
   echo "  ${SESSION_DIR}/episode_meta.txt"
 fi

@@ -72,6 +72,7 @@ CMD+=(
   --checkpoint "${TEACHER_CKPT}"
   --student "${STUDENT}"
   --h5_path "${H5_PATH}"
+  --no_walls
 )
 
 exec "${CMD[@]}" "${EXTRA[@]}"

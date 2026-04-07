@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Run inference with GoalLatentPredictorWithFiLM (prompt + image + q_start -> z_goal_hat).
+Run inference with GoalLatentPredictorWithFiLM (prompt + image + start conditioning -> z_goal_hat).
 
-This mirrors the training preprocessing in train_goal_rep_alignment.py:
+This mirrors train_goal_rep_alignment.py:
   - image: Resize((224,224)) + ResNet normalization (ImageNet mean/std)
-  - student: uses the frozen text/image encoders inside the model class
-  - q_start: passed as 6D vector (radians)
+  - start_cond teacher_z (default in new checkpoints): E(q_start) from frozen NTField + learned proj
+  - start_cond joints (legacy): 6D q_start into a small MLP
 
 Optional evaluation:
   If you also provide --q_goal, this will compute the teacher z_goal latent and report
@@ -33,7 +33,9 @@ from PIL import Image
 from train_goal_rep_alignment import (
     GoalLatentPredictorWithFiLM,
     build_coords_batch,
+    encode_teacher_joint_latent,
     load_teacher,
+    normalize_coords_tensor,
 )
 
 
@@ -90,8 +92,9 @@ def main() -> None:
     loss_name = str(payload.get("loss", "mse"))
     image_key = str(payload.get("image_key", "images"))
     teacher_ckpt = str(payload["checkpoint_teacher"])
+    start_cond = str(payload.get("start_cond", "joints"))
 
-    student = GoalLatentPredictorWithFiLM(ntfield_h=ntfield_h).to(device)
+    student = GoalLatentPredictorWithFiLM(ntfield_h=ntfield_h, start_cond=start_cond).to(device)
     student.load_state_dict(payload["student_state_dict"], strict=True)
     student.eval()
 
@@ -111,8 +114,16 @@ def main() -> None:
     # ---- joints ----
     qs = torch.tensor(parse_q_ntfield(args.q_start), dtype=torch.float32, device=device).unsqueeze(0)  # (1,6)
 
+    teacher = None
     with torch.no_grad():
-        z_goal_hat = student(img_t, [args.prompt], qs)  # (1, ntfield_h)
+        if start_cond == "teacher_z":
+            teacher, _ = load_teacher(teacher_ckpt, device)
+            teacher.eval()
+            qs_n = normalize_coords_tensor(qs, normalize_coords)
+            z_in = encode_teacher_joint_latent(teacher, qs_n)
+        else:
+            z_in = qs
+        z_goal_hat = student(img_t, [args.prompt], z_in)  # (1, ntfield_h)
 
     z_goal_hat_cpu = z_goal_hat.detach().cpu().numpy()
     print(f"z_goal_hat shape: {z_goal_hat_cpu.shape}")
@@ -125,8 +136,9 @@ def main() -> None:
 
     # ---- optional evaluation vs teacher ----
     if args.q_goal:
-        teacher, _ = load_teacher(teacher_ckpt, device)
-        teacher.eval()
+        if teacher is None:
+            teacher, _ = load_teacher(teacher_ckpt, device)
+            teacher.eval()
         qg = torch.tensor(parse_q_ntfield(args.q_goal), dtype=torch.float32, device=device).unsqueeze(0)  # (1,6)
 
         coords = build_coords_batch(qs, qg, use_scale=normalize_coords).to(device)

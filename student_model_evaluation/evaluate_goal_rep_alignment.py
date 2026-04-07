@@ -35,7 +35,9 @@ from train_goal_rep_alignment import (  # noqa: E402
     Subset,
     build_coords_batch,
     collate_fn,
+    encode_teacher_joint_latent,
     load_teacher,
+    normalize_coords_tensor,
 )
 
 
@@ -80,8 +82,9 @@ def main() -> None:
     loss_name = str(payload.get("loss", "mse"))
     image_key = str(payload.get("image_key", "images"))
     teacher_ckpt = str(payload["checkpoint_teacher"])
+    start_cond = str(payload.get("start_cond", "joints"))
 
-    student = GoalLatentPredictorWithFiLM(ntfield_h=ntfield_h).to(device)
+    student = GoalLatentPredictorWithFiLM(ntfield_h=ntfield_h, start_cond=start_cond).to(device)
     student.load_state_dict(payload["student_state_dict"], strict=True)
     student.eval()
 
@@ -132,7 +135,12 @@ def main() -> None:
 
             coords = build_coords_batch(qs, qg, normalize_coords).to(device)
             _, z_tgt = teacher.encode_pair_latents(coords)
-            z_hat = student(imgs, prs, qs)
+            if start_cond == "teacher_z":
+                qs_n = normalize_coords_tensor(qs, normalize_coords)
+                z_in = encode_teacher_joint_latent(teacher, qs_n)
+            else:
+                z_in = qs
+            z_hat = student(imgs, prs, z_in)
 
             selected_loss = _loss_value(z_hat, z_tgt, loss_name)
             total_selected_loss += float(selected_loss.item())
@@ -176,9 +184,11 @@ def main() -> None:
         "mse_std": std_mse,
         "normalize_coords": normalize_coords,
         "image_key": image_key,
+        "start_cond": start_cond,
     }
 
     print("=== Goal-Latent Evaluation Summary ===")
+    print(f"start_cond: {start_cond}")
     print(f"Split: {split_name}")
     print(f"Matched HDF5 files: {len(paths)}")
     print(f"Evaluated samples/batches: {samples}/{batches}")

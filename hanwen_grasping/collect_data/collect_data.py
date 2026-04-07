@@ -24,9 +24,6 @@ import fcl
 import cv2
 import copy
 
-import h5py
-import robot_arm_configuration as RC
-
 OBJECT_NAMES = {
     "002_master_chef_can": "master chef can",
     "004_sugar_box": "sugar box",
@@ -45,13 +42,41 @@ def get_object_display_name(urdf_path):
 #from rearrangement_planning_util_ICRA import write_result
 
 
-file_dir = os.path.dirname(__file__)
-util_dir = os.path.join(file_dir, './util')
-grasp_util_dir = os.path.join(file_dir, './grasp_util')
-#scorenet_dir = os.path.join(file_dir, '../learning')
+# This file lives in hanwen_grasping/collect_data/; deps are in hanwen_grasping/{util,grasp_util}.
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+package_root = os.path.abspath(os.path.join(_script_dir, '..'))
+
+
+def _resolve_assets_dir():
+    """URDFs/meshes: prefer hanwen_grasping/assets, then PI-VLA/assets, then VLM-NT/starter_code/assets."""
+    marker = os.path.join("urdf", "ycb", "object_urdf_grasp.txt")
+    candidates = [
+        os.path.join(package_root, "assets"),
+        os.path.join(os.path.dirname(package_root), "assets"),
+        os.path.join(
+            os.path.dirname(os.path.dirname(package_root)), "starter_code", "assets"
+        ),
+    ]
+    for c in candidates:
+        root = os.path.abspath(c)
+        if os.path.isfile(os.path.join(root, marker)):
+            return root
+    return os.path.abspath(os.path.join(package_root, "assets"))
+
+
+ASSETS_DIR = _resolve_assets_dir()
+SAVED_RESULT_DIR = os.path.join(_script_dir, "saved_as_result")
+
+util_dir = os.path.join(package_root, 'util')
+grasp_util_dir = os.path.join(package_root, 'grasp_util')
+#scorenet_dir = os.path.join(package_root, 'learning')
+sys.path.insert(0, package_root)
 sys.path.append(util_dir)
 #sys.path.append(scorenet_dir)
 sys.path.append(grasp_util_dir)
+
+import h5py
+import robot_arm_configuration as RC
 
 try:
     import ompl.base as ob
@@ -89,16 +114,16 @@ if choose == 0:
     min_drawer_height = 0.40
     MIN_NUM_OBSTACLES = 5
     MAX_NUM_OBSTACLES = 8
-    # table_dims = gymapi.Vec3(0.56, 0.86, 0.10) # S
-    table_dims = gymapi.Vec3(np.random.uniform(0.5, 0.7), np.random.uniform(0.8, 1.0), 0.10)
+    table_dims = gymapi.Vec3(0.56, 0.86, 0.10) # S
+    # table_dims = gymapi.Vec3(np.random.uniform(0.5, 0.7), np.random.uniform(0.8, 1.0), 0.10)
 
 else:
     max_drawer_height = 0.55
     min_drawer_height = 0.55
     MIN_NUM_OBSTACLES = 7
     MAX_NUM_OBSTACLES = 11
-    # table_dims = gymapi.Vec3(0.76, 1.16, 0.10) # L
-    table_dims = gymapi.Vec3(np.random.uniform(0.7, 0.9), np.random.uniform(1.0, 1.2), 0.10)
+    table_dims = gymapi.Vec3(0.76, 1.16, 0.10) # L
+    # table_dims = gymapi.Vec3(np.random.uniform(0.7, 0.9), np.random.uniform(1.0, 1.2), 0.10)
 
 piece_width = 0.03
 max_scaling_factor = 0
@@ -111,6 +136,10 @@ MIN_RADIUS = 0.03471716871486391
 
 # Single object
 NUM_OF_OBJECTS = 1
+
+# Each saved episode has this many (image, joint) samples: waypoints × physics steps per waypoint.
+PATH_RESAMPLE_WAYPOINTS = 10
+FRAMES_PER_TRAJECTORY = 100
 
 #*************************************************************************************************#
 
@@ -781,7 +810,7 @@ if __name__ == '__main__':
 
     #all assets
     #*************************************************************************************************#
-    asset_root = "./assets/"
+    asset_root = ASSETS_DIR + os.sep
     ur5e_asset_file = "urdf/ur5e/ur5e_mimic_real_gripper_test.urdf"
     ur5e_collision_parts = ["urdf/ur5e/meshes/collision/base.stl",
                             "urdf/ur5e/meshes/collision/shoulder.stl",
@@ -842,7 +871,9 @@ if __name__ == '__main__':
     #calculate Inverse Kinematics
     #*************************************************************************************************#
     urdf_str = ''
-    with open("./assets/urdf/ur5e/ur5e_mimic_real_gripper_test.urdf") as f:
+    with open(
+        os.path.join(ASSETS_DIR, "urdf", "ur5e", "ur5e_mimic_real_gripper_test.urdf")
+    ) as f:
         urdf_str = f.read()
 
     #*************************************************************************************************#
@@ -886,7 +917,10 @@ if __name__ == '__main__':
                                             upper_cover_dims.z,
                                             asset_options)
 
-    saved_env_name = './saved_as_result/env_' + str(env_id) + '_scene_info.npy'
+    os.makedirs(SAVED_RESULT_DIR, exist_ok=True)
+    saved_env_name = os.path.join(
+        SAVED_RESULT_DIR, "env_" + str(env_id) + "_scene_info.npy"
+    )
     np.save(saved_env_name, np.array([table_dims.x, table_dims.y, table_dims.z, drawer_height]))
 
     asset_options.fix_base_link = False
@@ -971,6 +1005,7 @@ if __name__ == '__main__':
 
     envs = []
     ur5e_handles = []
+    body_cam_handles = []
     camera_candidates = []
     # chosen_object = []
     chosen_scale = []
@@ -1090,38 +1125,36 @@ if __name__ == '__main__':
             objs_manager.registerObjects(obstacle_objs)
             objs_manager.setup()
 
-        # Top-down camera above table (only camera - wrist view removed)
-        # top_cam_handle = gym.create_camera_sensor(envs[-1], camera_props)
-        # table_center_x = table_pose.p.x
-        # table_center_y = table_pose.p.y
-        # top_cam_pos = gymapi.Vec3(table_center_x, table_center_y, 3.2)
-        # top_cam_target = gymapi.Vec3(table_center_x, table_center_y, 0.1)
-        # gym.set_camera_location(top_cam_handle, envs[-1], top_cam_pos, top_cam_target)
+        # set up global camera to record configuration (matches starter_code/collect_data.py)
+        body_cam_handles.append(gym.create_camera_sensor(envs[-1], camera_props))
+        viewpoint_candidate = gymapi.Vec3(3, 0, 0.3)
+        gym.set_camera_location(body_cam_handles[-1], envs[-1],
+                                viewpoint_candidate,
+                                camera_focus)
 
         # Top-down camera above table
         top_cam_handle = gym.create_camera_sensor(envs[-1], camera_props)
         table_center_x = table_pose.p.x
         table_center_y = table_pose.p.y
-        
+
         # Keep the tiny 1mm offset to Y to prevent the vertical singularity (gimbal lock)
-        top_cam_pos = gymapi.Vec3(table_center_x, table_center_y + 0.001, 1.6)
-        top_cam_target = gymapi.Vec3(table_center_x, table_center_y, 0.0)
-        
+        top_cam_pos = gymapi.Vec3(table_pose.p.x, table_pose.p.y + 0.001, 2.2)
+        top_cam_target = gymapi.Vec3(table_pose.p.x - 0.5, table_pose.p.y, table_pose.p.z)
+
         # camera_handle goes first, then the environment
         gym.set_camera_location(top_cam_handle, envs[-1], top_cam_pos, top_cam_target)
 
-        # Side view camera (from +X, looking at table center)
+        # Side view camera (same as viewer: 2.2, 0, 0.5 looking at 0, 0, 0.5)
         side_cam_handle = gym.create_camera_sensor(envs[-1], camera_props)
-        side_cam_pos = gymapi.Vec3(table_center_x + 1.2, table_center_y, table_dims.z + 0.5)
-        side_cam_target = gymapi.Vec3(table_center_x, table_center_y, table_dims.z + 0.05)
+        side_cam_pos = gymapi.Vec3(2.2, 0, 0.5)
+        side_cam_target = gymapi.Vec3(0, 0, 0.5)
         gym.set_camera_location(side_cam_handle, envs[-1], side_cam_pos, side_cam_target)
 
     #*************************************************************************************************#
 
     #*************************************************************************************************#
-    # Viewer camera: top-down over the table center
-    cam_pos = gymapi.Vec3(table_pose.p.x, table_pose.p.y + 0.001, 1.8)
-    cam_target = gymapi.Vec3(table_pose.p.x, table_pose.p.y, table_pose.p.z)
+    cam_pos = gymapi.Vec3(2.2, 0, 0.5)
+    cam_target = gymapi.Vec3(0, 0, 0.5)
     if viewer is not None:
         gym.viewer_camera_look_at(viewer, None, cam_pos, cam_target)
     gym.set_light_parameters(sim, 0, gymapi.Vec3(0.3, 0.3, 0.3), gymapi.Vec3(1.0, 1.0, 1.0),
@@ -1188,7 +1221,7 @@ if __name__ == '__main__':
     ik_solver2 = IK("base_link", "wrist_3_link", urdf_string = urdf_str)
     target_quat = gymapi.Quat(0.446, 0.560, -0.433, 0.549)
     converted_quat = quaternion_multiply(gymapi.Quat(-math.sqrt(2)/2, 0, 0, math.sqrt(2)/2), target_quat)
-    file_path = './assets/urdf/ur5e/meshes/collision/'
+    file_path = os.path.join(ASSETS_DIR, "urdf", "ur5e", "meshes", "collision") + os.sep
 
     scene_info = [table_dims.x, table_dims.y, table_dims.z, drawer_height]
     rac = RC.robot_arm_configuration(file_path, np.array([ur5e_pose.p.x, ur5e_pose.p.y, ur5e_pose.p.z]), scene_info)
@@ -1197,7 +1230,11 @@ if __name__ == '__main__':
     target_idx = getattr(args, "target_idx", 0)
     print(f"Grasping object {target_idx}")
 
-    grasp_file = "./assets/" + "/".join(object_asset_files[target_file_idx[target_idx]].split("/")[:-1]) + "/grasp_dict.npy"
+    grasp_file = os.path.join(
+        ASSETS_DIR,
+        *object_asset_files[target_file_idx[target_idx]].split("/")[:-1],
+        "grasp_dict.npy",
+    )
     grasp_data = np.load(grasp_file, allow_pickle=True)
 
     # generate grasp
@@ -1278,12 +1315,19 @@ if __name__ == '__main__':
     # Interpolate path, then resample to fixed length for normalized trajectories
     if init2grasp_path is not None and len(init2grasp_path) > 1:
         init2grasp_path = interpolate_path(init2grasp_path, steps_between=2)
-        init2grasp_path = resample_path(init2grasp_path, num_waypoints=10)
+        init2grasp_path = resample_path(
+            init2grasp_path, num_waypoints=PATH_RESAMPLE_WAYPOINTS
+        )
         print(f"Path normalized: {len(init2grasp_path)} waypoints")
 
     path_id = 0
     frames_at_waypoint = 0
-    SETTLE_STEPS = 15  # steps per waypoint - fewer = smaller dataset (arm still needs time to reach each pose)
+    if FRAMES_PER_TRAJECTORY % PATH_RESAMPLE_WAYPOINTS != 0:
+        raise ValueError(
+            "FRAMES_PER_TRAJECTORY must divide PATH_RESAMPLE_WAYPOINTS "
+            f"({FRAMES_PER_TRAJECTORY} % {PATH_RESAMPLE_WAYPOINTS} != 0)"
+        )
+    SETTLE_STEPS = FRAMES_PER_TRAJECTORY // PATH_RESAMPLE_WAYPOINTS
     JOINT_DIM = 6
     dataset_samples = []
     prompt = f"grasp the {get_object_display_name(object_asset_files[target_file_idx[target_idx]])}"

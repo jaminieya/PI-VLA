@@ -1,26 +1,15 @@
 #!/usr/bin/env python3
 """
 Train a model to match the NTField **goal-side latent** (the row fed into the
-metric head) using **text prompt**, **RGB image**, and **start joint configuration**.
+metric head) using ONLY the **RGB image** from the first frame.
 
 The frozen trajectory NTField defines the teacher:
   z_start, z_goal = network.encode_pair_latents( concat(q_start, q_goal) )
 
-The student predicts z_goal_hat ≈ z_goal from (prompt, image, start conditioning).
-By default start conditioning is the frozen teacher embedding z_start = E(q_start)
-(same encoder as z_goal); use --start_cond joints for the legacy 6D MLP on q_start.
+The student predicts z_goal_hat ≈ z_goal from (image).
 
-Dataset: ``grasp_6dof_demo_*.h5`` from collect_data (``images``, ``joint_configs``,
-``final_joint_config``, attrs ``prompt``).
-
-Usage:
-  cd hanwen_grasping
-  python train_goal_rep_alignment.py \\
-    --checkpoint ../ntrl-demo/Experiments/UR5_trajectory/.../Model_Epoch_04300_ValLoss_*.pt \\
-    --h5_glob '../collected_data/grasp_6dof_demo_*.h5' \\
-    --epochs 20 --batch_size 16 --out goal_rep_student.pt
-
-Requires: torch, h5py, numpy; torchvision recommended for image resize.
+Dataset: ``grasp_6dof_demo_*.h5``. Extracts index 0 for image/q_start, 
+and index -1 for q_goal.
 """
 
 from __future__ import annotations
@@ -40,32 +29,28 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 
 import torchvision.models as models
-from transformers import DistilBertModel, DistilBertTokenizer
 
 # NTField input normalization (same as planning/gradient_planner_trajectory.py)
 SCALE = float(np.pi / 0.5)
 
 _FILE_DIR = os.path.dirname(os.path.abspath(__file__))
-_PI_VLA_ROOT = os.path.dirname(_FILE_DIR)
+# This file lives in hanwen_grasping/img2goal_config/; repo root is PI-VLA/.
+_PI_VLA_ROOT = os.path.dirname(os.path.dirname(_FILE_DIR))
 _NTRL_DEMO = os.path.join(_PI_VLA_ROOT, "ntrl-demo")
 if os.path.isdir(_NTRL_DEMO) and _NTRL_DEMO not in sys.path:
     sys.path.insert(0, _NTRL_DEMO)
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def _maybe_torchvision():
     try:
         import torchvision.transforms as T  # noqa: WPS433
-
         return T
     except ImportError:
         return None
-
 
 def normalize_coords_tensor(q6: torch.Tensor, use_scale: bool) -> torch.Tensor:
     if use_scale:
         return q6 / SCALE
     return q6
-
 
 def build_coords_batch(
     q_start: torch.Tensor, q_goal: torch.Tensor, use_scale: bool
@@ -77,40 +62,21 @@ def build_coords_batch(
     return torch.cat([q_start, q_goal], dim=1)
 
 
-def encode_teacher_joint_latent(teacher_network: torch.nn.Module, q_n: torch.Tensor) -> torch.Tensor:
-    """
-    Single-configuration NTField embedding E(q): same as z_start from
-    encode_pair_latents(concat(q_start, q_goal)) for the start row (metric_arm).
-    q_n: (B, 6) in teacher input space (normalized if use_scale).
-    Returns: (B, H)
-    """
-    qq = torch.cat([q_n, q_n], dim=1)
-    z0, _z1 = teacher_network.encode_pair_latents(qq)
-    return z0
-
 # ==========================================
 # 1. Frozen Pre-Trained Image Encoder
 # ==========================================
 class PretrainedImageEncoder(nn.Module):
     """
-    Acts as a proxy for R3M / VC-1. 
-    Uses a pre-trained ResNet, frozen to prevent downstream catastrophic forgetting.
+    Uses a pre-trained ResNet, mostly frozen to prevent downstream catastrophic forgetting.
     """
     def __init__(self, out_dim: int = 2048):
         super().__init__()
-        # Load a pre-trained ResNet50 (Standard practice for R3M base)
-        # Note: If using the actual r3m library, you would load it here:
-        # self.backbone = r3m.load_model("resnet50")
-        # torchvision compatibility:
-        # - newer: resnet50(weights=models.ResNet50_Weights.DEFAULT)
-        # - older: resnet50(pretrained=True)
         try:
             resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
         except AttributeError:
             resnet = models.resnet50(pretrained=True)
         
-        # Strip the final classification layer to get the raw feature vector
-        # and keep access to named stages so we can selectively unfreeze layer4.
+        # Strip the final classification layer
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
         self.out_dim = out_dim
         
@@ -118,158 +84,56 @@ class PretrainedImageEncoder(nn.Module):
         self.backbone.eval()
         for param in self.backbone.parameters():
             param.requires_grad = False
-        # Then unfreeze only the last residual stage (layer4) to adapt to
-        # overhead grasping-domain imagery while keeping earlier features stable.
-        # In torchvision ResNet child ordering, index 7 corresponds to layer4.
+            
+        # Unfreeze only the last residual stage (layer4)
         for param in self.backbone[7].parameters():
             param.requires_grad = True
 
+    def train(self, mode=True):
+        """Override train to ensure frozen BatchNorm layers don't drift their running stats."""
+        super().train(mode)
+        # Force the entire backbone to eval mode (freezes BN stats)
+        self.backbone.eval()
+        # Put ONLY layer4 back into train mode
+        self.backbone[7].train()
+        return self
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # No no_grad wrapper — layer4 needs to receive gradients.
-        # Frozen layers won't update anyway since requires_grad=False.
         features = self.backbone(x)
         return features.flatten(1)
 
 
 # ==========================================
-# 2. Frozen Pre-Trained Text Encoder
+# 2. Image-Only Student Model
 # ==========================================
-class PretrainedTextEncoder(nn.Module):
+class GoalLatentPredictorImageOnly(nn.Module):
     """
-    Extracts rich language embeddings using a pre-trained Transformer.
+    Predicts NTField goal latent using ONLY a frozen visual backbone.
     """
-    def __init__(self, model_name: str = 'distilbert-base-uncased', out_dim: int = 768):
+    def __init__(self, ntfield_h: int = 256):
         super().__init__()
-        self.tokenizer = DistilBertTokenizer.from_pretrained(model_name)
-        # Older torch versions (e.g., 1.x) can fail loading safetensors
-        # due to missing torch.frombuffer; force .bin checkpoint loading.
-        self.transformer = DistilBertModel.from_pretrained(
-            model_name,
-            use_safetensors=False,
-        )
-        self.out_dim = out_dim
-        
-        # FREEZE the language backbone
-        self.transformer.eval()
-        for param in self.transformer.parameters():
-            param.requires_grad = False
-
-    def forward(self, prompts: list[str], device: torch.device) -> torch.Tensor:
-        # Tokenize and pad the batch of text prompts
-        inputs = self.tokenizer(
-            prompts, 
-            return_tensors="pt", 
-            padding=True, 
-            truncation=True, 
-            max_length=64
-        ).to(device)
-        
-        with torch.no_grad():
-            outputs = self.transformer(**inputs)
-            
-        # Extract the [CLS] token representation as the sentence embedding
-        sentence_embedding = outputs.last_hidden_state[:, 0, :]
-        return sentence_embedding # Output shape: (B, 768)
-
-
-# ==========================================
-# 3. FiLM (Feature-wise Linear Modulation)
-# ==========================================
-class FiLMConditioning(nn.Module):
-    """
-    Injects language embeddings into the visual representation by learning 
-    scale (gamma) and shift (beta) parameters from the text.
-    """
-    def __init__(self, text_dim: int, image_dim: int):
-        super().__init__()
-        # Maps the text embedding to the exact dimensions of the image embedding
-        # Output is 2 * image_dim because we need both gamma and beta
-        self.film_generator = nn.Linear(text_dim, image_dim * 2)
-
-    def forward(self, image_features: torch.Tensor, text_features: torch.Tensor) -> torch.Tensor:
-        # Generate conditioning parameters from text
-        film_params = self.film_generator(text_features)
-        
-        # Split into scale (gamma) and shift (beta)
-        # Note: We add 1 to gamma so that the default scale (before learning) is 1, not 0
-        gamma, beta = film_params.chunk(2, dim=1)
-        gamma = gamma + 1.0 
-        
-        # Apply FiLM: condition the image features using the text parameters
-        conditioned_features = (image_features * gamma) + beta
-        return conditioned_features
-
-
-# ==========================================
-# 4. The Updated Student Model
-# ==========================================
-class GoalLatentPredictorWithFiLM(nn.Module):
-    """
-    Predicts NTField goal latent using frozen Foundation Models and FiLM.
-    start_cond:
-      - "teacher_z": concat full E(q_start) (shape ntfield_h); no extra linear on z_start.
-      - "joints": legacy MLP on raw q_start (6D) → 128D.
-    """
-
-    start_cond: str
-
-    def __init__(self, ntfield_h: int = 256, start_cond: str = "teacher_z"):
-        super().__init__()
-        if start_cond not in ("teacher_z", "joints"):
-            raise ValueError("start_cond must be 'teacher_z' or 'joints'")
-        self.start_cond = start_cond
         self.ntfield_h = int(ntfield_h)
-
-        # 1. Initialize Frozen Encoders
         self.img_enc = PretrainedImageEncoder(out_dim=2048)
-        self.text_enc = PretrainedTextEncoder(out_dim=768)
 
-        # 2. Initialize FiLM Fusion Module
-        self.film = FiLMConditioning(text_dim=self.text_enc.out_dim, image_dim=self.img_enc.out_dim)
-
-        # 3. Start side: full teacher latent, or joint MLP → 128
-        if start_cond == "teacher_z":
-            self.q_enc = None
-            start_side_dim = self.ntfield_h
-        else:
-            self.q_enc = nn.Sequential(
-                nn.Linear(6, 64),
-                nn.ReLU(inplace=True),
-                nn.Linear(64, 128),
-                nn.ReLU(inplace=True),
-            )
-            start_side_dim = 128
-
-        # 4. Head: image+text (2048) + start features
-        fused_dim = self.img_enc.out_dim + start_side_dim
+        # Head: Maps the 2048D image features directly to the NTField latent space
         self.head = nn.Sequential(
-            nn.Linear(fused_dim, 1024),
+            nn.Linear(self.img_enc.out_dim, 1024),
             nn.ReLU(inplace=True),
             nn.Linear(1024, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, self.ntfield_h),
         )
 
-    def forward(
-        self,
-        images_bchw: torch.Tensor,
-        prompts: list[str],
-        q_start_or_z_embed: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, images_bchw: torch.Tensor) -> torch.Tensor:
         im_feats = self.img_enc(images_bchw)
-        text_feats = self.text_enc(prompts, images_bchw.device)
-        vis_lang_fused = self.film(im_feats, text_feats)
+        return self.head(im_feats)
 
-        if self.start_cond == "teacher_z":
-            q = q_start_or_z_embed
-        else:
-            q = self.q_enc(q_start_or_z_embed)
 
-        final_input = torch.cat([vis_lang_fused, q], dim=1)
-        return self.head(final_input)
-
+# ==========================================
+# 3. Trajectory Dataset loader
+# ==========================================
 class H5GraspDemoDataset(Dataset):
-    """One sample = (image_i, prompt, q_start_i, q_goal_final)."""
+    """One sample per file = (image_first, q_start_first, q_goal_last)."""
 
     def __init__(
         self,
@@ -278,22 +142,21 @@ class H5GraspDemoDataset(Dataset):
         use_torchvision_resize: bool = True,
         img_size: int = 128,
     ):
-        self.samples: List[Tuple[str, int]] = []
-        self.prompts_per_file: Dict[str, str] = {}
-        self._bad_samples: set[Tuple[str, int]] = set()
+        self.samples: List[str] = []
         self._bad_files: set[str] = set()
         self._bad_file_hits: Dict[str, int] = {}
         self.image_key = image_key
         self.img_size = img_size
         self._T = _maybe_torchvision()
         self._use_tv = bool(use_torchvision_resize and self._T is not None)
+        
         if self._use_tv:
             self._tfm = self._T.Compose(
                 [
                     self._T.ToPILImage(),
-                    self._T.Resize((224, 224)), # Standard ResNet size
+                    self._T.Resize((224, 224)),
                     self._T.ToTensor(),
-                    self._T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # CRITICAL
+                    self._T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                 ]
             )
         else:
@@ -305,23 +168,18 @@ class H5GraspDemoDataset(Dataset):
             path = os.path.abspath(path)
             try:
                 with h5py.File(path, "r") as f:
-                    if image_key not in f or "joint_configs" not in f or "final_joint_config" not in f:
+                    if image_key not in f or "joint_configs" not in f:
                         continue
-                    n = f[image_key].shape[0]
-                    pr = f.attrs.get("prompt", "")
-                    if isinstance(pr, bytes):
-                        pr = pr.decode("utf-8", errors="replace")
-                    self.prompts_per_file[path] = str(pr)
-                    for i in range(n):
-                        self.samples.append((path, i))
+                    # We treat each file as one trajectory.
+                    self.samples.append(path)
             except OSError:
                 print(f"[warn] Skipping non-HDF5 or corrupted file: {path}")
                 continue
 
         if not self.samples:
-            raise ValueError("No samples found. Check --h5_glob and HDF5 keys (images, joint_configs).")
+            raise ValueError("No samples found. Check --h5_glob and HDF5 keys.")
         
-        self._file_handles = {} # Add this to cache open files
+        self._file_handles = {} # Cache open files to prevent OS I/O bottlenecks
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -331,7 +189,6 @@ class H5GraspDemoDataset(Dataset):
             rgb = np.clip(rgb, 0, 255).astype(np.uint8)
         if self._use_tv:
             return self._tfm(rgb)
-        # numpy fallback: mean-pool downsample
         h, w = rgb.shape[:2]
         tgt = self.img_size
         if h != tgt or w != tgt:
@@ -343,44 +200,41 @@ class H5GraspDemoDataset(Dataset):
 
     def __getitem__(self, idx: int):
         import h5py
-
         n = len(self.samples)
         max_retries = min(256, n)
-        # Probe varied indices to avoid getting stuck in one corrupted region/file.
+        
         for step in range(max_retries):
-            # Large odd stride gives good coverage across the dataset index space.
             j = (idx + step * 9973) % n
-            path, i = self.samples[j]
+            path = self.samples[j]
             try:
-                # Lazily open and cache the file handle per worker
                 if path not in self._file_handles:
                     self._file_handles[path] = h5py.File(path, "r")
                 
                 f = self._file_handles[path]
-                img = np.array(f[self.image_key][i])
-                q_start = np.array(f["joint_configs"][i, :6], dtype=np.float32)
-                q_goal = np.array(f["final_joint_config"][:6], dtype=np.float32)
-                pr = self.prompts_per_file[path]
+                
+                # First index for image and start joints
+                img = np.array(f[self.image_key][0])
+                q_start = np.array(f["joint_configs"][0, :6], dtype=np.float32)
+                
+                # Last index for goal joints
+                q_goal = np.array(f["joint_configs"][-1, :6], dtype=np.float32)
+                
             except (OSError, KeyError) as e:
-                self._bad_samples.add((path, i))
                 hits = self._bad_file_hits.get(path, 0) + 1
                 self._bad_file_hits[path] = hits
-                print(f"[warn] Skipping unreadable sample: file={path} idx={i} error={e}")
                 if hits >= 32:
                     self._bad_files.add(path)
-                    print(f"[warn] Marking file as bad after repeated read failures: {path}")
                 continue
+                
             x = self._image_to_tensor(img)
-            return x, pr, torch.from_numpy(q_start), torch.from_numpy(q_goal)
+            return x, torch.from_numpy(q_start), torch.from_numpy(q_goal)
 
-        raise RuntimeError(
-            f"Failed to read dataset sample at idx={idx}; no readable sample found after {max_retries} attempts."
-        )
+        raise RuntimeError(f"Failed to read dataset sample at idx={idx}.")
 
 
 def collate_fn(batch):
-    imgs, prs, qs, qg = zip(*batch)
-    return torch.stack(imgs, 0), list(prs), torch.stack(qs, 0), torch.stack(qg, 0)
+    imgs, qs, qg = zip(*batch)
+    return torch.stack(imgs, 0), torch.stack(qs, 0), torch.stack(qg, 0)
 
 
 def load_teacher(
@@ -397,7 +251,6 @@ def load_teacher(
     for p in model.network.parameters():
         p.requires_grad_(False)
     h = 256
-    # Infer H from first linear after encoder stack
     if hasattr(model.network, "encoder") and len(model.network.encoder) > 0:
         lin = model.network.encoder[-1]
         if hasattr(lin, "out_features"):
@@ -406,71 +259,47 @@ def load_teacher(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Train goal latent alignment (prompt+image+q_start -> z_goal)")
+    p = argparse.ArgumentParser(description="Train image-only goal latent alignment")
     p.add_argument("--checkpoint", type=str, required=True, help="NTField Model_Epoch_*.pt")
     p.add_argument("--h5_glob", type=str, required=True, help="Glob for grasp_6dof_demo_*.h5")
     p.add_argument("--out", type=str, default="goal_rep_student.pt")
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument(
-        "--warmup_pct",
-        type=float,
-        default=0.1,
-        help="Fraction of total OneCycle steps used for linear warmup.",
-    )
+    p.add_argument("--warmup_pct", type=float, default=0.1)
     p.add_argument("--num_workers", type=int, default=0)
-    p.add_argument("--image_key", type=str, default="images", help="HDF5 dataset name (images or image)")
+    p.add_argument("--image_key", type=str, default="images", help="HDF5 dataset name")
     p.add_argument(
         "--normalize_coords",
         action="store_true",
-        help="Divide joints by π/0.5 before NTField (matches gradient_planner_trajectory). "
-        "Try without first if loss is unstable; trajectory points.npy is often raw radians.",
+        help="Divide joints by π/0.5 before NTField",
     )
-    p.add_argument(
-        "--loss",
-        type=str,
-        choices=["mse", "cosine"],
-        default="mse",
-        help="cosine = 1 - cos(z_hat, z_goal); useful if scales drift",
-    )
-    p.add_argument(
-        "--triplet_weight",
-        type=float,
-        default=0.1,
-        help="Weight for batch triplet margin loss added to base loss.",
-    )
-    p.add_argument(
-        "--triplet_margin",
-        type=float,
-        default=0.5,
-        help="Margin used by batch triplet loss (anchor=z_hat, pos=z_goal_i, neg=z_goal_j).",
-    )
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument(
-        "--start_cond",
-        type=str,
-        choices=["teacher_z", "joints"],
-        default="teacher_z",
-        help="Condition the head on NTField E(q_start) (teacher_z) or a learned MLP on raw q_start (joints).",
-    )
+    p.add_argument("--loss", type=str, choices=["mse", "cosine"], default="mse")
     p.add_argument("--use_infonce", action="store_true", help="Use InfoNCE instead of Triplet Loss")
     p.add_argument("--temperature", type=float, default=0.07, help="Temperature for InfoNCE")
-    p.add_argument("--align_weight", type=float, default=1.0, help="Weight for alignment loss")
-    p.add_argument("--contrastive_weight", type=float, default=1.0, help="Weight for contrastive loss")
+    p.add_argument("--triplet_weight", type=float, default=0.1)
+    p.add_argument("--triplet_margin", type=float, default=0.5)
+    p.add_argument("--align_weight", type=float, default=1.0)
+    p.add_argument("--contrastive_weight", type=float, default=1.0)
+    p.add_argument(
+        "--save_every",
+        type=int,
+        default=20,
+        help="Save *_epochNNN.pt every N epochs (0 disables; final --out always saved).",
+    )
+    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     args = p.parse_args()
-
     device = torch.device(args.device)
     paths = sorted(glob.glob(args.h5_glob))
     paths = [os.path.abspath(x) for x in paths if os.path.isfile(x)]
+    
     if not paths:
         print(f"No HDF5 matched: {args.h5_glob}")
         sys.exit(1)
-    print(f"Using {len(paths)} HDF5 files")
-
+        
     ds_full = H5GraspDemoDataset(paths, image_key=args.image_key)
-    print(f"Samples {len(ds_full)}")
+    print(f"Trajectories found: {len(ds_full)}")
 
     n = len(ds_full)
     n_val = max(1, int(0.1 * n))
@@ -483,35 +312,26 @@ def main() -> None:
     ds_va = Subset(ds_full, val_list)
 
     loader_tr = DataLoader(
-        ds_tr,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
-        drop_last=True,
+        ds_tr, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, collate_fn=collate_fn, drop_last=True,
     )
     loader_va = DataLoader(
-        ds_va,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
+        ds_va, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, collate_fn=collate_fn,
     )
 
     teacher, nt_h = load_teacher(args.checkpoint, device)
-    student = GoalLatentPredictorWithFiLM(ntfield_h=nt_h, start_cond=args.start_cond).to(device)
-    # Only pass parameters that actually require gradients
+    student = GoalLatentPredictorImageOnly(ntfield_h=nt_h).to(device)
+    
     trainable_params = [p for p in student.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        opt,
-        max_lr=args.lr,
-        steps_per_epoch=len(loader_tr),
-        epochs=args.epochs,
-        pct_start=args.warmup_pct,
+        opt, max_lr=args.lr, steps_per_epoch=len(loader_tr),
+        epochs=args.epochs, pct_start=args.warmup_pct,
     )
 
     def teacher_z_goal(qs: torch.Tensor, qg: torch.Tensor) -> torch.Tensor:
+        # Teacher still requires the pair of start and goal to formulate the correct latent representation
         coords = build_coords_batch(qs, qg, args.normalize_coords).to(device)
         with torch.no_grad():
             _, zg = teacher.encode_pair_latents(coords)
@@ -526,54 +346,33 @@ def main() -> None:
 
     def info_nce_loss(z_hat: torch.Tensor, z_tgt: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
         b_size = z_hat.shape[0]
-        if b_size <= 1:
-            return z_hat.new_tensor(0.0)
+        if b_size <= 1: return z_hat.new_tensor(0.0)
 
-        # 1. Normalize representations to unit sphere
         z_hat = F.normalize(z_hat, dim=1)
         z_tgt = F.normalize(z_tgt, dim=1)
-
-        # 2. Compute similarity matrix (B, B)
-        # Element (i, j) is the scaled cosine sim between z_hat[i] and z_tgt[j]
         logits = torch.matmul(z_hat, z_tgt.T) / temperature
 
-        # 3. Handle False Negatives (Duplicates in batch)
         with torch.no_grad():
-            # Find which targets are essentially identical
             tgt_sims = torch.matmul(z_tgt, z_tgt.T)
-            # Create a mask of duplicates (excluding the diagonal itself)
             duplicate_mask = (tgt_sims > 0.999) & ~torch.eye(b_size, dtype=torch.bool, device=z_hat.device)
         
-        # Mask out duplicates by setting their logits to -inf 
-        # (so they become 0 in the softmax denominator)
         logits.masked_fill_(duplicate_mask, float('-inf'))
-
-        # 4. Standard Cross-Entropy (positive pairs are on the diagonal)
         labels = torch.arange(b_size, device=z_hat.device)
-        
         return F.cross_entropy(logits, labels)
 
     def batch_triplet_loss(z_hat: torch.Tensor, z_tgt: torch.Tensor, margin: float = 0.5) -> torch.Tensor:
-        if z_hat.shape[0] <= 1:
-            return z_hat.new_tensor(0.0)
+        if z_hat.shape[0] <= 1: return z_hat.new_tensor(0.0)
 
-        # Normalize FIRST — margin is meaningful in unit-sphere geometry.
         z_hat = F.normalize(z_hat, dim=1)
         z_tgt = F.normalize(z_tgt, dim=1)
 
         with torch.no_grad():
             dists = torch.cdist(z_tgt, z_tgt, p=2)
             dists[dists < 1e-5] = float("inf")
-            
-            # Find rows where all elements are inf
             valid_rows_mask = ~torch.isinf(dists).all(dim=1)
-            
-            if not valid_rows_mask.any(): # Entire batch is identical
-                return z_hat.new_tensor(0.0)
-                
+            if not valid_rows_mask.any(): return z_hat.new_tensor(0.0)
             neg_idx = dists.argmin(dim=1)
 
-        # Apply mask so invalid rows don't artificially inflate/corrupt the loss
         z_hat = z_hat[valid_rows_mask]
         z_tgt = z_tgt[valid_rows_mask]
         neg_z = z_tgt[neg_idx[valid_rows_mask]]
@@ -586,18 +385,17 @@ def main() -> None:
         student.train()
         run = 0.0
         n_b = 0
-        for imgs, prs, qs, qg in loader_tr:
+        for imgs, qs, qg in loader_tr:
             imgs = imgs.to(device)
             qs = qs.to(device)
             qg = qg.to(device)
+            
+            # Ground truth latent from teacher
             z_tgt = teacher_z_goal(qs, qg)
-            if args.start_cond == "teacher_z":
-                with torch.no_grad():
-                    qs_n = normalize_coords_tensor(qs, args.normalize_coords)
-                    z_in = encode_teacher_joint_latent(teacher, qs_n)
-            else:
-                z_in = qs
-            z_hat = student(imgs, prs, z_in)
+            
+            # Prediction from student (Image Only)
+            z_hat = student(imgs)
+            
             align_loss = base_alignment_loss(z_hat, z_tgt)
             if args.use_infonce:
                 contrastive_loss = info_nce_loss(z_hat, z_tgt, temperature=args.temperature)
@@ -611,65 +409,62 @@ def main() -> None:
             scheduler.step()
             run += float(loss.item())
             n_b += 1
+            
         train_loss = run / max(1, n_b)
 
         student.eval()
         vrun = 0.0
         vb = 0
         with torch.no_grad():
-            for imgs, prs, qs, qg in loader_va:
+            for imgs, qs, qg in loader_va:
                 imgs = imgs.to(device)
                 qs = qs.to(device)
                 qg = qg.to(device)
+                
                 z_tgt = teacher_z_goal(qs, qg)
-                if args.start_cond == "teacher_z":
-                    with torch.no_grad():
-                        qs_n = normalize_coords_tensor(qs, args.normalize_coords)
-                        z_in = encode_teacher_joint_latent(teacher, qs_n)
-                else:
-                    z_in = qs
-                z_hat = student(imgs, prs, z_in)
+                z_hat = student(imgs)
+                
                 align_loss = base_alignment_loss(z_hat, z_tgt)
                 if args.use_infonce:
                     contrastive_loss = info_nce_loss(z_hat, z_tgt, temperature=args.temperature)
                 else:
                     contrastive_loss = batch_triplet_loss(z_hat, z_tgt, margin=args.triplet_margin)
+                    
                 loss = args.align_weight * align_loss + args.contrastive_weight * contrastive_loss
                 vrun += float(loss.item())
                 vb += 1
+                
         val_loss = vrun / max(1, vb)
         print(
-            f"epoch {epoch+1}/{args.epochs}  train_{args.loss}={train_loss:.6f}  val_{args.loss}={val_loss:.6f}",
+            f"epoch {epoch+1}/{args.epochs}  train_loss={train_loss:.6f}  val_loss={val_loss:.6f}",
             flush=True,
         )
 
-        # Save checkpoint every epoch with an epoch-specific suffix.
-        epoch_suffix = f"_epoch{epoch+1:03d}"
-        base, ext = os.path.splitext(out_path)
-        epoch_path = base + epoch_suffix + (ext or ".pt")
-        payload_epoch = {
-            "student_state_dict": student.state_dict(),
-            "ntfield_h": nt_h,
-            "start_cond": args.start_cond,
-            "normalize_coords": args.normalize_coords,
-            "loss": args.loss,
-            "triplet_weight": args.triplet_weight,
-            "triplet_margin": args.triplet_margin,
-            "lr_scheduler": "OneCycleLR",
-            "warmup_pct": args.warmup_pct,
-            "image_key": args.image_key,
-            "checkpoint_teacher": os.path.abspath(args.checkpoint),
-            "epoch": int(epoch + 1),
-        }
-        torch.save(payload_epoch, epoch_path)
-        with open(epoch_path + ".json", "w") as f:
-            json.dump({k: v for k, v in payload_epoch.items() if k != "student_state_dict"}, f, indent=2)
+        if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
+            epoch_suffix = f"_epoch{epoch+1:03d}"
+            base, ext = os.path.splitext(out_path)
+            epoch_path = base + epoch_suffix + (ext or ".pt")
+            payload_epoch = {
+                "student_state_dict": student.state_dict(),
+                "ntfield_h": nt_h,
+                "normalize_coords": args.normalize_coords,
+                "loss": args.loss,
+                "triplet_weight": args.triplet_weight,
+                "triplet_margin": args.triplet_margin,
+                "lr_scheduler": "OneCycleLR",
+                "warmup_pct": args.warmup_pct,
+                "image_key": args.image_key,
+                "checkpoint_teacher": os.path.abspath(args.checkpoint),
+                "epoch": int(epoch + 1),
+                "save_every": args.save_every,
+            }
+            torch.save(payload_epoch, epoch_path)
+            with open(epoch_path + ".json", "w") as f:
+                json.dump({k: v for k, v in payload_epoch.items() if k != "student_state_dict"}, f, indent=2)
 
-    # Final checkpoint at the user-specified output path (no epoch suffix).
     payload_final = {
         "student_state_dict": student.state_dict(),
         "ntfield_h": nt_h,
-        "start_cond": args.start_cond,
         "normalize_coords": args.normalize_coords,
         "loss": args.loss,
         "triplet_weight": args.triplet_weight,
@@ -679,12 +474,12 @@ def main() -> None:
         "image_key": args.image_key,
         "checkpoint_teacher": os.path.abspath(args.checkpoint),
         "epoch": int(args.epochs),
+        "save_every": args.save_every,
     }
     torch.save(payload_final, out_path)
     with open(out_path + ".json", "w") as f:
         json.dump({k: v for k, v in payload_final.items() if k != "student_state_dict"}, f, indent=2)
     print(f"Saved final student to {out_path}", flush=True)
-
 
 if __name__ == "__main__":
     main()

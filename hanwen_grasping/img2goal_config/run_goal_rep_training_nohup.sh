@@ -5,10 +5,10 @@ set -euo pipefail
 #   ./run_goal_rep_training_nohup.sh <checkpoint.pt> <h5_glob> [output.pt]
 #
 # Example:
-  # ./run_goal_rep_training_nohup.sh \
+  # ./img2goal_config/run_goal_rep_training_nohup.sh \
   #   ../ntrl-demo/Experiments/UR5_trajectory/trajectory_03_09_20_10/Model_Epoch_04300_ValLoss_6.635179e-01.pt \
   #   "./collected_data/grasp_6dof_demo_*.h5" \
-  #   goal_rep_student_film_1_1.pt
+  #   goal_rep_student_film_0_1.pt
 
 if [[ $# -lt 2 ]]; then
   echo "Usage: $0 <checkpoint.pt> <h5_glob> [output.pt]"
@@ -20,6 +20,9 @@ H5_GLOB="$2"
 OUT_FILE="${3:-goal_rep_student_film.pt}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Parent is hanwen_grasping/ so paths like ./collected_data/*.h5 match real data (not img2goal_config/collected_data).
+GRASP_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+TRAIN_PY="${SCRIPT_DIR}/train_goal_rep_alignment.py"
 LOG_DIR="${SCRIPT_DIR}/logs"
 mkdir -p "${LOG_DIR}"
 
@@ -32,7 +35,7 @@ PID_FILE="${LOG_DIR}/train_goal_rep_alignment_${TIMESTAMP}.pid"
 # =========================
 PYTHON_BIN="python"
 CONDA_ENV_NAME="rlgpu"
-EPOCHS=30
+EPOCHS=100
 BATCH_SIZE=16
 LR="1e-3"
 NUM_WORKERS=0
@@ -47,19 +50,19 @@ USE_STDBUF=1
 LOSS="mse"
 IMAGE_KEY="images"
 NORMALIZE_COORDS=0          # set to 1 to add --normalize_coords
-# teacher_z = NTField E(q_start); joints = legacy MLP on 6D q_start
-START_COND="teacher_z"
+# Image-only train_goal_rep_alignment.py has no --start_cond (no prompt / q_start branch).
 TRIPLET_WEIGHT="0.5"
 TRIPLET_MARGIN="0.5"
 WARMUP_PCT="0.1"
-ALIGN_WEIGHT="0.0"
+ALIGN_WEIGHT="1.0"
 CONTRASTIVE_WEIGHT="1.0"
 USE_INFONCE=1               # set to 1 to add --use_infonce, 0 for triplet loss
 TEMPERATURE="0.07"
+SAVE_EVERY=20
 
 CMD=(
   env PYTHONUNBUFFERED=1
-  "${PYTHON_BIN}" -u train_goal_rep_alignment.py
+  "${PYTHON_BIN}" -u "${TRAIN_PY}"
   --checkpoint "${CHECKPOINT}"
   --h5_glob "${H5_GLOB}"
   --out "${OUT_FILE}"
@@ -73,10 +76,10 @@ CMD=(
   --triplet_weight "${TRIPLET_WEIGHT}"
   --triplet_margin "${TRIPLET_MARGIN}"
   --warmup_pct "${WARMUP_PCT}"
-  --start_cond "${START_COND}"
   --align_weight "${ALIGN_WEIGHT}"
   --contrastive_weight "${CONTRASTIVE_WEIGHT}"
   --temperature "${TEMPERATURE}"
+  --save_every "${SAVE_EVERY}"
 )
 
 if [[ "${NORMALIZE_COORDS}" == "1" ]]; then
@@ -98,7 +101,7 @@ else
   exit 1
 fi
 
-cd "${SCRIPT_DIR}"
+cd "${GRASP_ROOT}"
 
 if [[ -n "${CUDA_VISIBLE_DEVICES}" ]]; then
   export CUDA_VISIBLE_DEVICES
@@ -113,6 +116,7 @@ fi
 {
   echo "=== train_goal_rep_alignment launch ==="
   echo "timestamp: ${TIMESTAMP}"
+  echo "cwd: ${GRASP_ROOT}"
   echo "checkpoint: ${CHECKPOINT}"
   echo "h5_glob: ${H5_GLOB}"
   echo "out_file: ${OUT_FILE}"
@@ -127,7 +131,6 @@ fi
   echo "loss: ${LOSS}"
   echo "image_key: ${IMAGE_KEY}"
   echo "normalize_coords: ${NORMALIZE_COORDS}"
-  echo "start_cond: ${START_COND}"
   echo "triplet_weight: ${TRIPLET_WEIGHT}"
   echo "triplet_margin: ${TRIPLET_MARGIN}"
   echo "warmup_pct: ${WARMUP_PCT}"
@@ -135,6 +138,7 @@ fi
   echo "contrastive_weight: ${CONTRASTIVE_WEIGHT}"
   echo "use_infonce: ${USE_INFONCE}"
   echo "temperature: ${TEMPERATURE}"
+  echo "save_every: ${SAVE_EVERY}"
   echo "command: ${CMD[*]}"
   echo "======================================"
 } > "${LOG_FILE}"

@@ -194,6 +194,109 @@ def plan_to_student_latent(
     return np.stack(path, axis=0), stats
 
 
+def mppi_plan_joint_space(
+    teacher_model,
+    q_start,
+    q_goal,
+    scale,
+    *,
+    steps: int = 200,
+    sample_num: int = 50,
+    horizon: int = 5,
+    device: torch.device,
+) -> np.ndarray:
+    """MPPI planner operating on physical joint-space goal targets."""
+    q_s = torch.tensor(q_start, dtype=torch.float32, device=device).unsqueeze(0) / scale
+    q_g = torch.tensor(q_goal, dtype=torch.float32, device=device).unsqueeze(0) / scale
+
+    xp = torch.cat([q_s, q_g], dim=1)  # (1, 12)
+    dp_prior = torch.zeros((1, 6), device=device)
+    path = [q_s.clone() * scale]
+
+    for _ in range(steps):
+        xp_tmp = xp.clone().unsqueeze(0).repeat(sample_num, horizon, 1)
+
+        dp = 0.015 * torch.randn((sample_num, 1, 6), device=device) + 0.015 * torch.randn(
+            (sample_num, horizon, 6), device=device
+        )
+        dp = dp + 2.0 * dp_prior
+        dp_norm = torch.norm(dp, dim=2, keepdim=True)
+        dp = dp / (torch.clamp(dp_norm, min=0.015) / 0.015)
+
+        dp_cumsum = torch.cumsum(dp, dim=1)
+        xp_tmp[..., 0:6] = xp_tmp[..., 0:6] + dp_cumsum
+
+        eval_tensor = xp_tmp[:, [0, -1], :].reshape(-1, 12)
+        cost = teacher_model.function.TravelTimes(eval_tensor).reshape(-1, 2)
+        total_cost = 10.0 * cost[:, 0] + cost[:, 1]
+
+        weight = torch.softmax(-50.0 * total_cost, dim=0)
+        dp_prior = (weight @ dp[:, 0, :]).unsqueeze(0)
+
+        xp[:, 0:6] = xp[:, 0:6] + dp_prior
+        path.append(xp[:, 0:6].clone() * scale)
+
+        if torch.norm(xp[:, 6:12] - xp[:, 0:6]) < 0.01:
+            break
+
+    path.append(xp[:, 6:12].clone() * scale)
+    return np.stack([p.squeeze(0).detach().cpu().numpy() for p in path], axis=0)
+
+
+def mppi_plan_latent_space(
+    teacher_network: torch.nn.Module,
+    q_start,
+    z_goal_hat: torch.Tensor,
+    scale,
+    *,
+    steps: int = 200,
+    sample_num: int = 50,
+    horizon: int = 5,
+    device: torch.device,
+) -> np.ndarray:
+    """MPPI planner that drives directly toward latent z_goal_hat (no explicit q_goal)."""
+    q_curr = torch.tensor(q_start, dtype=torch.float32, device=device).unsqueeze(0) / scale
+    dp_prior = torch.zeros((1, 6), device=device)
+    path = [q_curr.clone() * scale]
+
+    for _ in range(steps):
+        q_tmp = q_curr.unsqueeze(0).repeat(sample_num, horizon, 1)
+
+        dp = 0.015 * torch.randn((sample_num, 1, 6), device=device) + 0.015 * torch.randn(
+            (sample_num, horizon, 6), device=device
+        )
+        dp = dp + 2.0 * dp_prior
+        dp_norm = torch.norm(dp, dim=2, keepdim=True)
+        dp = dp / (torch.clamp(dp_norm, min=0.015) / 0.015)
+
+        dp_cumsum = torch.cumsum(dp, dim=1)
+        q_tmp = q_tmp + dp_cumsum
+
+        q_horizon_start = q_tmp[:, 0, :]
+        q_horizon_end = q_tmp[:, -1, :]
+
+        z_start_samples = _encode_teacher_joint_latent(teacher_network, q_horizon_start)
+        z_end_samples = _encode_teacher_joint_latent(teacher_network, q_horizon_end)
+        z_target_exp = z_goal_hat.expand(sample_num, -1)
+
+        cost_0 = _teacher_tau_from_latents(z_start_samples, z_target_exp).squeeze(1)
+        cost_1 = _teacher_tau_from_latents(z_end_samples, z_target_exp).squeeze(1)
+        total_cost = 10.0 * cost_0 + cost_1
+
+        weight = torch.softmax(-50.0 * total_cost, dim=0)
+        dp_prior = (weight @ dp[:, 0, :]).unsqueeze(0)
+        q_curr = q_curr + dp_prior
+        path.append(q_curr.clone() * scale)
+
+        with torch.no_grad():
+            z_curr = _encode_teacher_joint_latent(teacher_network, q_curr)
+            tau_curr = _teacher_tau_from_latents(z_curr, z_goal_hat).item()
+        if tau_curr < 0.05:
+            break
+
+    return np.stack([p.squeeze(0).detach().cpu().numpy() for p in path], axis=0)
+
+
 def preprocess_collect_data_rgb(rgb_uint8: np.ndarray, device: str) -> torch.Tensor:
     """
     Align exactly with collect_data.py + training dataset pipeline:
@@ -380,6 +483,12 @@ if __name__ == '__main__':
                 'type': str,
                 'default': '',
                 'help': 'PyTorch device for NTField teacher/student (e.g. cuda:1, cpu). Empty = auto: use another GPU than --compute_device_id when possible.',
+            },
+            {
+                'name': '--student_planner',
+                'type': str,
+                'default': 'mppi_joint',
+                'help': 'Planner for student mode: gradient, mppi_joint, or mppi_latent.',
             },
         ],
     )
@@ -597,19 +706,29 @@ if __name__ == '__main__':
 
 
             # 2. Load Student Architecture
-            from train_goal_rep_alignment import GoalLatentPredictorWithFiLM
+            from train_goal_rep_alignment import (
+                GoalLatentPredictorWithFiLM,
+                encode_teacher_joint_latent,
+                normalize_coords_tensor,
+            )
             student_payload = torch.load(args.student, map_location="cpu")
             ntfield_h = int(student_payload["ntfield_h"])
             use_scale = bool(student_payload.get("normalize_coords", False))
+            start_cond = str(student_payload.get("start_cond", "joints"))
 
-            student = GoalLatentPredictorWithFiLM(ntfield_h=ntfield_h).to(device)
+            student = GoalLatentPredictorWithFiLM(ntfield_h=ntfield_h, start_cond=start_cond).to(device)
             student.load_state_dict(student_payload["student_state_dict"], strict=True)
             student.eval()
 
             # 3. Predict Goal Latent Space
             qs_t = torch.tensor(q_start, dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
-                z_goal_hat = student(img_t, [_nt_h5_prompt], qs_t)
+                if start_cond == "teacher_z":
+                    qs_n = normalize_coords_tensor(qs_t, use_scale)
+                    z_in = encode_teacher_joint_latent(teacher.network, qs_n)
+                else:
+                    z_in = qs_t
+                z_goal_hat = student(img_t, [_nt_h5_prompt], z_in)
 
             # 3.5 Compare student latent against ground-truth goal latent from dataset.
             with h5py.File(args.h5_path, "r") as f:
@@ -646,33 +765,58 @@ if __name__ == '__main__':
             print(f"[Latent compare] cosine loss (1-cos): {cos_loss_gt:.6f}")
             print(f"[Latent compare] mse: {mse_gt:.6f}")
 
-            # 4. Adam search: (a) match teacher latent to student z_goal_hat; (b) same for teacher z_goal_gt.
-            opt_trace_rad, stats = plan_to_student_latent(
-                teacher.network, q_start, z_goal_hat,
-                steps=200, lr=0.05, device=device, use_scale=use_scale, metric="cosine"
-            )
-            opt_trace_z_gt, stats_z_gt = plan_to_student_latent(
-                teacher.network, q_start, z_goal_gt,
-                steps=200, lr=0.05, device=device, use_scale=use_scale, metric="cosine"
-            )
-
-            q_goal_hat = opt_trace_rad[-1]
-            q_goal_from_z_gt = opt_trace_z_gt[-1]
+            planner_mode = str(getattr(args, "student_planner", "mppi_joint")).strip().lower()
+            q_goal_hat = None
+            opt_trace_rad = None
+            stats = {"loss_history": []}
             q_goal_gt_d = np.asarray(q_goal_gt, dtype=np.float64).reshape(6)
 
-            print(
-                f"[Latent inv z_goal_gt] final cosine: {stats_z_gt['final_cosine_similarity']:.6f} "
-                f"mse: {stats_z_gt['final_mse']:.6f}"
-            )
-            print(
-                "[Compare] joint L2 |q from invert(z_goal_gt) - q_goal_gt_dataset|: "
-                f"{float(np.linalg.norm(np.asarray(q_goal_from_z_gt, dtype=np.float64) - q_goal_gt_d)):.6f}"
-            )
+            if planner_mode == "mppi_latent":
+                print("[Student planner] Using latent MPPI (directly toward z_goal_hat)")
+                path_student = mppi_plan_latent_space(
+                    teacher.network,
+                    q_start,
+                    z_goal_hat,
+                    scale=SCALE if use_scale else 1.0,
+                    device=device,
+                )
+            else:
+                # Keep latent inversion for gradient and joint-space MPPI modes.
+                opt_trace_rad, stats = plan_to_student_latent(
+                    teacher.network, q_start, z_goal_hat,
+                    steps=200, lr=0.05, device=device, use_scale=use_scale, metric="cosine"
+                )
+                opt_trace_z_gt, stats_z_gt = plan_to_student_latent(
+                    teacher.network, q_start, z_goal_gt,
+                    steps=200, lr=0.05, device=device, use_scale=use_scale, metric="cosine"
+                )
 
-            # 5. Student → invert(z_hat) then field plan. GT reference → dataset q_goal (oracle joints).
-            path_student = gradient_plan(
-                teacher, q_start, q_goal_hat, step_size=0.02, max_steps=200, tol=0.01, device=device
-            )
+                q_goal_hat = opt_trace_rad[-1]
+                q_goal_from_z_gt = opt_trace_z_gt[-1]
+                print(
+                    f"[Latent inv z_goal_gt] final cosine: {stats_z_gt['final_cosine_similarity']:.6f} "
+                    f"mse: {stats_z_gt['final_mse']:.6f}"
+                )
+                print(
+                    "[Compare] joint L2 |q from invert(z_goal_gt) - q_goal_gt_dataset|: "
+                    f"{float(np.linalg.norm(np.asarray(q_goal_from_z_gt, dtype=np.float64) - q_goal_gt_d)):.6f}"
+                )
+
+                if planner_mode == "gradient":
+                    print("[Student planner] Using original gradient_plan after latent inversion")
+                    path_student = gradient_plan(
+                        teacher, q_start, q_goal_hat, step_size=0.02, max_steps=200, tol=0.01, device=device
+                    )
+                else:
+                    print("[Student planner] Using joint-space MPPI after latent inversion")
+                    path_student = mppi_plan_joint_space(
+                        teacher,
+                        q_start,
+                        q_goal_hat,
+                        scale=SCALE if use_scale else 1.0,
+                        device=device,
+                    )
+
             robot_path_student = interpolate_path_ntfield(path_student, steps_between=4)
             path_gt = gradient_plan(
                 teacher, q_start, q_goal_gt_d, step_size=0.02, max_steps=200, tol=0.01, device=device
@@ -689,11 +833,12 @@ if __name__ == '__main__':
 
             _summarize_plan("[Student plan → q from invert(z_goal_hat)]", robot_path_student)
             _summarize_plan("[GT plan → q_goal_gt from dataset (oracle joints)]", robot_path_gt)
-            qgh = np.asarray(q_goal_hat, dtype=np.float64).reshape(6)
-            print(
-                "[Compare] joint L2 |q from invert(z_goal_hat) - q_goal_gt_dataset|: "
-                f"{float(np.linalg.norm(qgh - q_goal_gt_d)):.6f}"
-            )
+            if q_goal_hat is not None:
+                qgh = np.asarray(q_goal_hat, dtype=np.float64).reshape(6)
+                print(
+                    "[Compare] joint L2 |q from invert(z_goal_hat) - q_goal_gt_dataset|: "
+                    f"{float(np.linalg.norm(qgh - q_goal_gt_d)):.6f}"
+                )
             print(
                 "[Compare] joint L2 |student_path_end - q_goal_gt_dataset|: "
                 f"{float(np.linalg.norm(np.asarray(robot_path_student[-1]) - q_goal_gt_d)):.6f}"
@@ -712,7 +857,7 @@ if __name__ == '__main__':
             )
             _record_split_gt_start = len(robot_path_student) + hold_between_paths
 
-            if getattr(args, 'record', False):
+            if getattr(args, 'record', False) and opt_trace_rad is not None:
                 plot_frames = _build_record_frames(opt_trace_rad, stats.get("loss_history", []), fps=30)
 
         else:

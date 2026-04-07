@@ -6,9 +6,9 @@ metric head) using **text prompt**, **RGB image**, and **start joint configurati
 The frozen trajectory NTField defines the teacher:
   z_start, z_goal = network.encode_pair_latents( concat(q_start, q_goal) )
 
-The student predicts z_goal_hat ≈ z_goal from (prompt, image, q_start), so at
-inference you can replace an explicit goal configuration with the predicted
-latent when building planner inputs (requires a small planner change).
+The student predicts z_goal_hat ≈ z_goal from (prompt, image, start conditioning).
+By default start conditioning is the frozen teacher embedding z_start = E(q_start)
+(same encoder as z_goal); use --start_cond joints for the legacy 6D MLP on q_start.
 
 Dataset: ``grasp_6dof_demo_*.h5`` from collect_data (``images``, ``joint_configs``,
 ``final_joint_config``, attrs ``prompt``).
@@ -75,6 +75,18 @@ def build_coords_batch(
         q_start = q_start / SCALE
         q_goal = q_goal / SCALE
     return torch.cat([q_start, q_goal], dim=1)
+
+
+def encode_teacher_joint_latent(teacher_network: torch.nn.Module, q_n: torch.Tensor) -> torch.Tensor:
+    """
+    Single-configuration NTField embedding E(q): same as z_start from
+    encode_pair_latents(concat(q_start, q_goal)) for the start row (metric_arm).
+    q_n: (B, 6) in teacher input space (normalized if use_scale).
+    Returns: (B, H)
+    """
+    qq = torch.cat([q_n, q_n], dim=1)
+    z0, _z1 = teacher_network.encode_pair_latents(qq)
+    return z0
 
 # ==========================================
 # 1. Frozen Pre-Trained Image Encoder
@@ -194,56 +206,67 @@ class FiLMConditioning(nn.Module):
 class GoalLatentPredictorWithFiLM(nn.Module):
     """
     Predicts NTField goal latent using frozen Foundation Models and FiLM.
+    start_cond:
+      - "teacher_z": concat full E(q_start) (shape ntfield_h); no extra linear on z_start.
+      - "joints": legacy MLP on raw q_start (6D) → 128D.
     """
-    def __init__(self, ntfield_h: int = 256):
+
+    start_cond: str
+
+    def __init__(self, ntfield_h: int = 256, start_cond: str = "teacher_z"):
         super().__init__()
-        
+        if start_cond not in ("teacher_z", "joints"):
+            raise ValueError("start_cond must be 'teacher_z' or 'joints'")
+        self.start_cond = start_cond
+        self.ntfield_h = int(ntfield_h)
+
         # 1. Initialize Frozen Encoders
         self.img_enc = PretrainedImageEncoder(out_dim=2048)
         self.text_enc = PretrainedTextEncoder(out_dim=768)
-        
+
         # 2. Initialize FiLM Fusion Module
         self.film = FiLMConditioning(text_dim=self.text_enc.out_dim, image_dim=self.img_enc.out_dim)
-        
-        # 3. Start Joint Encoder (q_start) - actively trained
-        self.q_enc = nn.Sequential(
-            nn.Linear(6, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 128),
-            nn.ReLU(inplace=True),
-        )
-        
-        # 4. Final Policy/Metric Head - actively trained
-        # Input = Conditioned Image Features (2048) + Encoded Joints (128)
-        fused_dim = self.img_enc.out_dim + 128
+
+        # 3. Start side: full teacher latent, or joint MLP → 128
+        if start_cond == "teacher_z":
+            self.q_enc = None
+            start_side_dim = self.ntfield_h
+        else:
+            self.q_enc = nn.Sequential(
+                nn.Linear(6, 64),
+                nn.ReLU(inplace=True),
+                nn.Linear(64, 128),
+                nn.ReLU(inplace=True),
+            )
+            start_side_dim = 128
+
+        # 4. Head: image+text (2048) + start features
+        fused_dim = self.img_enc.out_dim + start_side_dim
         self.head = nn.Sequential(
             nn.Linear(fused_dim, 1024),
             nn.ReLU(inplace=True),
             nn.Linear(1024, 512),
             nn.ReLU(inplace=True),
-            nn.Linear(512, ntfield_h),
+            nn.Linear(512, self.ntfield_h),
         )
 
-    def forward(self, images_bchw: torch.Tensor, prompts: list[str], q_start: torch.Tensor) -> torch.Tensor:
-        # Device management
-        device = images_bchw.device
-        
-        # 1. Extract Frozen Features
+    def forward(
+        self,
+        images_bchw: torch.Tensor,
+        prompts: list[str],
+        q_start_or_z_embed: torch.Tensor,
+    ) -> torch.Tensor:
         im_feats = self.img_enc(images_bchw)
-        text_feats = self.text_enc(prompts, device)
-        
-        # 2. Fuse Vision and Language via FiLM
-        # The visual features are actively shifted and scaled based on the text instruction
+        text_feats = self.text_enc(prompts, images_bchw.device)
         vis_lang_fused = self.film(im_feats, text_feats)
-        
-        # 3. Encode Proprioception (Joints)
-        q = self.q_enc(q_start)
-        
-        # 4. Predict the Goal Latent
+
+        if self.start_cond == "teacher_z":
+            q = q_start_or_z_embed
+        else:
+            q = self.q_enc(q_start_or_z_embed)
+
         final_input = torch.cat([vis_lang_fused, q], dim=1)
-        z_goal_hat = self.head(final_input)
-        
-        return z_goal_hat
+        return self.head(final_input)
 
 class H5GraspDemoDataset(Dataset):
     """One sample = (image_i, prompt, q_start_i, q_goal_final)."""
@@ -297,6 +320,8 @@ class H5GraspDemoDataset(Dataset):
 
         if not self.samples:
             raise ValueError("No samples found. Check --h5_glob and HDF5 keys (images, joint_configs).")
+        
+        self._file_handles = {} # Add this to cache open files
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -326,25 +351,27 @@ class H5GraspDemoDataset(Dataset):
             # Large odd stride gives good coverage across the dataset index space.
             j = (idx + step * 9973) % n
             path, i = self.samples[j]
-            if path in self._bad_files or (path, i) in self._bad_samples:
-                continue
             try:
-                with h5py.File(path, "r") as f:
-                    img = np.array(f[self.image_key][i])
-                    q_start = np.array(f["joint_configs"][i, :6], dtype=np.float32)
-                    q_goal = np.array(f["final_joint_config"][:6], dtype=np.float32)
+                # Lazily open and cache the file handle per worker
+                if path not in self._file_handles:
+                    self._file_handles[path] = h5py.File(path, "r")
+                
+                f = self._file_handles[path]
+                img = np.array(f[self.image_key][i])
+                q_start = np.array(f["joint_configs"][i, :6], dtype=np.float32)
+                q_goal = np.array(f["final_joint_config"][:6], dtype=np.float32)
                 pr = self.prompts_per_file[path]
-                x = self._image_to_tensor(img)
-                return x, pr, torch.from_numpy(q_start), torch.from_numpy(q_goal)
-            except OSError:
+            except (OSError, KeyError) as e:
                 self._bad_samples.add((path, i))
                 hits = self._bad_file_hits.get(path, 0) + 1
                 self._bad_file_hits[path] = hits
-                print(f"[warn] Skipping unreadable sample: file={path} idx={i}")
+                print(f"[warn] Skipping unreadable sample: file={path} idx={i} error={e}")
                 if hits >= 32:
                     self._bad_files.add(path)
                     print(f"[warn] Marking file as bad after repeated read failures: {path}")
                 continue
+            x = self._image_to_tensor(img)
+            return x, pr, torch.from_numpy(q_start), torch.from_numpy(q_goal)
 
         raise RuntimeError(
             f"Failed to read dataset sample at idx={idx}; no readable sample found after {max_retries} attempts."
@@ -420,6 +447,18 @@ def main() -> None:
         help="Margin used by batch triplet loss (anchor=z_hat, pos=z_goal_i, neg=z_goal_j).",
     )
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--start_cond",
+        type=str,
+        choices=["teacher_z", "joints"],
+        default="teacher_z",
+        help="Condition the head on NTField E(q_start) (teacher_z) or a learned MLP on raw q_start (joints).",
+    )
+    p.add_argument("--use_infonce", action="store_true", help="Use InfoNCE instead of Triplet Loss")
+    p.add_argument("--temperature", type=float, default=0.07, help="Temperature for InfoNCE")
+    p.add_argument("--align_weight", type=float, default=1.0, help="Weight for alignment loss")
+    p.add_argument("--contrastive_weight", type=float, default=1.0, help="Weight for contrastive loss")
+
     args = p.parse_args()
 
     device = torch.device(args.device)
@@ -460,7 +499,7 @@ def main() -> None:
     )
 
     teacher, nt_h = load_teacher(args.checkpoint, device)
-    student = GoalLatentPredictorWithFiLM(ntfield_h=nt_h).to(device)
+    student = GoalLatentPredictorWithFiLM(ntfield_h=nt_h, start_cond=args.start_cond).to(device)
     # Only pass parameters that actually require gradients
     trainable_params = [p for p in student.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
@@ -485,6 +524,35 @@ def main() -> None:
         z_tgt_n = F.normalize(z_tgt, dim=1)
         return (1.0 - (z_hat_n * z_tgt_n).sum(dim=1)).mean()
 
+    def info_nce_loss(z_hat: torch.Tensor, z_tgt: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
+        b_size = z_hat.shape[0]
+        if b_size <= 1:
+            return z_hat.new_tensor(0.0)
+
+        # 1. Normalize representations to unit sphere
+        z_hat = F.normalize(z_hat, dim=1)
+        z_tgt = F.normalize(z_tgt, dim=1)
+
+        # 2. Compute similarity matrix (B, B)
+        # Element (i, j) is the scaled cosine sim between z_hat[i] and z_tgt[j]
+        logits = torch.matmul(z_hat, z_tgt.T) / temperature
+
+        # 3. Handle False Negatives (Duplicates in batch)
+        with torch.no_grad():
+            # Find which targets are essentially identical
+            tgt_sims = torch.matmul(z_tgt, z_tgt.T)
+            # Create a mask of duplicates (excluding the diagonal itself)
+            duplicate_mask = (tgt_sims > 0.999) & ~torch.eye(b_size, dtype=torch.bool, device=z_hat.device)
+        
+        # Mask out duplicates by setting their logits to -inf 
+        # (so they become 0 in the softmax denominator)
+        logits.masked_fill_(duplicate_mask, float('-inf'))
+
+        # 4. Standard Cross-Entropy (positive pairs are on the diagonal)
+        labels = torch.arange(b_size, device=z_hat.device)
+        
+        return F.cross_entropy(logits, labels)
+
     def batch_triplet_loss(z_hat: torch.Tensor, z_tgt: torch.Tensor, margin: float = 0.5) -> torch.Tensor:
         if z_hat.shape[0] <= 1:
             return z_hat.new_tensor(0.0)
@@ -493,17 +561,22 @@ def main() -> None:
         z_hat = F.normalize(z_hat, dim=1)
         z_tgt = F.normalize(z_tgt, dim=1)
 
-        # Hard negatives: closest distinct target in the batch.
-        # Mask out near-identical vectors (including the diagonal and duplicates)
-        # to avoid false negatives that produce uninformative triplet gradients.
         with torch.no_grad():
             dists = torch.cdist(z_tgt, z_tgt, p=2)
             dists[dists < 1e-5] = float("inf")
-            if torch.isinf(dists).all():
+            
+            # Find rows where all elements are inf
+            valid_rows_mask = ~torch.isinf(dists).all(dim=1)
+            
+            if not valid_rows_mask.any(): # Entire batch is identical
                 return z_hat.new_tensor(0.0)
+                
             neg_idx = dists.argmin(dim=1)
 
-        neg_z = z_tgt[neg_idx]
+        # Apply mask so invalid rows don't artificially inflate/corrupt the loss
+        z_hat = z_hat[valid_rows_mask]
+        z_tgt = z_tgt[valid_rows_mask]
+        neg_z = z_tgt[neg_idx[valid_rows_mask]]
 
         return F.triplet_margin_loss(z_hat, z_tgt, neg_z, margin=margin)
 
@@ -518,10 +591,20 @@ def main() -> None:
             qs = qs.to(device)
             qg = qg.to(device)
             z_tgt = teacher_z_goal(qs, qg)
-            z_hat = student(imgs, prs, qs)
+            if args.start_cond == "teacher_z":
+                with torch.no_grad():
+                    qs_n = normalize_coords_tensor(qs, args.normalize_coords)
+                    z_in = encode_teacher_joint_latent(teacher, qs_n)
+            else:
+                z_in = qs
+            z_hat = student(imgs, prs, z_in)
             align_loss = base_alignment_loss(z_hat, z_tgt)
-            trip_loss = batch_triplet_loss(z_hat, z_tgt, margin=args.triplet_margin)
-            loss = align_loss + args.triplet_weight * trip_loss
+            if args.use_infonce:
+                contrastive_loss = info_nce_loss(z_hat, z_tgt, temperature=args.temperature)
+            else:
+                contrastive_loss = batch_triplet_loss(z_hat, z_tgt, margin=args.triplet_margin)
+
+            loss = args.align_weight * align_loss + args.contrastive_weight * contrastive_loss
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -539,10 +622,19 @@ def main() -> None:
                 qs = qs.to(device)
                 qg = qg.to(device)
                 z_tgt = teacher_z_goal(qs, qg)
-                z_hat = student(imgs, prs, qs)
+                if args.start_cond == "teacher_z":
+                    with torch.no_grad():
+                        qs_n = normalize_coords_tensor(qs, args.normalize_coords)
+                        z_in = encode_teacher_joint_latent(teacher, qs_n)
+                else:
+                    z_in = qs
+                z_hat = student(imgs, prs, z_in)
                 align_loss = base_alignment_loss(z_hat, z_tgt)
-                trip_loss = batch_triplet_loss(z_hat, z_tgt, margin=args.triplet_margin)
-                loss = align_loss + args.triplet_weight * trip_loss
+                if args.use_infonce:
+                    contrastive_loss = info_nce_loss(z_hat, z_tgt, temperature=args.temperature)
+                else:
+                    contrastive_loss = batch_triplet_loss(z_hat, z_tgt, margin=args.triplet_margin)
+                loss = args.align_weight * align_loss + args.contrastive_weight * contrastive_loss
                 vrun += float(loss.item())
                 vb += 1
         val_loss = vrun / max(1, vb)
@@ -558,6 +650,7 @@ def main() -> None:
         payload_epoch = {
             "student_state_dict": student.state_dict(),
             "ntfield_h": nt_h,
+            "start_cond": args.start_cond,
             "normalize_coords": args.normalize_coords,
             "loss": args.loss,
             "triplet_weight": args.triplet_weight,
@@ -576,6 +669,7 @@ def main() -> None:
     payload_final = {
         "student_state_dict": student.state_dict(),
         "ntfield_h": nt_h,
+        "start_cond": args.start_cond,
         "normalize_coords": args.normalize_coords,
         "loss": args.loss,
         "triplet_weight": args.triplet_weight,

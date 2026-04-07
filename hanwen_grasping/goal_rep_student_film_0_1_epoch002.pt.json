@@ -1,0 +1,13 @@
+{
+  "ntfield_h": 256,
+  "start_cond": "teacher_z",
+  "normalize_coords": false,
+  "loss": "mse",
+  "triplet_weight": 0.5,
+  "triplet_margin": 0.5,
+  "lr_scheduler": "OneCycleLR",
+  "warmup_pct": 0.1,
+  "image_key": "images",
+  "checkpoint_teacher": "/home/hojinsohn/VLM-NT/PI-VLA/ntrl-demo/Experiments/UR5_trajectory/trajectory_03_09_20_10/Model_Epoch_04300_ValLoss_6.635179e-01.pt",
+  "epoch": 2
+}

@@ -8,6 +8,11 @@
 # Run (from PI-VLA root): python trajectory_evaluation/rrtconnect/collect_data.py ...
 # Default: headless. Cameras still render for HDF5.
 #
+# PCA on teacher goal embeddings (offline, after HDF5 exists):
+#   PI-VLA/goal_embedding_visualization/extract_teacher_goal_embeddings_from_h5.py
+#   writes PI-VLA/output/embedding_visualization/<grasp_6dof_demo_*>/teacher_z_goal_bundle.npz
+#   then: pca_embedding_3d.py --h5 <same .h5 path>
+#
 
 from datetime import datetime
 from scipy.spatial.transform import Rotation as R

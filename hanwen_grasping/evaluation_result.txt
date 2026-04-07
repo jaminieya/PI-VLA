@@ -1,7 +1,0 @@
-Split: val10
-Matched HDF5 files: 930
-Evaluated samples/batches: 13935/871
-Mean cosine (batch-avg): 0.151445
-Cosine similarity mean/std: 0.848560 / 0.091148
-Cosine loss mean (1-cos): 0.151440
-MSE mean/std: 116014.020315 / 88832.603938

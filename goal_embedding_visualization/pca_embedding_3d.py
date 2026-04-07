@@ -25,6 +25,7 @@ After ``collect_data.py``, extract teacher latents then PCA (see
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 from typing import Optional
 
@@ -119,6 +120,12 @@ def main() -> None:
         help="Grasp demo .h5 path: sets --npz_bundle to output/embedding_visualization/<stem>/teacher_z_goal_bundle.npz",
     )
     p.add_argument(
+        "--h5_glob",
+        type=str,
+        default="",
+        help="Glob of grasp demo .h5 files for one combined PCA over all matching bundles",
+    )
+    p.add_argument(
         "--npz_bundle",
         type=str,
         default="",
@@ -181,14 +188,42 @@ def main() -> None:
     args = p.parse_args()
 
     if args.h5:
-        if args.npz_bundle:
-            p.error("Pass only one of --h5 or --npz_bundle")
+        if args.npz_bundle or args.h5_glob:
+            p.error("Pass only one of --h5, --h5_glob, or --npz_bundle")
         stem = os.path.splitext(os.path.basename(os.path.abspath(args.h5)))[0]
         args.npz_bundle = os.path.join(_OUTPUT_EMBED_ROOT, stem, "teacher_z_goal_bundle.npz")
 
     bundle_labels = None
     data = None
-    if args.npz_bundle:
+    if args.h5_glob:
+        if args.embeddings:
+            p.error("Do not combine --h5_glob with --embeddings")
+        h5_paths = sorted(glob.glob(os.path.abspath(args.h5_glob)))
+        h5_paths = [p for p in h5_paths if os.path.isfile(p)]
+        if not h5_paths:
+            p.error(f"No files matched --h5_glob: {args.h5_glob}")
+
+        z_list = []
+        demo_labels = []
+        for demo_idx, h5_path in enumerate(h5_paths):
+            stem = os.path.splitext(os.path.basename(h5_path))[0]
+            bpath = os.path.join(_OUTPUT_EMBED_ROOT, stem, "teacher_z_goal_bundle.npz")
+            if not os.path.isfile(bpath):
+                print(f"WARNING: missing bundle for {h5_path}; skipping {bpath}")
+                continue
+            d = np.load(bpath, allow_pickle=True)
+            if args.embed_key not in d:
+                raise KeyError(f"--embed_key {args.embed_key!r} not in {bpath}; keys: {list(d.keys())}")
+            z = np.asarray(d[args.embed_key], dtype=np.float64)
+            z_list.append(z)
+            demo_labels.append(np.full(z.shape[0], demo_idx, dtype=np.int32))
+        if not z_list:
+            p.error("No valid bundles found for --h5_glob. Run extraction first.")
+        mats = [np.vstack(z_list)]
+        if not args.labels and args.label_key == "labels_demo":
+            bundle_labels = np.concatenate(demo_labels, axis=0)
+        paths = [f"h5_glob:{args.h5_glob}"]
+    elif args.npz_bundle:
         bpath = os.path.abspath(args.npz_bundle)
         data = np.load(bpath, allow_pickle=True)
         embed_key_eff = args.embed_key
@@ -262,6 +297,9 @@ def main() -> None:
 
     if args.out:
         out_png = os.path.abspath(args.out)
+    elif args.h5_glob:
+        os.makedirs(_OUTPUT_EMBED_ROOT, exist_ok=True)
+        out_png = os.path.join(_OUTPUT_EMBED_ROOT, "pca_embedding_3d_all_h5.png")
     elif args.npz_bundle:
         out_png = os.path.join(
             os.path.dirname(os.path.abspath(args.npz_bundle)), "pca_embedding_3d.png"

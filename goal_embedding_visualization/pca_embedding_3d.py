@@ -184,6 +184,12 @@ def main() -> None:
     p.add_argument("--point_size", type=float, default=8.0)
     p.add_argument("--alpha", type=float, default=0.65)
     p.add_argument("--dpi", type=int, default=150)
+    p.add_argument(
+        "--color_by_topk_pc",
+        type=int,
+        default=0,
+        help="If >0, color each point by argmax(|PC score|) among first K PCs (e.g., 7).",
+    )
     p.add_argument("--show", action="store_true", help="Open interactive matplotlib window")
     args = p.parse_args()
 
@@ -275,6 +281,14 @@ def main() -> None:
     n_fit = x_all.shape[0]
 
     scores_all, _, _, ratio3 = fit_transform_pca(x_all, n_components=3, standardize=args.standardize)
+    k_report = min(7, min(x_all.shape[0] - 1, x_all.shape[1]))
+    _, _, _, ratio7 = fit_transform_pca(x_all, n_components=k_report, standardize=args.standardize)
+
+    pc_color_labels = None
+    if args.color_by_topk_pc and args.color_by_topk_pc > 0:
+        k_color = min(max(1, args.color_by_topk_pc), min(x_all.shape[0] - 1, x_all.shape[1]))
+        scores_k, _, _, _ = fit_transform_pca(x_all, n_components=k_color, standardize=args.standardize)
+        pc_color_labels = np.argmax(np.abs(scores_k), axis=1).astype(np.int32)
 
     # Split scores back per original set
     chunks = []
@@ -284,7 +298,9 @@ def main() -> None:
         chunks.append(scores_all[off : off + k, :])
         off += k
 
-    if args.labels:
+    if pc_color_labels is not None:
+        labels = pc_color_labels
+    elif args.labels:
         labels = _labels_load(args.labels, n0)
     elif bundle_labels is not None:
         if bundle_labels.shape[0] != n0:
@@ -310,6 +326,7 @@ def main() -> None:
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
 
     import matplotlib.pyplot as plt
+    from matplotlib.colors import BoundaryNorm, ListedColormap
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     fig = plt.figure(figsize=(9, 7))
@@ -321,22 +338,37 @@ def main() -> None:
     if len(chunks) == 1:
         sc = None
         if labels is not None:
+            cmap = "tab10"
+            norm = None
+            if pc_color_labels is not None:
+                k = int(args.color_by_topk_pc)
+                base = plt.cm.get_cmap("tab10", k)
+                cmap = ListedColormap(base(np.arange(k)))
+                norm = BoundaryNorm(np.arange(-0.5, k + 0.5, 1.0), cmap.N)
             sc = ax.scatter(
                 chunks[0][:, 0],
                 chunks[0][:, 1],
                 chunks[0][:, 2],
                 c=labels,
-                cmap="tab10",
+                cmap=cmap,
+                norm=norm,
                 s=args.point_size,
                 alpha=args.alpha,
             )
-            if args.label_key == "labels_demo":
+            if pc_color_labels is not None:
+                cbar_lbl = f"dominant PC index in top-{args.color_by_topk_pc}"
+            elif args.label_key == "labels_demo":
                 cbar_lbl = "demo index"
             elif args.label_key == "labels_frame":
                 cbar_lbl = "frame index"
             else:
                 cbar_lbl = "label"
-            fig.colorbar(sc, ax=ax, shrink=0.6, label=cbar_lbl)
+            cbar = fig.colorbar(sc, ax=ax, shrink=0.6, label=cbar_lbl)
+            if pc_color_labels is not None:
+                k = int(args.color_by_topk_pc)
+                ticks = np.arange(0, k)
+                cbar.set_ticks(ticks)
+                cbar.set_ticklabels([f"PC{i+1}" for i in ticks])
         else:
             ax.scatter(
                 chunks[0][:, 0],
@@ -360,10 +392,10 @@ def main() -> None:
             )
         ax.legend(loc="upper left", fontsize=9)
 
+    ratio7_txt = ", ".join([f"{v*100:.2f}%" for v in ratio7])
     var_lines = (
-        f"PC1–3 explained variance (of total): "
-        f"{ratio3[0]*100:.2f}%, {ratio3[1]*100:.2f}%, {ratio3[2]*100:.2f}% "
-        f"(cumulative {(ratio3.sum())*100:.2f}%)"
+        f"PC1–{k_report} explained variance (of total): "
+        f"{ratio7_txt} (cumulative {(ratio7.sum())*100:.2f}%)"
     )
     ax.set_title("PCA 3D — dominant linear variance")
     ax.set_xlabel("PC1")

@@ -1,6 +1,6 @@
 # Image → object location (`img2objloc_model`)
 
-Pipeline: HDF5 demos → Segment Anything table crop → train a small CNN regressor for **(x, y)** with **z fixed** at `0.12`, then evaluate on a held-out test folder.
+Pipeline: HDF5 demos → Segment Anything table crop → train a small CNN regressor for **(x, y)** with **z fixed** at `0.1` (aligned with Isaac table `table_dims.z`), then evaluate on a held-out test folder.
 
 ## SAM checkpoint (ViT-H)
 
@@ -25,11 +25,11 @@ Use `--sam-checkpoint img2objloc_model/checkpoints/sam_vit_h_4b8939.pth` in the 
 ## Data layout
 
 - Raw demos: `output/data_collection/20260402/*.h5`  
-  Each file has `images` `(100, H, W, 3)`, `object_location` `(3,)`, etc. We use **`images[0]`** and labels from **`object_location`**, with **z overwritten to 0.12** in exported metadata.
+  Each file has `images` `(100, H, W, 3)`, `object_location` `(3,)`, etc. We use **`images[0]`** and labels from **`object_location`**, with **z overwritten to 0.1** in exported metadata (override with `--label-z` on SAM export).
 
 - SAM exports: `output/segment_anything/<timestamp>/` (one directory per episode), containing at least:
   - `first_image_table_crop.png` — cropped RGB around the table (**object stays visible**)
-  - `object_location.json` — `object_location_original`, `object_location_z_fixed` (x, y, 0.12)
+  - `object_location.json` — `object_location_original`, `object_location_z_fixed` (x, y, 0.1 by default)
 
 - Train / test split (80/20): after moving samples with `split_segment_anything_train_test.py`:
   - `output/segment_anything/train/<timestamp>/`
@@ -123,7 +123,7 @@ python img2objloc_model/eval_objloc_xy.py \
   --predictions-csv img2objloc_model/test_predictions.csv
 ```
 
-The model predicts **only x and y**; **`z_fixed`** in the checkpoint (`0.12`) is for downstream use, not learned.
+The model predicts **only x and y**; **`z_fixed`** in the checkpoint (default `0.1`, set with `train_objloc_xy.py --z-fixed`) is for downstream use, not learned.
 
 ## Dependencies
 

@@ -208,7 +208,7 @@ def train(args: argparse.Namespace) -> None:
                     "image_size": args.image_size,
                     "image_name": args.image_name,
                     "best_val_mae_xy": best_val_mae,
-                    "z_fixed": 0.12,
+                    "z_fixed": float(args.z_fixed),
                 },
                 best_path,
             )
@@ -266,6 +266,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto", help="auto/cpu/cuda")
+    p.add_argument(
+        "--z-fixed",
+        type=float,
+        default=0.1,
+        help="Z (m) stored in checkpoint for downstream 3D use; matches table_dims.z in Isaac benchmark (0.1).",
+    )
     return p.parse_args()
 
 

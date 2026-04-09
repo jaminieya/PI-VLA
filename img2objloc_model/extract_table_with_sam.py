@@ -174,6 +174,40 @@ def parse_timestamp_from_h5_name(h5_path: str) -> str:
     return base
 
 
+def process_one_image_array(
+    image_rgb: np.ndarray,
+    output_dir: str,
+    args: argparse.Namespace,
+    mask_generator: SamAutomaticMaskGenerator,
+    object_location_xy: Optional[np.ndarray] = None,
+) -> Dict:
+    """
+    Run SAM table segmentation + crop on an in-memory RGB image (e.g. Isaac top view).
+
+    If ``object_location_xy`` is provided (length >= 2), it is written to object_location.json
+    as ``object_location_original`` and ``object_location_z_fixed`` (z from args or default 0.1).
+    """
+    image_rgb = ensure_uint8_rgb(np.asarray(image_rgb))
+    masks = mask_generator.generate(image_rgb)
+    table_mask = select_table_mask_auto(masks, image_rgb)
+    out_prefix = os.path.join(output_dir, "first_image")
+    save_outputs(
+        image_rgb=image_rgb,
+        table_mask=table_mask,
+        out_prefix=out_prefix,
+        crop_margin_ratio=args.crop_margin_ratio,
+    )
+    meta: Dict = {"source": "image_array"}
+    z_fix = float(getattr(args, "label_z", 0.1))
+    if object_location_xy is not None and len(object_location_xy) >= 2:
+        ox, oy = float(object_location_xy[0]), float(object_location_xy[1])
+        meta["object_location_original"] = [ox, oy, z_fix]
+        meta["object_location_z_fixed"] = [ox, oy, z_fix]
+        with open(os.path.join(output_dir, "object_location.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+    return meta
+
+
 def process_one_h5(
     h5_path: str, output_dir: str, args: argparse.Namespace, mask_generator: SamAutomaticMaskGenerator
 ) -> Dict:
@@ -190,7 +224,8 @@ def process_one_h5(
     )
     meta = {"source_h5": h5_path}
     if object_location is not None:
-        fixed = np.array([object_location[0], object_location[1], 0.12], dtype=np.float32)
+        z_fix = float(getattr(args, "label_z", 0.1))
+        fixed = np.array([object_location[0], object_location[1], z_fix], dtype=np.float32)
         meta["object_location_original"] = [float(v) for v in object_location.tolist()]
         meta["object_location_z_fixed"] = [float(v) for v in fixed.tolist()]
     with open(os.path.join(output_dir, "object_location.json"), "w", encoding="utf-8") as f:
@@ -235,11 +270,29 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("Provide either --h5-path/--image-path, or --h5-dir for batch mode")
     if args.h5_path is not None and args.image_path is not None:
         raise ValueError("Provide only one of --h5-path or --image-path")
-    if args.image_path is not None:
-        raise ValueError("Single-image mode supports --h5-path only for object_location export")
 
     os.makedirs(args.output_dir, exist_ok=True)
     mask_generator = build_mask_generator(args)
+
+    if args.image_path is not None:
+        base_name = os.path.splitext(os.path.basename(args.image_path))[0]
+        sample_dir = os.path.join(args.output_dir, base_name)
+        os.makedirs(sample_dir, exist_ok=True)
+        bgr = cv2.imread(args.image_path)
+        if bgr is None:
+            raise FileNotFoundError(f"Could not read image: {args.image_path}")
+        image_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        meta = process_one_image_array(
+            image_rgb=image_rgb,
+            output_dir=sample_dir,
+            args=args,
+            mask_generator=mask_generator,
+            object_location_xy=None,
+        )
+        print(f"Saved directory: {sample_dir}")
+        print("meta:", meta)
+        return
+
     base_name = os.path.splitext(os.path.basename(args.h5_path))[0]
     sample_dir = os.path.join(args.output_dir, base_name)
     os.makedirs(sample_dir, exist_ok=True)
@@ -260,7 +313,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--h5-dir", type=str, default=None, help="Directory of .h5 files (batch)")
     parser.add_argument("--h5-path", type=str, default=None, help="Path to one .h5 data file")
-    parser.add_argument("--image-path", type=str, default=None, help="Path to one RGB image")
+    parser.add_argument(
+        "--image-path",
+        type=str,
+        default=None,
+        help="Path to one RGB/BGR image on disk (OpenCV read); runs SAM without H5 metadata",
+    )
+    parser.add_argument(
+        "--label-z",
+        type=float,
+        default=0.1,
+        help="Z (m) written with object_location.json when using process_one_image_array with labels",
+    )
     parser.add_argument("--sam-checkpoint", type=str, required=True, help="Path to SAM checkpoint")
     parser.add_argument(
         "--model-type",

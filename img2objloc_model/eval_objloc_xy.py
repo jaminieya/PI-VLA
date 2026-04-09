@@ -121,7 +121,7 @@ def main() -> None:
     backbone = ckpt.get("backbone", "resnet18")
     image_size = int(ckpt.get("image_size", 256))
     image_name = ckpt.get("image_name", "first_image_table_crop.png")
-    z_fixed = float(ckpt.get("z_fixed", 0.12))
+    z_fixed = float(ckpt.get("z_fixed", 0.1))
 
     samples = train_mod.load_samples(os.path.abspath(args.segment_root), image_name)
     dataset = train_mod.ObjLocDataset(samples, image_size=image_size, train=False)

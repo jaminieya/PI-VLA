@@ -1,7 +1,7 @@
 #
 # trajectory_evaluation/comparison/run_rrt_ntfield_benchmark.py
 #
-# Fixed scene: table (0.8, 1.0, 0.1) m, single YCB 006_mustard_bottle at user-provided world pose.
+# Fixed scene: table (0.8, 1.0, 0.1) m, single YCB 011_banana at user-provided world pose.
 # 1) Grasp pipeline -> goal joints q_goal (same as collect_data / integrated).
 # 2) RRTConnect get_path2grasp from current sim q_start; record planning time, path joint motion, execution time.
 # 3) Reset arm to q_start; NTField gradient plan; same metrics.
@@ -59,9 +59,9 @@ TABLE_DIMS_Y = 1.0
 TABLE_DIMS_Z = 0.10
 DRAWER_HEIGHT = 0.40
 NUM_OF_OBJECTS = 1
-# 006_mustard_bottle is index 3 in object_urdf_grasp.txt (0-based list)
-MUSTARD_ASSET_IDX = 3
-TARGET_OBJ_INDEX = [MUSTARD_ASSET_IDX]
+# 011_banana is index 5 in assets/urdf/ycb/object_urdf_grasp.txt (0-based list)
+BANANA_ASSET_IDX = 5
+TARGET_OBJ_INDEX = [BANANA_ASSET_IDX]
 ADD_COVER = False
 max_scaling_factor = 0
 
@@ -249,7 +249,7 @@ def reset_arm_to_q(gym, sim, env, ur_handle, spj, slj, ej, wj1, wj2, wj3, viewer
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RRTConnect vs NTField benchmark (fixed 0.8x1.0 table, mustard).")
+    parser = argparse.ArgumentParser(description="RRTConnect vs NTField benchmark (fixed 0.8x1.0 table, YCB banana).")
     parser.add_argument("--object_x", type=float, required=True, help="Mustard bottle actor position x (world m)")
     parser.add_argument("--object_y", type=float, required=True, help="Mustard bottle actor position y (world m)")
     parser.add_argument("--object_z", type=float, required=True, help="Mustard bottle actor position z (world m)")
@@ -643,7 +643,7 @@ def main():
         "planner_playback": args.planner_playback,
         "table_dims_m": [TABLE_DIMS_X, TABLE_DIMS_Y, TABLE_DIMS_Z],
         "object_pose_world_m": [args.object_x, args.object_y, args.object_z],
-        "object": "006_mustard_bottle",
+        "object": "011_banana",
         "q_start_live": q_start_live.tolist(),
         "goal_configuration_grasp_verify": grasp_target_q.tolist() if grasp_target_q is not None else None,
         "rrtconnect": {},

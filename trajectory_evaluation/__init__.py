@@ -1,1 +1,1 @@
-# PI-VLA trajectory evaluation package
+# trajectory_evaluation package (PI-VLA root on PYTHONPATH)

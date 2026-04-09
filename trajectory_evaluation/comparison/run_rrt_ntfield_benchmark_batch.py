@@ -1,5 +1,5 @@
 #
-# Batch runner: RRTConnect vs NTField benchmark over a fixed (x, y) grid of mustard poses.
+# Batch runner: RRTConnect vs NTField benchmark over a fixed (x, y) grid of object poses.
 #
 # From PI-VLA repository root:
 #   python trajectory_evaluation/comparison/run_rrt_ntfield_benchmark_batch.py

@@ -19,12 +19,15 @@ echo "  0 = sugar_box, 1 = mustard_bottle, 2 = banana"
 echo "Output: ../collected_data/grasp_6dof_demo_*.h5"
 echo ""
 
-for i in $(seq 1 $NUM_EPISODES); do
-    echo "=============================================="
-    echo "Episode $i/$NUM_EPISODES"
-    echo "=============================================="
-    python collect_data.py --headless --object_idx $OBJECT_IDX || true
-done
+if python collect_data_for_student.py --headless --num_episodes "$NUM_EPISODES" --object_idx "$OBJECT_IDX"; then
+  echo ""
+  echo "Success: collector exited cleanly."
+else
+  status=$?
+  echo ""
+  echo "Error: collector crashed or failed (exit code: $status)"
+  exit $status
+fi
 
 echo ""
 echo "Done: collected $NUM_EPISODES episodes"

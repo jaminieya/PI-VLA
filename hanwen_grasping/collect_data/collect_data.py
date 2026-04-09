@@ -108,22 +108,13 @@ num_of_envs = 1
 row_num_of_envs = int(math.sqrt(num_of_envs))
 
 #env settings
-choose = np.random.randint(2)
-if choose == 0:
-    max_drawer_height = 0.40
-    min_drawer_height = 0.40
-    MIN_NUM_OBSTACLES = 5
-    MAX_NUM_OBSTACLES = 8
-    table_dims = gymapi.Vec3(0.56, 0.86, 0.10) # S
-    # table_dims = gymapi.Vec3(np.random.uniform(0.5, 0.7), np.random.uniform(0.8, 1.0), 0.10)
-
-else:
-    max_drawer_height = 0.55
-    min_drawer_height = 0.55
-    MIN_NUM_OBSTACLES = 7
-    MAX_NUM_OBSTACLES = 11
-    table_dims = gymapi.Vec3(0.76, 1.16, 0.10) # L
-    # table_dims = gymapi.Vec3(np.random.uniform(0.7, 0.9), np.random.uniform(1.0, 1.2), 0.10)
+TABLE_DIMS_X = 0.8
+TABLE_DIMS_Y = 1.0
+TABLE_DIMS_Z = 0.10
+DRAWER_HEIGHT = 0.40
+max_drawer_height = DRAWER_HEIGHT
+min_drawer_height = DRAWER_HEIGHT
+table_dims = gymapi.Vec3(TABLE_DIMS_X, TABLE_DIMS_Y, TABLE_DIMS_Z)
 
 piece_width = 0.03
 max_scaling_factor = 0
@@ -1312,13 +1303,14 @@ if __name__ == '__main__':
         gym.destroy_sim(sim)
         sys.exit(0)
 
-    # Interpolate path, then resample to fixed length for normalized trajectories
-    if init2grasp_path is not None and len(init2grasp_path) > 1:
-        init2grasp_path = interpolate_path(init2grasp_path, steps_between=2)
-        init2grasp_path = resample_path(
-            init2grasp_path, num_waypoints=PATH_RESAMPLE_WAYPOINTS
-        )
-        print(f"Path normalized: {len(init2grasp_path)} waypoints")
+    print("len(init2grasp_path):", len(init2grasp_path))
+    # # Interpolate path, then resample to fixed length for normalized trajectories
+    # if init2grasp_path is not None and len(init2grasp_path) > 1:
+    #     init2grasp_path = interpolate_path(init2grasp_path, steps_between=2)
+    #     init2grasp_path = resample_path(
+    #         init2grasp_path, num_waypoints=PATH_RESAMPLE_WAYPOINTS
+    #     )
+    #     print(f"Path normalized: {len(init2grasp_path)} waypoints")
 
     path_id = 0
     frames_at_waypoint = 0

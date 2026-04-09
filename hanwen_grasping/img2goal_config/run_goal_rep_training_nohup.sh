@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # Example:
   # ./img2goal_config/run_goal_rep_training_nohup.sh \
-  #   ../ntrl-demo/Experiments/UR5_trajectory/trajectory_03_09_20_10/Model_Epoch_04300_ValLoss_6.635179e-01.pt \
+  #   ../ntrl-demo/Experiments/UR5_trajectory_no_wall_accuracy_check/trajectory_03_25_20_28/Model_Epoch_05000_ValLoss_7.820605e-01.pt \
   #   "./collected_data/grasp_6dof_demo_*.h5" \
   #   goal_rep_student_film_0_1.pt
 

@@ -67,3 +67,69 @@ def plan(model, q_start, q_goal, step_size=0.02, max_steps=200, tol=0.01, device
     # Convert to radians
     path_rad = [p * SCALE for p in path_norm]
     return path_rad
+
+
+def plan_with_goal_latent(
+    model,
+    q_start,
+    z_goal,
+    step_size=0.02,
+    max_steps=200,
+    grad_tol=1e-3,
+    device="cuda",
+):
+    """
+    Plan path from q_start using a fixed goal latent z_goal.
+
+    This uses ``model.network.out_with_goal_latent(q_start_norm, z_goal)``, so the
+    optimization is done directly against the latent goal representation instead of
+    explicit q_goal joints.
+
+    Args:
+        model: NTField model with ``model.network.out_with_goal_latent``.
+        q_start: (6,) numpy array, start joint config in radians.
+        z_goal: (H,) or (1, H) goal latent from the same network latent space.
+        step_size: gradient step size in normalized space.
+        max_steps: maximum planning iterations.
+        grad_tol: stop when ||descent_direction||_2 falls below this threshold.
+        device: torch device.
+
+    Returns:
+        List of (6,) joint configs in radians, starting from q_start.
+    """
+    q_start = np.asarray(q_start, dtype=np.float64).reshape(6)
+    q_start_norm = q_start / SCALE
+
+    q_current = torch.tensor(q_start_norm, dtype=torch.float32, device=device).unsqueeze(0)
+    q_current.requires_grad_(True)
+
+    if isinstance(z_goal, np.ndarray):
+        z_goal_t = torch.from_numpy(z_goal).to(device=device, dtype=torch.float32)
+    elif torch.is_tensor(z_goal):
+        z_goal_t = z_goal.to(device=device, dtype=torch.float32)
+    else:
+        z_goal_t = torch.tensor(z_goal, dtype=torch.float32, device=device)
+    if z_goal_t.dim() == 1:
+        z_goal_t = z_goal_t.unsqueeze(0)
+    z_goal_t = z_goal_t.detach()
+
+    path_norm = [q_start_norm.copy()]
+
+    for _ in range(max_steps):
+        tau, _, q_for_grad = model.network.out_with_goal_latent(q_current, z_goal_t)
+        grad = torch.autograd.grad(tau, q_for_grad, torch.ones_like(tau), create_graph=False)[0]
+
+        direction = -grad
+        direction = direction / (torch.norm(direction, dim=1, keepdim=True) ** 2 + 1e-12)
+        step_norm = torch.norm(direction, dim=1).item()
+        if step_norm < grad_tol:
+            break
+
+        with torch.no_grad():
+            q_next = q_for_grad.detach() + step_size * direction.detach()
+            q_current = q_next.requires_grad_(True)
+
+        path_norm.append(q_current[0].detach().cpu().numpy().copy())
+
+    path_rad = [p * SCALE for p in path_norm]
+    return path_rad

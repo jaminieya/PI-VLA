@@ -246,6 +246,32 @@ class NN(torch.nn.Module):
         
         return x, w, coords
     
+    def out_with_goal_latent(self, q_start, z_goal):
+        """
+        Computes the distance/travel-time metric using a physical start configuration
+        and a pre-computed (or predicted) goal latent vector.
+        
+        Args:
+            q_start: (B, dim) tensor of start configurations.
+            z_goal: (B, H) tensor of the goal latent representation.
+        """
+        # Concatenate q_start with itself to match the (B, 2*dim) shape expected by _embed_start_goal.
+        coords = torch.cat([q_start, q_start], dim=1)
+        
+        # Pass through the encoder. 
+        # We capture z_start, but ignore the second latent since we use the provided z_goal.
+        z_start, _, w, coords = self._embed_start_goal(coords)
+
+        # OURS: Compute the metric exactly as done in the standard out() method
+        x = torch.sqrt((z_start - z_goal) ** 2 + 1e-6)
+        x = x.view(x.shape[0], -1, 16)
+        x = (torch.logsumexp(10 * x, 2) - np.log(16)) / 10
+        x = 0.1 * (torch.sum(x, dim=1, keepdim=True))
+
+        # Note: If calculating gradients w.r.t the input, the planner should use 
+        # coords[:, :self.dim] since coords contains the duplicated q_start.
+        return x, w, coords
+    
     def forward(self, coords):
         coords = coords.clone().detach().requires_grad_(True) # allows to take derivative w.r.t. input
 

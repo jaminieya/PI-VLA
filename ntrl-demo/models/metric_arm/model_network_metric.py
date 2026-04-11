@@ -1,3 +1,4 @@
+import os
 import matplotlib
 import numpy as np
 import math
@@ -236,7 +237,7 @@ class NN(torch.nn.Module):
         #OURS
         x = torch.sqrt((z_start - z_goal) ** 2 + 1e-6)
         x = x.view(x.shape[0],-1,16)
-        x = (torch.logsumexp(10*x, 2)-np.log(16))/10
+        x = (torch.logsumexp(10*x, 2) - math.log(16)) / 10
         x = 0.1*(torch.sum(x,dim=1,keepdim=True))
 
         #L1
@@ -246,32 +247,39 @@ class NN(torch.nn.Module):
         
         return x, w, coords
     
-    def out_with_goal_latent(self, q_start, z_goal):
-        """
-        Computes the distance/travel-time metric using a physical start configuration
-        and a pre-computed (or predicted) goal latent vector.
-        
-        Args:
-            q_start: (B, dim) tensor of start configurations.
-            z_goal: (B, H) tensor of the goal latent representation.
-        """
-        # Concatenate q_start with itself to match the (B, 2*dim) shape expected by _embed_start_goal.
-        coords = torch.cat([q_start, q_start], dim=1)
-        
-        # Pass through the encoder. 
-        # We capture z_start, but ignore the second latent since we use the provided z_goal.
-        z_start, _, w, coords = self._embed_start_goal(coords)
+    def out_with_goal_latent(self, q_start, z_goal_ext, q_goal_norm=None):
+        if q_goal_norm is not None:
+            q_goal_side = torch.as_tensor(
+                q_goal_norm, dtype=q_start.dtype, device=q_start.device
+            ).detach()
+            if q_goal_side.dim() == 1:
+                q_goal_side = q_goal_side.unsqueeze(0)
+            if q_goal_side.shape[0] == 1 and q_start.shape[0] > 1:
+                q_goal_side = q_goal_side.expand(q_start.shape[0], -1)
+        else:
+            # q_goal unknown (inference with predicted latent) — duplicate q_start
+            q_goal_side = q_start.detach()
 
-        # OURS: Compute the metric exactly as done in the standard out() method
+        coords = torch.cat([q_start, q_goal_side], dim=1)
+        z_start, z_goal_reenc, w, coords = self._embed_start_goal(coords)
+
+        if z_goal_ext is None:
+            z_goal = z_goal_reenc
+        else:
+            z_goal = torch.as_tensor(z_goal_ext, dtype=z_start.dtype, device=z_start.device)
+            if z_goal.dim() == 1:
+                z_goal = z_goal.unsqueeze(0)
+            if z_goal.shape[0] == 1 and z_start.shape[0] > 1:
+                z_goal = z_goal.expand(z_start.shape[0], -1)
+
         x = torch.sqrt((z_start - z_goal) ** 2 + 1e-6)
         x = x.view(x.shape[0], -1, 16)
-        x = (torch.logsumexp(10 * x, 2) - np.log(16)) / 10
+        x = (torch.logsumexp(10 * x, 2) - math.log(16)) / 10
         x = 0.1 * (torch.sum(x, dim=1, keepdim=True))
 
-        # Note: If calculating gradients w.r.t the input, the planner should use 
-        # coords[:, :self.dim] since coords contains the duplicated q_start.
         return x, w, coords
-    
+
+        
     def forward(self, coords):
         coords = coords.clone().detach().requires_grad_(True) # allows to take derivative w.r.t. input
 

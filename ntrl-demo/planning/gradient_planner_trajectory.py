@@ -79,57 +79,81 @@ def plan_with_goal_latent(
     device="cuda",
 ):
     """
-    Plan path from q_start using a fixed goal latent z_goal.
-
-    This uses ``model.network.out_with_goal_latent(q_start_norm, z_goal)``, so the
-    optimization is done directly against the latent goal representation instead of
-    explicit q_goal joints.
-
-    Args:
-        model: NTField model with ``model.network.out_with_goal_latent``.
-        q_start: (6,) numpy array, start joint config in radians.
-        z_goal: (H,) or (1, H) goal latent from the same network latent space.
-        step_size: gradient step size in normalized space.
-        max_steps: maximum planning iterations.
-        grad_tol: stop when ||descent_direction||_2 falls below this threshold.
-        device: torch device.
-
-    Returns:
-        List of (6,) joint configs in radians, starting from q_start.
+    Plan path from q_start to a target latent representation using gradient descent.
     """
-    q_start = np.asarray(q_start, dtype=np.float64).reshape(6)
+    dim = len(q_start)
+    
+    # Assuming SCALE is a global constant as implied in the original codebase
+    global SCALE 
+    
+    q_start = np.asarray(q_start, dtype=np.float64).reshape(dim)
     q_start_norm = q_start / SCALE
 
-    q_current = torch.tensor(q_start_norm, dtype=torch.float32, device=device).unsqueeze(0)
-    q_current.requires_grad_(True)
+    # Set up start tensor
+    q_tensor = torch.tensor(q_start_norm, dtype=torch.float32, device=device).unsqueeze(0)
 
-    if isinstance(z_goal, np.ndarray):
-        z_goal_t = torch.from_numpy(z_goal).to(device=device, dtype=torch.float32)
-    elif torch.is_tensor(z_goal):
-        z_goal_t = z_goal.to(device=device, dtype=torch.float32)
-    else:
-        z_goal_t = torch.tensor(z_goal, dtype=torch.float32, device=device)
-    if z_goal_t.dim() == 1:
-        z_goal_t = z_goal_t.unsqueeze(0)
-    z_goal_t = z_goal_t.detach()
+    # Ensure z_goal is correctly formatted
+    if not isinstance(z_goal, torch.Tensor):
+        z_goal = torch.tensor(z_goal, dtype=torch.float32, device=device)
+    if z_goal.dim() == 1:
+        z_goal = z_goal.unsqueeze(0)
 
     path_norm = [q_start_norm.copy()]
 
-    for _ in range(max_steps):
-        tau, _, q_for_grad = model.network.out_with_goal_latent(q_current, z_goal_t)
-        grad = torch.autograd.grad(tau, q_for_grad, torch.ones_like(tau), create_graph=False)[0]
+    # Access the network (handling potential wrapper layers)
+    network = getattr(model, 'network', getattr(model, 'function', model))
+    if hasattr(network, 'network'):
+        network = network.network
 
-        direction = -grad
-        direction = direction / (torch.norm(direction, dim=1, keepdim=True) ** 2 + 1e-12)
-        step_norm = torch.norm(direction, dim=1).item()
-        if step_norm < grad_tol:
+    for step in range(max_steps):
+        
+        # q_tensor must be a fresh leaf each iteration
+        q_inp = q_tensor.detach().requires_grad_(True)
+        
+        # Forward pass
+        tau, w, coords = network.out_with_goal_latent(q_inp, z_goal)
+        
+        # Check convergence based on proximity (tau approaches 0)
+        if tau.item() < 1e-4:
             break
 
+        # Differentiate w.r.t. coords (the intermediate node inside the network)
+        # This returns a (1, 12) gradient tensor
+        dtau_tuple = torch.autograd.grad(
+            outputs=tau, 
+            inputs=coords, 
+            grad_outputs=torch.ones_like(tau),
+            only_inputs=True,
+            allow_unused=True # Good practice when checking for graph disconnects
+        )
+        
+        dtau = dtau_tuple[0]
+
+        # Guard against disconnected graph or entirely flat gradients
+        if dtau is None or dtau.abs().max().item() < 1e-12:
+            print(f"[plan_with_goal_latent] Warning: zero gradient at step {step}, graph may be disconnected or flat.")
+            break
+        
+        # Isolate the gradient for the start configuration (first half)
+        grad_q = dtau[:, :dim]
+        
+        # Calculate the gradient magnitude
+        grad_mag = torch.norm(grad_q, dim=1).view(-1, 1)
+        
+        # Check convergence based on a flat gradient
+        if grad_mag.item() < grad_tol:
+            break
+
+        # Reproduce the exact inverse-squared normalization
+        update_dir = -grad_q / (grad_mag**2 + 1e-8)
+
+        # Update q_start in normalized space 
         with torch.no_grad():
-            q_next = q_for_grad.detach() + step_size * direction.detach()
-            q_current = q_next.requires_grad_(True)
+            q_tensor = q_inp.detach() + step_size * update_dir
 
-        path_norm.append(q_current[0].detach().cpu().numpy().copy())
+        path_norm.append(q_tensor[0].detach().cpu().numpy().copy())
 
+    # Convert normalized path back to radians
     path_rad = [p * SCALE for p in path_norm]
+    
     return path_rad

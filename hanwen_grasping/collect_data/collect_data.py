@@ -1129,7 +1129,7 @@ if __name__ == '__main__':
         table_center_y = table_pose.p.y
 
         # Keep the tiny 1mm offset to Y to prevent the vertical singularity (gimbal lock)
-        top_cam_pos = gymapi.Vec3(table_pose.p.x, table_pose.p.y + 0.001, 2.2)
+        top_cam_pos = gymapi.Vec3(table_pose.p.x, table_pose.p.y + 0.001, 2.0)
         top_cam_target = gymapi.Vec3(table_pose.p.x - 0.5, table_pose.p.y, table_pose.p.z)
 
         # camera_handle goes first, then the environment

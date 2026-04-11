@@ -18,6 +18,7 @@ class _ModelShim:
 
     def __init__(self, function: Any) -> None:
         self.function = function
+        self.network = function.network
 
 
 def load_network_and_function(

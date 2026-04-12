@@ -3,5 +3,5 @@ python student_model_evaluation/plan_ntfield_with_student.py \
   --object_y 0.0 \
   --object_z 0.18 \
   --ntfield_checkpoint ntrl-demo/Experiments/UR5_trajectory_no_wall_accuracy_check/trajectory_03_25_20_28/Model_Epoch_05000_ValLoss_7.820605e-01.pt \
-  --student_checkpoint hanwen_grasping/goal_rep_student_film_1_1_epoch100.pt \
+  --student_checkpoint final_integrate/best_z_goal_model_original.pth \
   --student_planner gradient_latent

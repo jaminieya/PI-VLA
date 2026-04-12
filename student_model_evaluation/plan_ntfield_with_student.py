@@ -1,5 +1,5 @@
 #
-# trajectory_evaluation/comparison/run_rrt_ntfield_benchmark.py
+# student_model_evaluation/plan_ntfield_with_student.py
 #
 from __future__ import annotations
 
@@ -29,6 +29,8 @@ sys.path.insert(0, _PI_VLA_ROOT)
 sys.path.insert(0, os.path.join(_PI_VLA_ROOT, "ntrl-demo"))
 
 import torch
+import torch.nn as nn
+import torchvision.models as models
 import torchvision.transforms as T
 import robot_arm_configuration as RC
 from stl_reader import stl_reader
@@ -70,7 +72,7 @@ def preprocess_collect_data_rgb(rgb_uint8: np.ndarray, device: torch.device) -> 
 
 def ntfield_latent_plan_gradient(teacher_network, q_start, z_goal_hat,
                                   q_goal_norm=None,
-                                  step_size=0.02, max_steps=200, tol=0.01, device="cuda"):
+                                  step_size=0.2, max_steps=200, tol=0.01, device="cuda"):
     q_curr_norm = np.asarray(q_start, dtype=np.float32) / NTFIELD_SCALE
     q_curr_t = torch.tensor(q_curr_norm, dtype=torch.float32, device=device).unsqueeze(0)
     q_curr_t.requires_grad_(True)
@@ -145,6 +147,61 @@ def mppi_plan_latent_space(teacher_network, q_start, z_goal_hat, scale, steps=20
     return np.stack([p.squeeze(0).detach().cpu().numpy() for p in path], axis=0)
 
 
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+class StudentHead(nn.Module):
+    def __init__(self, in_features, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_features, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, output_dim),
+        )
+        # Running stats for stable eval — fixes batch_size=1 issue
+        self.register_buffer("_running_mean", torch.zeros(output_dim))
+        self.register_buffer("_running_var",  torch.ones(output_dim))
+        self._momentum = 0.01
+
+    def _apply_encoder_norm(self, y):
+        if self.training:
+            mean = y.mean(dim=0)
+            var  = y.var(dim=0, unbiased=False)
+            with torch.no_grad():
+                self._running_mean.mul_(1 - self._momentum).add_(mean, alpha=self._momentum)
+                self._running_var.mul_(1 - self._momentum).add_(var,  alpha=self._momentum)
+        else:
+            mean = self._running_mean
+            var  = self._running_var
+        return (y - mean) / torch.sqrt(var + 1e-5)
+
+    def forward(self, x):
+        return self._apply_encoder_norm(self.net(x))
+
+
+class StudentModel(nn.Module):
+    """Defined at module level so torch.save/load and pickle work correctly."""
+
+    def __init__(self, output_dim: int):
+        super().__init__()
+        try:
+            backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        except (TypeError, AttributeError):
+            backbone = models.resnet18(pretrained=True)
+        in_features = backbone.fc.in_features
+        backbone.fc = nn.Identity()
+        self.backbone = backbone
+        self.head = StudentHead(in_features, output_dim)
+
+    def forward(self, x):
+        return self.head(self.backbone(x))
+
+
+def _get_latent_model_new(output_dim: int) -> nn.Module:
+    return StudentModel(output_dim)
+
+
 def _get_latent_model(output_dim: int = 256):
     import torch.nn as nn
     import torchvision.models as models
@@ -155,6 +212,51 @@ def _get_latent_model(output_dim: int = 256):
         model = models.resnet18(pretrained=False)
     model.fc = nn.Linear(model.fc.in_features, output_dim)
     return model
+
+
+def _normalize_student_checkpoint(ckpt):
+    """Return (state_dict, metadata) for various save formats."""
+    meta = {}
+    if isinstance(ckpt, dict) and "student_state_dict" in ckpt:
+        meta = {k: v for k, v in ckpt.items() if k != "student_state_dict"}
+        return ckpt["student_state_dict"], meta
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        meta = {k: v for k, v in ckpt.items() if k != "model_state_dict"}
+        return ckpt["model_state_dict"], meta
+    if isinstance(ckpt, dict):
+        return ckpt, meta
+    return ckpt, meta
+
+
+def _infer_latent_output_dim(meta: dict, sd: dict) -> int:
+    if "head.net.3.weight" in sd:
+        return int(sd["head.net.3.weight"].shape[0])
+    if "fc.weight" in sd:
+        return int(sd["fc.weight"].shape[0])
+    for key in ("z_dim", "ntfield_h"):
+        if key in meta and meta[key] is not None:
+            return int(meta[key])
+    return 256
+
+
+def _load_image_student_from_checkpoint(sd: dict, meta: dict, dev: torch.device) -> nn.Module:
+    """Load ResNet18 + latent head weights used by Isaac image inference."""
+    output_dim = _infer_latent_output_dim(meta, sd)
+    if any(k.startswith("backbone.") for k in sd):
+        model = _get_latent_model(output_dim=output_dim).to(dev)
+        model.load_state_dict(sd, strict=True)
+        return model
+    if "fc.weight" in sd:
+        model = _get_latent_model(output_dim=output_dim).to(dev)
+        model.load_state_dict(sd, strict=True)
+        return model
+    sample = ", ".join(list(sd.keys())[:12])
+    raise RuntimeError(
+        "Unrecognized student weights for image-only NTField inference (expected "
+        "StudentModel `backbone.*` + `head.*`, or ResNet18 + `fc.*`). "
+        f"First keys: {sample}. "
+        "GoalLatentPredictorWithFiLM / ResNet50 image-only checkpoints need a different inference path."
+    )
 
 
 def _process_img(img: np.ndarray, img_size: int) -> torch.Tensor:
@@ -177,12 +279,13 @@ def _process_img(img: np.ndarray, img_size: int) -> torch.Tensor:
 
 
 def _infer_latent_on_image(image: np.ndarray, checkpoint_path: str, device: str) -> np.ndarray:
-    """Run ResNet18-based latent model on a HWC uint8 RGB array. Returns (256,) numpy array."""
+    """Run image→latent student on a HWC uint8 RGB array. Returns (z_dim,) numpy (default 256)."""
     from torchvision import transforms
 
     dev = torch.device("cuda" if torch.cuda.is_available() and device == "auto" else device)
-    model = _get_latent_model(output_dim=256).to(dev)
-    model.load_state_dict(torch.load(os.path.abspath(checkpoint_path), map_location=dev))
+    raw = torch.load(os.path.abspath(checkpoint_path), map_location=dev)
+    sd, meta = _normalize_student_checkpoint(raw)
+    model = _load_image_student_from_checkpoint(sd, meta, dev)
     model.eval()
 
     x = _process_img(image, 224).unsqueeze(0)
@@ -831,8 +934,8 @@ def main():
         path_true_raw = ntfield_latent_plan_gradient(
             teacher_network=ntfield_network,
             q_start=q_start_live,
-            z_goal_hat=None,
-            q_goal_norm=qg_norm,
+            z_goal_hat=z_goal_true,
+            q_goal_norm=None,
             step_size=args.ntfield_step_size,
             max_steps=args.ntfield_max_steps,
             tol=args.ntfield_tol,

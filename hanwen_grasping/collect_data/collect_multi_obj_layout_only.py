@@ -1,8 +1,10 @@
 #
 # collect_multi_obj_layout_only.py
 # Same tabletop setup as collect_multi_obj_data_for_student.py (3 YCB objects) but does not
-# run grasp / motion planning. Saves only start_image (RGB from top camera) and
-# object_locations (3x3 float32: world-frame object centers after physics settle).
+# run grasp / motion planning. Saves start_image (RGB from top camera),
+# object_locations (NUM_OF_OBJECTS x 3 float32: world-frame centers after settle),
+# object_urdf_indices (int32, same row order as object_locations: index into object_urdf_grasp.txt),
+# and object_names (UTF-8 human-readable label per row, same convention as collect_multi_obj_data_for_student).
 #
 # Run (from hanwen_grasping): python collect_data/collect_multi_obj_layout_only.py --headless
 # Output: PI-VLA/output/multi_obj_layout/multi_obj_layout_*.h5
@@ -20,6 +22,30 @@ import h5py
 
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 package_root = os.path.abspath(os.path.join(_script_dir, ".."))
+
+# YCB grasp asset folder or URDF stem -> short phrase (aligned with collect_multi_obj_data_for_student.OBJECT_NAMES)
+_OBJECT_DISPLAY_NAMES = {
+    "002_master_chef_can": "master chef can",
+    "004_sugar_box": "sugar box",
+    "005_tomato_soup_can": "tomato soup can",
+    "006_mustard_bottle": "mustard bottle",
+    "036_wood_block": "wood block",
+    "011_banana": "banana",
+}
+
+
+def _grasp_asset_path_to_display_name(rel_path: str) -> str:
+    """Readable name from a line in object_urdf_grasp.txt (may be urdf/ycb/<id>/file.urdf or flat)."""
+    rel = rel_path.replace("\\", "/")
+    folder = rel.split("/")[-2] if "/" in rel else ""
+    stem = os.path.splitext(os.path.basename(rel))[0]
+    for key in (folder, stem):
+        if key and key in _OBJECT_DISPLAY_NAMES:
+            return _OBJECT_DISPLAY_NAMES[key]
+    label = stem or folder
+    if len(label) > 4 and label[:3].isdigit() and label[3] == "_":
+        label = label[4:]
+    return label.replace("_", " ").strip()
 
 
 def _resolve_assets_dir():
@@ -192,6 +218,8 @@ if __name__ == "__main__":
     ur5e_handles = []
     object_status_list = []
     object_handles = []
+    object_slot_urdf_indices = None
+    object_slot_names = None
 
     for i in range(num_of_envs):
         envs.append(gym.create_env(sim, env_lower, env_upper, row_num_of_envs))
@@ -213,6 +241,11 @@ if __name__ == "__main__":
                 f"Need at least {NUM_OF_OBJECTS} entries in TARGET_OBJ_INDEX, got {len(TARGET_OBJ_INDEX)}"
             )
         target_file_idx = np.random.choice(TARGET_OBJ_INDEX, NUM_OF_OBJECTS, replace=False)
+        object_slot_urdf_indices = np.asarray(target_file_idx, dtype=np.int32).copy()
+        object_slot_names = [
+            _grasp_asset_path_to_display_name(object_asset_files[int(object_slot_urdf_indices[k])])
+            for k in range(NUM_OF_OBJECTS)
+        ]
 
         object_scaling_factor = np.random.randint(0, max_scaling_factor + 1, size=NUM_OF_OBJECTS) / 10.0 + 1.0
 
@@ -452,6 +485,9 @@ if __name__ == "__main__":
         with h5py.File(out_path, "w") as f:
             f.create_dataset("start_image", data=start_image.astype(np.uint8), compression="gzip")
             f.create_dataset("object_locations", data=object_locations)
+            f.create_dataset("object_urdf_indices", data=object_slot_urdf_indices)
+            name_dtype = h5py.string_dtype(encoding="utf-8")
+            f.create_dataset("object_names", data=np.asarray(object_slot_names, dtype=name_dtype))
             f.attrs["num_objects"] = int(NUM_OF_OBJECTS)
             f.flush()
 

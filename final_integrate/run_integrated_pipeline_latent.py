@@ -5,8 +5,8 @@ End-to-end PI-VLA integration (Isaac Gym + obj-loc + TracIK + NTField).
 Run from PI-VLA root:
   python final_integrate/run_integrated_pipeline_latent.py \
     --ntfield_checkpoint ntrl-demo/Experiments/UR5_trajectory_no_wall_accuracy_check/trajectory_03_25_20_28/Model_Epoch_05000_ValLoss_7.820605e-01.pt \
-    --objloc_checkpoint final_integrate/best_obj_loc_model.pth \
-    --latent_checkpoint final_integrate/best_z_goal_model_original.pth
+    --latent_checkpoint final_integrate/best_z_goal_model_wonorm_mse_cos.pth \
+    --fourier_checkpoint final_integrate/best_z_goal_model_fourier.pth
 
 Outputs under output/final_integrate/<timestamp>/ (see --output_dir).
 """
@@ -30,7 +30,6 @@ _COLLECT_DATA_DIR = os.path.join(HANWEN_GRASPING_ROOT, "collect_data")
 _UTIL_DIR = os.path.join(_COLLECT_DATA_DIR, "util")
 _GRASP_UTIL_DIR = os.path.join(_COLLECT_DATA_DIR, "grasp_util")
 _NTRL_DEMO = os.path.join(_PI_VLA_ROOT, "ntrl-demo")
-_IMG2OBJ = os.path.join(_PI_VLA_ROOT, "img2objloc_model")
 
 NORMALIZE_COORDS = True
 # Same as planning.gradient_planner_trajectory.SCALE; defined here (not imported) because
@@ -84,33 +83,6 @@ def _compute_z_goal(
         _, zg = teacher.encode_pair_latents(coords)
     return zg.detach().cpu().float().numpy().reshape(-1)
 
-def _get_model(output_dim: int = 3):
-    import torch.nn as nn
-    import torchvision.models as models
-
-    # No ImageNet weights — checkpoint supplies all weights (older torchvision
-    # has no ResNet18_Weights; use pretrained=False).
-    try:
-        model = models.resnet18(weights=None)
-    except TypeError:
-        model = models.resnet18(pretrained=False)
-    num_features = model.fc.in_features
-    model.fc = nn.Linear(num_features, output_dim)
-    return model
-
-def _get_latent_model(output_dim: int = 256):
-    import torch.nn as nn
-    import torchvision.models as models
-
-    # No ImageNet weights — checkpoint supplies all weights (older torchvision
-    # has no ResNet18_Weights; use pretrained=False).
-    try:
-        model = models.resnet18(weights=None)
-    except TypeError:
-        model = models.resnet18(pretrained=False)
-    model.fc = nn.Linear(model.fc.in_features, output_dim)
-    return model
-    
 def _process_img(img: np.ndarray, img_size: int):
     """Resize + to tensor. Matches what we did in training."""
     import torch
@@ -130,78 +102,130 @@ def _process_img(img: np.ndarray, img_size: int):
 
     return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
-def _infer_latent_on_image(
-    image: np.ndarray,
-    checkpoint_path: str,
-    device: str,
-) -> Tuple[float, float, float]:
-    """
-    Run the latent_model.py-style model (get_model / output_dim=128) on a raw HWC
-    uint8 RGB numpy array.  Returns (pred_latent).
-    """
+# ---------------------------------------------------------------------------
+# Model loaders — must match training architecture exactly
+# ---------------------------------------------------------------------------
+
+def _get_latent_model(output_dim: int = 256):
+    """Matches StudentModelWonorm from train_config_wonorm.py."""
+    import torch.nn as nn
+    import torchvision.models as models
+
+    class StudentHead(nn.Module):
+        def __init__(self, in_features, output_dim):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(in_features, 512),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(512, output_dim),
+            )
+        def forward(self, x):
+            return self.net(x)
+
+    class StudentModel(nn.Module):
+        def __init__(self, output_dim):
+            super().__init__()
+            try:
+                backbone = models.resnet18(weights=None)
+            except TypeError:
+                backbone = models.resnet18(pretrained=False)
+            in_features = backbone.fc.in_features
+            backbone.fc = nn.Identity()
+            self.backbone = backbone
+            self.head = StudentHead(in_features, output_dim)
+        def forward(self, x):
+            return self.head(self.backbone(x))
+
+    return StudentModel(output_dim)
+
+
+def _get_fourier_model(output_dim: int = 256):
+    """Matches the OLD StudentHead that still had _apply_encoder_norm buffers."""
+    import torch
+    import torch.nn as nn
+    import torchvision.models as models
+
+    class StudentHeadLegacy(nn.Module):
+        def __init__(self, in_features, output_dim):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(in_features, 512),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(512, output_dim),
+            )
+            # keep buffers to match checkpoint
+            self.register_buffer("_running_mean", torch.zeros(output_dim))
+            self.register_buffer("_running_var",  torch.ones(output_dim))
+
+        def forward(self, x):
+            return self.net(x)  # buffers present but unused
+
+    class StudentModel(nn.Module):
+        def __init__(self, output_dim):
+            super().__init__()
+            try:
+                backbone = models.resnet18(weights=None)
+            except TypeError:
+                backbone = models.resnet18(pretrained=False)
+            in_features = backbone.fc.in_features
+            backbone.fc = nn.Identity()
+            self.backbone = backbone
+            self.head = StudentHeadLegacy(in_features, output_dim)
+
+        def forward(self, x):
+            return self.head(self.backbone(x))
+
+    return StudentModel(output_dim)
+
+
+def _infer_latent_on_image(image, checkpoint_path, device):
     import torch
     from torchvision import transforms
 
-    ckpt_path = os.path.abspath(checkpoint_path)
     dev = torch.device(
         "cuda" if torch.cuda.is_available() and device == "auto" else device
     )
+    ckpt = torch.load(os.path.abspath(checkpoint_path), map_location=dev)
+    z_dim = ckpt.get("z_dim", 256)
 
-    model = _get_latent_model(output_dim=256).to(dev)
-    model.load_state_dict(torch.load(ckpt_path, map_location=dev))
+    model = _get_latent_model(output_dim=z_dim).to(dev)
+    model.load_state_dict(ckpt["model_state_dict"])  # ← use model_state_dict key
     model.eval()
 
     normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
+        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
     )
-
     x = _process_img(image, 224).unsqueeze(0)
     x = normalize(x).to(dev)
-
     with torch.no_grad():
-        pred = model(x).squeeze(0).cpu().numpy()  # shape (256,)
-
+        pred = model(x).squeeze(0).cpu().numpy()
     return pred
 
-def _infer_objloc_on_image(
-    image: np.ndarray,
-    checkpoint_path: str,
-    device: str,
-) -> Tuple[float, float, float]:
-    """
-    Run the view_data.py-style model (get_model / output_dim=3) on a raw HWC
-    uint8 RGB numpy array.  Returns (pred_x, pred_y, pred_z).
-    """
+
+def _infer_fourier_on_image(image, checkpoint_path, device):
     import torch
     from torchvision import transforms
 
-    if _IMG2OBJ not in sys.path:
-        sys.path.insert(0, _IMG2OBJ)
-
-
-    ckpt_path = os.path.abspath(checkpoint_path)
     dev = torch.device(
         "cuda" if torch.cuda.is_available() and device == "auto" else device
     )
+    ckpt = torch.load(os.path.abspath(checkpoint_path), map_location=dev)
+    z_dim = ckpt.get("z_dim", 256)
 
-    model = _get_model(output_dim=3).to(dev)
-    model.load_state_dict(torch.load(ckpt_path, map_location=dev))
+    model = _get_fourier_model(output_dim=z_dim).to(dev)
+    model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
     normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
+        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
     )
-
     x = _process_img(image, 224).unsqueeze(0)
     x = normalize(x).to(dev)
-
     with torch.no_grad():
-        pred = model(x).squeeze(0).cpu().numpy()  # shape (3,)
-
-    return float(pred[0]), float(pred[1]), float(pred[2])
-
+        pred = model(x).squeeze(0).cpu().numpy()
+    return pred
 
 def find_grasp_q_goal(
     rac: Any,
@@ -306,6 +330,45 @@ def find_grasp_q_goal(
     return grasp_target_q, init2grasp_path, rrt_plan_s
 
 
+# def load_network_and_function(
+#     checkpoint_path: str,
+#     experiment_dir: Optional[str],
+#     device: torch.device,
+#     dim: int = 6,
+# ) -> Tuple[Any, Any]:
+#     """
+#     Restore NN + Function from a Model_Epoch_*.pt saved by train_arm_trajectory.py.
+
+#     Args:
+#         checkpoint_path: Absolute path to .pt file.
+#         experiment_dir: Folder that contains copied ``models/metric_arm`` (usually
+#             the run directory next to the checkpoint). If None, uses dirname(checkpoint).
+#         device: torch.device
+#         dim: joint dimension (6 for UR5e)
+#     """
+#     checkpoint_path = os.path.abspath(checkpoint_path)
+#     if experiment_dir is None:
+#         experiment_dir = os.path.dirname(checkpoint_path)
+#     else:
+#         experiment_dir = os.path.abspath(experiment_dir)
+
+#     ckpt = torch.load(checkpoint_path, map_location=device)
+#     B = ckpt["B_state_dict"]
+#     if not torch.is_tensor(B):
+#         B = torch.as_tensor(B)
+
+#     from models.metric_arm import model_function_metric as model_function
+#     from models.metric_arm import model_network_metric as model_network
+
+#     network = model_network.NN(str(device), dim, B)
+#     network.load_state_dict(ckpt["model_state_dict"], strict=True)
+#     network.to(device)
+#     network.eval()
+
+#     fn = model_function.Function(experiment_dir, device, network, dim)
+#     return network, fn, B
+
+
 def main() -> None:
     from scipy.spatial.transform import Rotation as R
     from isaacgym import gymapi
@@ -340,8 +403,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="PI-VLA final integration pipeline")
     parser.add_argument("--ntfield_checkpoint", type=str, required=True)
     parser.add_argument("--ntfield_experiment_dir", type=str, default=None)
-    parser.add_argument("--objloc_checkpoint", type=str, required=True,
-                        help="Path to best_obj_loc_model.pth (get_model / output_dim=3)")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Session dir (default: output/final_integrate/TIMESTAMP)")
     parser.add_argument("--object_z", type=float, default=0.18,
@@ -353,7 +414,6 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--use_viewer", action="store_true")
     parser.add_argument("--ntfield_device", type=str, default="cuda:0")
-    parser.add_argument("--objloc_device", type=str, default="auto")
     parser.add_argument("--latent_checkpoint", type=str, required=True,
                         help="Path to image→latent goal checkpoint (ResNet18 fc, output_dim=256)")
     parser.add_argument("--latent_device", type=str, default="auto",
@@ -369,6 +429,11 @@ def main() -> None:
         choices=("direct", "settle"),
         default="direct",
     )
+
+    parser.add_argument("--fourier_checkpoint", type=str, default=None,
+                    help="Path to image→Fourier embedding checkpoint")
+    parser.add_argument("--fourier_device", type=str, default="auto",
+                        help="Device for Fourier embedding model (e.g. cuda:0, cpu, auto)")
     args, argv_remainder = parser.parse_known_args()
 
     # ------------------------------------------------------------------
@@ -661,24 +726,10 @@ def main() -> None:
     top_view_path = os.path.join(session_dir, "top_view.png")
     cv2.imwrite(top_view_path, cv2.cvtColor(rgb_top, cv2.COLOR_RGB2BGR))
 
-    # ------------------------------------------------------------------
-    # Object localisation: get_model (output_dim=3) — same as view_data.py
-    # Replaces the previous SAM + separate objloc_xy pipeline entirely.
-    # pred_z is taken directly from the model (no z_fixed fallback needed).
-    # ------------------------------------------------------------------
-    pred_x, pred_y, pred_z = _infer_objloc_on_image(
-        rgb_top,
-        _resolve_under_root(args.objloc_checkpoint),
-        args.objloc_device,
-    )
-
     object_location_original = [float(ox), float(oy), float(oz)]
-    object_location_predicted = [float(pred_x), float(pred_y), float(pred_z)]
 
     with open(os.path.join(session_dir, "object_location_original.json"), "w", encoding="utf-8") as f:
         json.dump({"xyz_m": object_location_original}, f, indent=2)
-    with open(os.path.join(session_dir, "object_location_predicted.json"), "w", encoding="utf-8") as f:
-        json.dump({"xyz_m": object_location_predicted}, f, indent=2)
 
     scene_info = [table_dims.x, table_dims.y, table_dims.z, drawer_height]
     file_path_rac = "./assets/urdf/ur5e/meshes/collision/"
@@ -692,38 +743,29 @@ def main() -> None:
     grasp_list = np.arange(len(grasp_data))
     np.random.shuffle(grasp_list)
 
+    # ------------------------------------------------------------------
+    # Gradient planner trajectory: find_grasp_q_goal (output_dim=3) — same as view_data.py
+    # ------------------------------------------------------------------
     true_xy = np.array([ox, oy], dtype=np.float64)
-    pred_xy = np.array([pred_x, pred_y], dtype=np.float64)
-
     q_goal_true, _, _ = find_grasp_q_goal(
         rac, RC, scene_info, grasp_data, grasp_list,
         true_xy, target_idx, object_mesh, object_collision_models,
         plane_obj, get_swept_volume_size,
     )
-    q_goal_pred, _, _ = find_grasp_q_goal(
-        rac, RC, scene_info, grasp_data, grasp_list,
-        pred_xy, target_idx, object_mesh, object_collision_models,
-        plane_obj, get_swept_volume_size,
-    )
 
     with open(os.path.join(session_dir, "q_goal_original.json"), "w", encoding="utf-8") as f:
         json.dump({"joint_rad": None if q_goal_true is None else q_goal_true.tolist()}, f, indent=2)
-    with open(os.path.join(session_dir, "q_goal_predicted.json"), "w", encoding="utf-8") as f:
-        json.dump({"joint_rad": None if q_goal_pred is None else q_goal_pred.tolist()}, f, indent=2)
 
     dof_snapshot = gym.get_actor_dof_states(env, ur, gymapi.STATE_POS)
     q_start_live = np.array(dof_snapshot["pos"][:6], dtype=np.float64)
 
-    mp4_pred = os.path.join(session_dir, "ntfield_trajectory_predicted_goal.mp4")
     mp4_true = os.path.join(session_dir, "ntfield_trajectory_original_goal.mp4")
 
     summary: Dict[str, Any] = {
         "session_dir": session_dir,
         "object_pose_world_m": object_location_original,
-        "object_location_predicted_m": object_location_predicted,
         "q_start_live": q_start_live.tolist(),
         "q_goal_original_found": q_goal_true is not None,
-        "q_goal_predicted_found": q_goal_pred is not None,
         "videos": {},
     }
 
@@ -757,7 +799,6 @@ def main() -> None:
         _save_mp4_rgb(frames_nt, out_mp4, fps=args.video_fps)
         summary["videos"][label] = out_mp4
 
-    _run_ntfield_video(q_goal_pred, mp4_pred, "predicted_goal")
     _run_ntfield_video(q_goal_true, mp4_true, "original_goal")
 
     with open(os.path.join(session_dir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
@@ -775,30 +816,119 @@ def main() -> None:
     # ------------------------------------------------------------------
 
 
-    def ntfield_latent_plan_gradient(teacher_network, q_start, z_goal_hat, step_size=0.02, max_steps=200, tol=0.01, device="cuda"):
-        """Gradient descent planner minimizing distance to a goal latent vector directly."""
-        q_curr_norm = np.asarray(q_start, dtype=np.float32) / NTFIELD_SCALE
-        q_curr_t = torch.tensor(q_curr_norm, dtype=torch.float32, device=device).unsqueeze(0)
-        q_curr_t.requires_grad_(True)
+    def ntfield_plan_gradient_with_fourier_features(
+        teacher_network, q_start, fourier_features,
+        step_size=0.02, max_steps=200, tol=0.01, device="cuda"
+    ):
+        import torch
+
+        q_start = np.asarray(q_start, dtype=np.float32).reshape(-1)
+        q_curr_norm = q_start / NTFIELD_SCALE
+        q_curr_t = torch.tensor(
+            q_curr_norm, dtype=torch.float32, device=device
+        ).unsqueeze(0)  # (1, 6)
+
+        if isinstance(fourier_features, np.ndarray):
+            fourier_features = torch.tensor(
+                fourier_features.reshape(1, -1), dtype=torch.float32, device=device
+            )
+        else:
+            fourier_features = fourier_features.reshape(1, -1).to(device)
+        fourier_features = fourier_features.detach()  # goal is fixed — no grad needed
 
         path_norm = [q_curr_norm.copy()]
 
         for step in range(max_steps):
+            q_curr_t = q_curr_t.detach().requires_grad_(True)
+
+            # compute Fourier features of q_curr_t — connected to q_curr_t
+            x_start = teacher_network.input_mapping(q_curr_t)  # (1, 252)
+
+            # stack with fixed goal Fourier features
+            x = torch.vstack((x_start, fourier_features))  # (2, 252)
+
+            # run trunk — use fresh variable to avoid overwriting x
+            w = teacher_network.lip_norm(teacher_network.pe_gate[0].weight)
+            u = torch.sin(x @ w.T + teacher_network.pe_gate[0].bias)
+            w = teacher_network.lip_norm(teacher_network.pe_gate[1].weight)
+            v = torch.sin(x @ w.T + teacher_network.pe_gate[1].bias)
+
+            h = x  # separate variable for trunk activations
+            for ii in range(teacher_network.nl1):
+                h_tmp = h
+                w = teacher_network.lip_norm(teacher_network.encoder[3*ii+1].weight)
+                y = h @ w.T + teacher_network.encoder[3*ii+1].bias
+                h = u * torch.sin(y) + v * (1 - torch.sin(y))
+                w = teacher_network.lip_norm(teacher_network.encoder[3*ii+2].weight)
+                y = h @ w.T + teacher_network.encoder[3*ii+2].bias
+                h = u * torch.sin(y) + v * (1 - torch.sin(y))
+                w = teacher_network.lip_norm(teacher_network.encoder[3*ii+3].weight)
+                y = h @ w.T + teacher_network.encoder[3*ii+3].bias
+                weight = torch.sigmoid(0.1 * teacher_network.gate[ii].weight)
+                h = (1 - weight) * h_tmp + (weight) * torch.sin(y)
+
+            w = teacher_network.lip_norm(teacher_network.encoder[-1].weight)
+            y = h @ w.T + teacher_network.encoder[-1].bias
+            # skip apply_encoder_norm — only 2 rows, statistics are meaningless
+            # and norm breaks gradient since goal row affects start row stats
+
+            z_start = y[:1, ...]
+            z_goal  = y[1:, ...]
+
+            dist = torch.sqrt((z_start - z_goal)**2 + 1e-6)
+            dist = dist.view(dist.shape[0], -1, 16)
+            dist = (torch.logsumexp(10*dist, 2) - np.log(16)) / 10
+            dist = 0.1 * torch.sum(dist, dim=1, keepdim=True)
+
+            if dist.item() < tol:
+                break
+
+            grad = torch.autograd.grad(dist, q_curr_t)[0]  # (1, 6)
+
+            with torch.no_grad():
+                q_curr_t = q_curr_t - step_size * grad
+
+            path_norm.append(q_curr_t.detach().cpu().numpy()[0].copy())
+
+        path_rad = [p * NTFIELD_SCALE for p in path_norm]
+        return path_rad
+
+    def ntfield_plan_gradient_with_goal_latent(
+        teacher_network, q_start, z_goal_hat, 
+        step_size=0.02, max_steps=200, tol=0.01, device="cuda"
+    ):
+        import torch
+
+        # ensure q_start is (6,) before normalizing
+        q_start = np.asarray(q_start, dtype=np.float32).reshape(-1)  # (6,)
+        q_curr_norm = q_start / NTFIELD_SCALE
+        q_curr_t = torch.tensor(
+            q_curr_norm, dtype=torch.float32, device=device
+        ).unsqueeze(0)  # (1, 6)
+
+        # ensure z_goal_hat is (1, H) tensor on device
+        if isinstance(z_goal_hat, np.ndarray):
+            z_goal_hat = torch.tensor(
+                z_goal_hat.reshape(1, -1), dtype=torch.float32, device=device
+            )
+        else:
+            z_goal_hat = z_goal_hat.reshape(1, -1).to(device)
+
+        path_norm = [q_curr_norm.copy()]
+
+        for step in range(max_steps):
+            q_curr_t = q_curr_t.detach().requires_grad_(True)
             dist, _, coords_out = teacher_network.out_with_goal_latent(q_curr_t, z_goal_hat)
 
             if dist.item() < tol:
                 break
 
-            # Get gradient of distance with respect to coords
             grad_out = torch.autograd.grad(dist, coords_out)[0]
-            # We only care about the start configuration's gradient (first 6 dims)
             grad_start = grad_out[:, :6]
 
             with torch.no_grad():
-                # Step in negative gradient direction to MINIMIZE distance
                 q_curr_t = q_curr_t - step_size * grad_start
 
-            q_curr_t = q_curr_t.detach().requires_grad_(True)
             path_norm.append(q_curr_t.detach().cpu().numpy()[0].copy())
 
         path_rad = [p * NTFIELD_SCALE for p in path_norm]
@@ -809,10 +939,36 @@ def main() -> None:
             summary["videos"][label] = None
             return
         reset_arm_to_q(gym, sim, env, ur, spj, slj, ej, wj1, wj2, wj3, viewer, q_start_live, n_steps=200)
-        path_nt_raw = ntfield_latent_plan_gradient(
+        path_nt_raw = ntfield_plan_gradient_with_goal_latent(
             nt_net,
             q_start_live.reshape(1, -1),
             z_goal.reshape(1, -1)
+        )
+        if not path_nt_raw or len(path_nt_raw) < 2:
+            summary["videos"][label] = None
+            return
+        path_nt = _path_as_6_list(path_nt_raw)
+        frames_nt: List[np.ndarray] = []
+        execute_path_and_time(
+            gym, sim, env, ur, spj, slj, ej, wj1, wj2, wj3, viewer,
+            path_nt, label,
+            main_cam_handle=main_cam_handle,
+            camera_props=camera_props,
+            record_rgb=frames_nt,
+            planner_playback=args.planner_playback,
+        )
+        _save_mp4_rgb(frames_nt, out_mp4, fps=args.video_fps)
+        summary["videos"][label] = out_mp4
+
+    def _run_ntfield_video_with_fourier_features(fourier_features: Optional[np.ndarray], out_mp4: str, label: str) -> None:
+        if fourier_features is None:
+            summary["videos"][label] = None
+            return
+        reset_arm_to_q(gym, sim, env, ur, spj, slj, ej, wj1, wj2, wj3, viewer, q_start_live, n_steps=200)
+        path_nt_raw = ntfield_plan_gradient_with_fourier_features(
+            nt_net,
+            q_start_live.reshape(1, -1),
+            fourier_features.reshape(1, -1)
         )
         if not path_nt_raw or len(path_nt_raw) < 2:
             summary["videos"][label] = None
@@ -836,6 +992,12 @@ def main() -> None:
         args.latent_device,
     )
 
+    fourier_pred = _infer_fourier_on_image(
+        rgb_top,
+        _resolve_under_root(args.fourier_checkpoint),
+        args.fourier_device,
+    )
+
     latent_goal_true: Optional[np.ndarray] = None
     if q_goal_true is not None:
         latent_goal_true = _compute_z_goal(
@@ -844,12 +1006,33 @@ def main() -> None:
             q_goal_true.reshape(1, -1),
             dev_nt,
         )
+    if latent_goal_true is not None:
+        latent_diff = latent_goal_pred - latent_goal_true
+        latent_mse = float(np.mean(np.square(latent_diff)))
+        latent_l2 = float(np.linalg.norm(latent_diff))
+        latent_max_abs = float(np.max(np.abs(latent_diff)))
+        summary["latent_goal_comparison"] = {
+            "mse": latent_mse,
+            "l2": latent_l2,
+            "max_abs": latent_max_abs,
+        }
+        print(
+            "[latent compare] "
+            f"mse={latent_mse:.8f}, l2={latent_l2:.8f}, max_abs={latent_max_abs:.8f}"
+        )
+    else:
+        summary["latent_goal_comparison"] = None
 
     mp4_pred_latent = os.path.join(session_dir, "ntfield_trajectory_predicted_goal_latent.mp4")
     mp4_true_latent = os.path.join(session_dir, "ntfield_trajectory_original_goal_latent.mp4")
     
     _run_ntfield_video_with_goal_latent(latent_goal_pred, mp4_pred_latent, "predicted_latent_goal")
     _run_ntfield_video_with_goal_latent(latent_goal_true, mp4_true_latent, "original_latent_goal")
+
+    mp4_pred_fourier = os.path.join(session_dir, "ntfield_trajectory_predicted_goal_fourier.mp4")
+    mp4_true_fourier = os.path.join(session_dir, "ntfield_trajectory_original_goal_fourier.mp4")
+    _run_ntfield_video_with_fourier_features(fourier_pred, mp4_pred_fourier, "predicted_fourier_goal")
+    _run_ntfield_video_with_fourier_features(None, mp4_true_fourier, "original_fourier_goal")
 
     with open(os.path.join(session_dir, "latent_goal_pred.json"), "w", encoding="utf-8") as f:
         json.dump({"latent_goal": latent_goal_pred.tolist()}, f, indent=2)
@@ -859,7 +1042,9 @@ def main() -> None:
             f,
             indent=2,
         )
-
+    with open(os.path.join(session_dir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    
     gym.destroy_sim(sim)
     if viewer is not None:
         gym.destroy_viewer(viewer)

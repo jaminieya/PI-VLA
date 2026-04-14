@@ -1,4 +1,3 @@
-import os
 import matplotlib
 import numpy as np
 import math
@@ -219,7 +218,7 @@ class NN(torch.nn.Module):
         b = self.encoder[-1].bias
         w = self.lip_norm(w)
         y = x @ w.T + b
-        y = self.apply_encoder_norm(y)
+        y = self.apply_encoder_norm(y) # Only apply encoder norm in training
 
         z_start = y[:size, ...]
         z_goal = y[size:, ...]
@@ -246,6 +245,56 @@ class NN(torch.nn.Module):
         
         
         return x, w, coords
+
+    # In NN class — add this method
+    def out_with_fourier_features(self, q_start, fourier_features):
+        """
+        q_start: (B, dim) normalized
+        fourier_features: (B, 252) — output of input_mapping for q_goal
+        Uses pre-computed Fourier features as goal representation.
+        """
+        size = q_start.shape[0]
+        
+        # compute start Fourier features normally
+        x_start = self.input_mapping(q_start)  # (B, 252)
+        
+        # stack with provided goal Fourier features
+        x = torch.vstack((x_start, fourier_features))  # (2B, 252)
+
+        # run trunk exactly as in out()
+        w = self.lip_norm(self.pe_gate[0].weight)
+        u = torch.sin(x @ w.T + self.pe_gate[0].bias)
+        w = self.lip_norm(self.pe_gate[1].weight)
+        v = torch.sin(x @ w.T + self.pe_gate[1].bias)
+
+        for ii in range(self.nl1):
+            x_tmp = x
+            w = self.lip_norm(self.encoder[3*ii+1].weight)
+            y = x @ w.T + self.encoder[3*ii+1].bias
+            x = u * torch.sin(y) + v * (1 - torch.sin(y))
+            w = self.lip_norm(self.encoder[3*ii+2].weight)
+            y = x @ w.T + self.encoder[3*ii+2].bias
+            x = u * torch.sin(y) + v * (1 - torch.sin(y))
+            w = self.lip_norm(self.encoder[3*ii+3].weight)
+            y = x @ w.T + self.encoder[3*ii+3].bias
+            weight = torch.sigmoid(0.1 * self.gate[ii].weight)
+            x = (1 - weight) * x_tmp + (weight) * torch.sin(y)
+
+        w = self.lip_norm(self.encoder[-1].weight)
+        y = x @ w.T + self.encoder[-1].bias  # pre-norm
+        # y = self.apply_encoder_norm(y) 
+
+        z_start = y[:size, ...]
+        z_goal  = y[size:, ...]
+
+        dist = torch.sqrt((z_start - z_goal)**2 + 1e-6)
+        dist = dist.view(dist.shape[0], -1, 16)
+        dist = (torch.logsumexp(10*dist, 2) - np.log(16)) / 10
+        dist = 0.1 * torch.sum(dist, dim=1, keepdim=True)
+
+        # return coords for gradient computation
+        coords = torch.cat([q_start, q_start], dim=1).requires_grad_(True)
+        return dist, None, coords
     
     def out_with_goal_latent(self, q_start, z_goal_ext, q_goal_norm=None):
         if q_goal_norm is not None:

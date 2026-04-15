@@ -22,6 +22,10 @@ Usage (from PI-VLA root):
 Resume after interruption (same ``--output_dir`` and ``--num_episodes`` total target):
   python new_clean_data_collect/collect_ntfield_rrt_episodes.py \\
     --num_episodes 1000 --output_dir output/data_collection --resume
+
+If Isaac segfaults between episodes (GPU PhysX), use one process per episode:
+  python new_clean_data_collect/collect_ntfield_rrt_episodes.py \\
+    --num_episodes 1000 --output_dir output/data_collection --subprocess_per_episode
 """
 
 from __future__ import annotations
@@ -33,7 +37,9 @@ import json
 import math
 import os
 import pickle
+import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from typing import Any, List, Optional, Tuple
@@ -80,13 +86,31 @@ def _load_rng_state(out_dir: str) -> Optional[dict]:
         return pickle.load(f)
 
 
+def _worker_main_from_json(json_path: str) -> None:
+    """Child entry: one Isaac episode, then exit (isolates segfaults from parent)."""
+    with open(json_path, encoding="utf-8") as f:
+        job = json.load(f)
+    ok = run_one_episode(
+        float(job["ox"]),
+        float(job["oy"]),
+        float(job["oz"]),
+        int(job["episode_index"]),
+        str(job["out_h5"]),
+        int(job["grasp_shuffle_seed"]),
+        bool(job["use_viewer"]),
+        float(job["rrt_time_limit"]),
+        list(job["argv_gym"]),
+    )
+    raise SystemExit(0 if ok else 1)
+
+
 def run_one_episode(
     ox: float,
     oy: float,
     oz: float,
     episode_index: int,
     out_h5_path: str,
-    rng: np.random.Generator,
+    grasp_shuffle_seed: int,
     use_viewer: bool,
     rrt_time_limit: float,
     argv_gym_tail: List[str],
@@ -351,7 +375,8 @@ def run_one_episode(
         grasp_data = np.load(grasp_file, allow_pickle=True)
         target_idx = 0
         grasp_list = np.arange(len(grasp_data))
-        rng.shuffle(grasp_list)
+        grasp_rng = np.random.default_rng(int(grasp_shuffle_seed) & 0x7FFFFFFF)
+        grasp_rng.shuffle(grasp_list)
 
         obj_xy = np.array([ox, oy], dtype=np.float64)
         grasp_target_q, _, _ = find_grasp_q_goal(
@@ -412,6 +437,12 @@ def run_one_episode(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Collect RRT trajectories for NTField (benchmark scene).")
+    parser.add_argument(
+        "--_worker_json",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--num_episodes", type=int, default=1000)
     parser.add_argument(
         "--output_dir",
@@ -442,7 +473,15 @@ def main() -> None:
         help="Continue toward --num_episodes: count existing ntfield_rrt_ep_*.h5 in --output_dir, "
         "restore RNG state from .ntfield_collect_rng_state.pkl if present, append to collection_log.jsonl.",
     )
+    parser.add_argument(
+        "--subprocess_per_episode",
+        action="store_true",
+        help="Run each attempt in a fresh Python process (slower but survives Isaac GPU PhysX segfaults).",
+    )
     args, argv_remainder = parser.parse_known_args()
+
+    if args._worker_json:
+        _worker_main_from_json(args._worker_json)
 
     argv_gym = list(argv_remainder)
     if not args.use_viewer and "--headless" not in argv_gym:
@@ -489,18 +528,55 @@ def main() -> None:
         oz = float(args.object_z)
         h5_name = f"ntfield_rrt_ep_{successes:05d}_{datetime.now().strftime('%H%M%S')}.h5"
         out_h5 = os.path.join(out_dir, h5_name)
+        grasp_shuffle_seed = int(rng.integers(0, 2**31 - 1))
         t0 = time.perf_counter()
-        ok = run_one_episode(
-            ox,
-            oy,
-            oz,
-            successes,
-            out_h5,
-            rng,
-            args.use_viewer,
-            args.rrt_time_limit,
-            argv_gym,
-        )
+        child_rc: Optional[int] = None
+        if args.subprocess_per_episode:
+            job = {
+                "ox": ox,
+                "oy": oy,
+                "oz": oz,
+                "episode_index": successes,
+                "out_h5": out_h5,
+                "grasp_shuffle_seed": grasp_shuffle_seed,
+                "use_viewer": args.use_viewer,
+                "rrt_time_limit": args.rrt_time_limit,
+                "argv_gym": argv_gym,
+            }
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                suffix=".json",
+                delete=False,
+                dir=out_dir,
+            ) as tf:
+                json.dump(job, tf)
+                jpath = tf.name
+            try:
+                proc = subprocess.run(
+                    [sys.executable, os.path.abspath(__file__), "--_worker_json", jpath],
+                    cwd=_PI_VLA_ROOT,
+                    env=os.environ.copy(),
+                )
+                child_rc = proc.returncode
+                ok = proc.returncode == 0
+            finally:
+                try:
+                    os.unlink(jpath)
+                except OSError:
+                    pass
+        else:
+            ok = run_one_episode(
+                ox,
+                oy,
+                oz,
+                successes,
+                out_h5,
+                grasp_shuffle_seed,
+                args.use_viewer,
+                args.rrt_time_limit,
+                argv_gym,
+            )
         dt = time.perf_counter() - t0
         attempts += 1
         rec = {
@@ -510,6 +586,8 @@ def main() -> None:
             "object_xyz": [ox, oy, oz],
             "path": out_h5 if ok else None,
         }
+        if child_rc is not None:
+            rec["subprocess_returncode"] = child_rc
         with open(log_path, "a", encoding="utf-8") as lf:
             lf.write(json.dumps(rec) + "\n")
         _save_rng_state(out_dir, rng)
@@ -517,7 +595,8 @@ def main() -> None:
             successes += 1
             print(f"[{successes}/{args.num_episodes}] OK  {out_h5}  ({dt:.1f}s)")
         else:
-            print(f"[try {attempts}] FAIL  obj=({ox:.3f},{oy:.3f},{oz:.3f})  ({dt:.1f}s)")
+            extra = f" rc={child_rc}" if child_rc is not None else ""
+            print(f"[try {attempts}] FAIL  obj=({ox:.3f},{oy:.3f},{oz:.3f})  ({dt:.1f}s){extra}")
 
     print(f"Done. Successes: {successes}/{args.num_episodes}, attempts: {attempts}, out: {out_dir}")
 

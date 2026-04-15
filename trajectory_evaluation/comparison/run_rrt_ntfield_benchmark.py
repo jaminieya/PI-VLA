@@ -83,6 +83,34 @@ def _path_as_6_list(path):
     return [np.asarray(p, dtype=np.float64).reshape(-1)[:6].tolist() for p in path]
 
 
+def _resample_path_fixed_waypoints(path_6, target_count):
+    """Resample a joint path to exactly target_count waypoints (inclusive endpoints)."""
+    if path_6 is None:
+        return None
+    if target_count is None or int(target_count) <= 0:
+        return path_6
+    target_count = int(target_count)
+    if len(path_6) == 0:
+        return path_6
+    if len(path_6) == 1:
+        return [path_6[0] for _ in range(target_count)]
+    if target_count == 1:
+        return [path_6[0]]
+
+    arr = np.asarray(path_6, dtype=np.float64).reshape(-1, 6)
+    seg = np.linalg.norm(np.diff(arr, axis=0), axis=1)
+    s = np.concatenate(([0.0], np.cumsum(seg)))
+    total = float(s[-1])
+    if total <= 1e-12:
+        return [arr[0].tolist() for _ in range(target_count)]
+
+    s_new = np.linspace(0.0, total, target_count)
+    out = np.empty((target_count, 6), dtype=np.float64)
+    for j in range(6):
+        out[:, j] = np.interp(s_new, s, arr[:, j])
+    return out.tolist()
+
+
 def get_swept_volume_size(main_swept):
     min_x, min_y, min_z = sys.maxsize, sys.maxsize, sys.maxsize
     max_x, max_y, max_z = -sys.maxsize, -sys.maxsize, -sys.maxsize
@@ -278,6 +306,19 @@ def main():
         help="direct: one sim step per planner waypoint (default). settle: multi-step dwell per waypoint.",
     )
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--ntfield_waypoint_mode",
+        type=str,
+        choices=("full", "two_point"),
+        default="full",
+        help="full: execute all NTField waypoints. two_point: execute only [start, goal].",
+    )
+    parser.add_argument(
+        "--ntfield_fixed_waypoints",
+        type=int,
+        default=0,
+        help="If >0, resample NTField trajectory to this many waypoints (ignored in two_point mode).",
+    )
     args, argv_remainder = parser.parse_known_args()
     # Isaac gymutil parses sys.argv; pass through only unrecognized tokens.
     # When not using the viewer, inject --headless so Isaac Gym matches headless + camera-sensor capture.
@@ -641,6 +682,8 @@ def main():
     result = {
         "timestamp": datetime.now().isoformat(),
         "planner_playback": args.planner_playback,
+        "ntfield_waypoint_mode": args.ntfield_waypoint_mode,
+        "ntfield_fixed_waypoints": int(args.ntfield_fixed_waypoints),
         "table_dims_m": [TABLE_DIMS_X, TABLE_DIMS_Y, TABLE_DIMS_Z],
         "object_pose_world_m": [args.object_x, args.object_y, args.object_z],
         "object": "011_banana",
@@ -747,7 +790,12 @@ def main():
 
     if path_nt_raw and len(path_nt_raw) >= 2:
         path_nt = _path_as_6_list(path_nt_raw)
+        if args.ntfield_waypoint_mode == "two_point" and len(path_nt) >= 2:
+            path_nt = [path_nt[0], path_nt[-1]]
+        elif args.ntfield_fixed_waypoints > 0:
+            path_nt = _resample_path_fixed_waypoints(path_nt, args.ntfield_fixed_waypoints)
         result["ntfield"]["trajectory_waypoints_rad"] = path_nt
+        result["ntfield"]["num_waypoints_after_postprocess"] = len(path_nt)
         result["ntfield"]["motion"] = joint_metrics(path_nt, q_start_live, grasp_target_q)
         frames_nt = [] if want_video else None
         exec_nt = execute_path_and_time(

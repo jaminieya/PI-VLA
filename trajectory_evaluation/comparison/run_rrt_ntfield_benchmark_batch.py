@@ -71,6 +71,21 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=None, help="Passed to each benchmark run")
     parser.add_argument(
+        "--ntfield-waypoint-mode",
+        dest="ntfield_waypoint_mode",
+        type=str,
+        choices=("full", "two_point"),
+        default="full",
+        help="Forward --ntfield_waypoint_mode to each run.",
+    )
+    parser.add_argument(
+        "--ntfield-fixed-waypoints",
+        dest="ntfield_fixed_waypoints",
+        type=int,
+        default=0,
+        help="Forward --ntfield_fixed_waypoints to each run (0 disables resampling).",
+    )
+    parser.add_argument(
         "--planner-playback",
         dest="planner_playback",
         type=str,
@@ -134,6 +149,8 @@ def main() -> None:
         ]
         if args.seed is not None:
             cmd.extend(["--seed", str(args.seed)])
+        cmd.extend(["--ntfield_waypoint_mode", args.ntfield_waypoint_mode])
+        cmd.extend(["--ntfield_fixed_waypoints", str(args.ntfield_fixed_waypoints)])
         cmd.extend(["--planner_playback", args.planner_playback])
         if args.no_video:
             cmd.append("--no_video")
@@ -177,6 +194,8 @@ def main() -> None:
         "pi_vla_root": str(_PI_VLA_ROOT),
         "checkpoint": str(ckpt_resolved),
         "planner_playback": args.planner_playback,
+        "ntfield_waypoint_mode": args.ntfield_waypoint_mode,
+        "ntfield_fixed_waypoints": int(args.ntfield_fixed_waypoints),
         "object_z_m": args.object_z,
         "num_runs": len(OBJECT_XY_GRID),
         "num_failed": failed,

@@ -7,10 +7,16 @@ from torchvision import models, transforms
 
 # Shards from preprocess_config.py (images + z_goals = teacher latent of goal).
 # DATASET_ROOT = Path("/scratch/scholar/sohn31/grasp_zgoal_wonorm_dataset_shards")
-DATASET_ROOT = Path("/scratch/scholar/sohn31/grasp_zgoal_fourier_dataset_shards")
-PCA_OUTPUT_DIR = Path("output/pca_training_plots_fourier")
+DATASET_ROOT = Path("/home/hojinsohn/VLM-NT/grasp_zgoal_wonorm_dataset_shards")
+PCA_OUTPUT_DIR = Path("/home/hojinsohn/VLM-NT/PI-VLA/output/pca_training_plots_wonorm")
 LOG_EVERY_BATCHES = 100
 
+
+def build_resnet18():
+    """Build ResNet18 with pretrained weights across torchvision versions."""
+    if hasattr(models, "ResNet18_Weights"):
+        return models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+    return models.resnet18(pretrained=True)
 
 # ---------------------------------------------------------------------------
 # Shard helpers
@@ -230,7 +236,7 @@ def evaluate_shardwise(
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
-class StudentHead(nn.Module):
+class StudentHeadWonorm(nn.Module):
     def __init__(self, in_features, output_dim):
         super().__init__()
         self.net = nn.Sequential(
@@ -239,86 +245,26 @@ class StudentHead(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(512, output_dim),
         )
-        # Running stats for stable eval — fixes batch_size=1 issue
-        self.register_buffer("_running_mean", torch.zeros(output_dim))
-        self.register_buffer("_running_var",  torch.ones(output_dim))
-        self._momentum = 0.01
-
-    def _apply_encoder_norm(self, y):
-        if self.training:
-            mean = y.mean(dim=0)
-            var  = y.var(dim=0, unbiased=False)
-            with torch.no_grad():
-                self._running_mean.mul_(1 - self._momentum).add_(mean, alpha=self._momentum)
-                self._running_var.mul_(1 - self._momentum).add_(var,  alpha=self._momentum)
-        else:
-            mean = self._running_mean
-            var  = self._running_var
-        return (y - mean) / torch.sqrt(var + 1e-5)
-
-    def forward(self, x):
-        return self._apply_encoder_norm(self.net(x))
-
-
-class StudentModel(nn.Module):
-    """Defined at module level so torch.save/load and pickle work correctly."""
-    def __init__(self, output_dim: int):
-        super().__init__()
-        backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-        in_features = backbone.fc.in_features
-        backbone.fc = nn.Identity()
-        self.backbone = backbone
-        self.head = StudentHead(in_features, output_dim)
-
-    def forward(self, x):
-        return self.head(self.backbone(x))
-
-
-
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-class StudentHeadFourier(nn.Module):
-    def __init__(self, in_features, output_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_features, 512),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, output_dim),
-        )
-        # Running stats for stable eval — fixes batch_size=1 issue
-        self.register_buffer("_running_mean", torch.zeros(output_dim))
-        self.register_buffer("_running_var",  torch.ones(output_dim))
-        self._momentum = 0.01
 
     def forward(self, x):
         return self.net(x)
 
 
-class StudentModelFourier(nn.Module):
+class StudentModelWonorm(nn.Module):
     """Defined at module level so torch.save/load and pickle work correctly."""
     def __init__(self, output_dim: int):
         super().__init__()
-        backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        backbone = build_resnet18()
         in_features = backbone.fc.in_features
         backbone.fc = nn.Identity()
         self.backbone = backbone
-        self.head = StudentHeadFourier(in_features, output_dim)
+        self.head = StudentHeadWonorm(in_features, output_dim)
 
     def forward(self, x):
         return self.head(self.backbone(x))
 
-def get_model_fourier(output_dim: int) -> nn.Module:
-    return StudentModelFourier(output_dim)
-
-# ORIGINAL
-def get_model_old(output_dim: int) -> nn.Module:
-    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-    model.fc = nn.Linear(model.fc.in_features, output_dim)
-    return model
-
-
+def get_model_wonorm(output_dim: int) -> nn.Module:
+    return StudentModelWonorm(output_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +415,7 @@ def train():
     train_idx, val_idx, train_size, val_size = build_train_val_split(n_total)
     print(f"Train: {train_size} | Val: {val_size}", flush=True)
 
-    model = get_model_fourier(output_dim=z_dim).to(device)
+    model = get_model_wonorm(output_dim=z_dim).to(device)
 
     epochs = 20
     eval_every = 2
@@ -478,7 +424,7 @@ def train():
     best_val_cos = float("inf")
     best_val_n   = 0
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    criterion = HybridDistillationLoss(alpha=0.5) #  
+    criterion = HybridDistillationLoss(alpha=0.5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     for epoch in range(epochs):
@@ -533,7 +479,7 @@ def train():
                     "epoch":   epoch + 1,
                     "val_mae": best_val_mae,
                     "val_cos": best_val_cos,
-                }, "best_z_goal_model_fourier.pth")
+                }, "best_z_goal_model_wonorm_mse_cos.pth")
                 print(
                     f" -> New best saved. MAE: {best_val_mae:.6f} "
                     f"| Cos: {best_val_cos:.6f}",

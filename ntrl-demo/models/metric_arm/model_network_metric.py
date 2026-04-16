@@ -218,7 +218,7 @@ class NN(torch.nn.Module):
         b = self.encoder[-1].bias
         w = self.lip_norm(w)
         y = x @ w.T + b
-        y = self.apply_encoder_norm(y) # Only apply encoder norm in training
+        # y = self.apply_encoder_norm(y) # Only apply encoder norm in training
 
         z_start = y[:size, ...]
         z_goal = y[size:, ...]

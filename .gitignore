@@ -73,3 +73,5 @@ hanwen_grasping/checkpoints/
 
 # Segment Anything ViT-H weights (~2.4 GB); download per img2objloc_model/README.md
 img2objloc_model/checkpoints/sam_vit_h_4b8939.pth
+
+NTField_scaling/merged_h5/

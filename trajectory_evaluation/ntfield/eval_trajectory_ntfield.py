@@ -42,7 +42,9 @@ def load_network_and_function(
     else:
         experiment_dir = os.path.abspath(experiment_dir)
 
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    # Always unpickle on CPU first. With GPU PhysX, Isaac Gym often owns most VRAM
+    # before this runs; map_location=cuda here can fail with OOM during torch.load.
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
     B = ckpt["B_state_dict"]
     if not torch.is_tensor(B):
         B = torch.as_tensor(B)

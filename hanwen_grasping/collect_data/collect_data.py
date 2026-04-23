@@ -23,6 +23,7 @@ import open3d as o3d
 import fcl
 import cv2
 import copy
+import shutil
 
 OBJECT_NAMES = {
     "002_master_chef_can": "master chef can",
@@ -741,6 +742,99 @@ def move_objs(gym, object_collision_files, gymapi, new_obj_pos_list):
 
     return
 
+
+def _table_box_mesh_vertices_faces(center_xyz, dims_xyz):
+    cx, cy, cz = center_xyz
+    dx, dy, dz = dims_xyz
+    v = np.array(
+        [
+            [cx - dx / 2.0, cy - dy / 2.0, cz - dz / 2.0],
+            [cx - dx / 2.0, cy + dy / 2.0, cz - dz / 2.0],
+            [cx + dx / 2.0, cy + dy / 2.0, cz - dz / 2.0],
+            [cx + dx / 2.0, cy - dy / 2.0, cz - dz / 2.0],
+            [cx - dx / 2.0, cy - dy / 2.0, cz + dz / 2.0],
+            [cx - dx / 2.0, cy + dy / 2.0, cz + dz / 2.0],
+            [cx + dx / 2.0, cy + dy / 2.0, cz + dz / 2.0],
+            [cx + dx / 2.0, cy - dy / 2.0, cz + dz / 2.0],
+        ],
+        dtype=np.float64,
+    )
+    f = np.array(
+        [
+            [0, 2, 1], [0, 2, 3],
+            [4, 6, 5], [4, 6, 7],
+            [5, 2, 1], [5, 2, 6],
+            [7, 2, 3], [7, 2, 6],
+            [4, 3, 0], [4, 3, 7],
+            [4, 1, 0], [4, 1, 5],
+        ],
+        dtype=np.int64,
+    )
+    return v, f
+
+
+def _write_obj(path, vertices, faces):
+    with open(path, "w") as f:
+        for vx, vy, vz in vertices:
+            f.write(f"v {vx:.8f} {vy:.8f} {vz:.8f}\n")
+        for i, j, k in faces:
+            f.write(f"f {i + 1} {j + 1} {k + 1}\n")
+
+
+def _export_train_arm_scene_dataset(
+    output_dir,
+    table_pose,
+    table_dims,
+    object_reader_tracker,
+):
+    """
+    Export obstacle geometry in the format expected by ntrl-demo preprocess:
+      - realpc.obj
+      - dim (first line: DoF, second line: end-effector link name)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    vertices_all = []
+    faces_all = []
+    v_offset = 0
+
+    table_center = np.array([table_pose.p.x, table_pose.p.y, table_pose.p.z], dtype=np.float64)
+    table_size = np.array([table_dims.x, table_dims.y, table_dims.z], dtype=np.float64)
+    tv, tf = _table_box_mesh_vertices_faces(table_center, table_size)
+    vertices_all.append(tv)
+    faces_all.append(tf + v_offset)
+    v_offset += tv.shape[0]
+
+    for mesh_reader in object_reader_tracker:
+        ov = np.asarray(mesh_reader.get_vertices(), dtype=np.float64)
+        of = np.asarray(mesh_reader.get_faces(), dtype=np.int64)
+        if ov.size == 0 or of.size == 0:
+            continue
+        vertices_all.append(ov)
+        faces_all.append(of + v_offset)
+        v_offset += ov.shape[0]
+
+    if not vertices_all:
+        raise RuntimeError("No geometry available for train_arm scene export.")
+
+    vertices = np.concatenate(vertices_all, axis=0)
+    faces = np.concatenate(faces_all, axis=0)
+    obj_path = os.path.join(output_dir, "realpc.obj")
+    _write_obj(obj_path, vertices, faces)
+
+    dim_path = os.path.join(output_dir, "dim")
+    with open(dim_path, "w") as f:
+        f.write("6\n")
+        f.write("wrist_3_link\n")
+
+    # Ensure URDF exists for speed_sampling_arm_normal FK chain build.
+    urdf_src = os.path.join(ASSETS_DIR, "urdf", "ur5e", "ur5e.urdf")
+    urdf_dst = os.path.join(output_dir, "ur5e.urdf")
+    if os.path.isfile(urdf_src) and not os.path.isfile(urdf_dst):
+        shutil.copy2(urdf_src, urdf_dst)
+
+    return obj_path, dim_path
+
 #*************************************************************************************************#
 
 if __name__ == '__main__':
@@ -758,6 +852,17 @@ if __name__ == '__main__':
             {"name": "--target_idx", "type": int, "default": 0, "help": "Object index to grasp"},
             {"name": "--object_idx", "type": int, "default": None, "help": "Object type: 0=sugar_box, 1=mustard_bottle, 2=banana (default: random)"},
             {"name": "--headless", "action": "store_true", "help": "Run without creating a viewer"},
+            {
+                "name": "--export_train_arm_scene",
+                "action": "store_true",
+                "help": "Also export train_arm preprocessing scene files (realpc.obj + dim).",
+            },
+            {
+                "name": "--train_arm_output_dir",
+                "type": str,
+                "default": None,
+                "help": "Output directory for train_arm scene export (default: PI-VLA/ntrl-demo/datasets/arm/UR5).",
+            },
         ],
     )
     env_id = int(args.env_id)
@@ -1389,12 +1494,19 @@ if __name__ == '__main__':
             break
 
     # Save dataset to HDF5
-    pi_vla_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    collected_dir = os.path.join(pi_vla_root, "collected_data")
+    pi_vla_root = os.path.dirname(package_root)
+    default_scene_dir = os.path.join(pi_vla_root, "ntrl-demo", "datasets", "arm", "UR5")
+    scene_out_dir = (
+        os.path.abspath(args.train_arm_output_dir)
+        if args.train_arm_output_dir
+        else default_scene_dir
+    )
+    collected_dir = scene_out_dir
     if dataset_samples:
-        os.makedirs(collected_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = os.path.join(collected_dir, f"grasp_6dof_demo_{timestamp}.h5")
+        run_dir = os.path.join(collected_dir, timestamp)
+        os.makedirs(run_dir, exist_ok=True)
+        out_path = os.path.join(run_dir, f"grasp_6dof_demo_{timestamp}.h5")
         images_arr = np.array([s["image"] for s in dataset_samples], dtype=np.uint8)
         images_side_arr = np.array([s["image_side"] for s in dataset_samples], dtype=np.uint8)
         joint_configs_arr = np.array([s["joint_config"] for s in dataset_samples], dtype=np.float32)
@@ -1410,9 +1522,19 @@ if __name__ == '__main__':
             f.attrs["num_samples"] = int(num_samples)
             f.attrs["joint_dim"] = int(JOINT_DIM)
         print(f"Saved {num_samples} samples (images + images_side + joint_configs + final_joint_config + object_location) to {out_path}")
+
+        if getattr(args, "export_train_arm_scene", False):
+            obj_path, dim_path = _export_train_arm_scene_dataset(
+                output_dir=run_dir,
+                table_pose=table_pose,
+                table_dims=table_dims,
+                object_reader_tracker=object_reader_tracker,
+            )
+            print(f"Exported train_arm scene mesh: {obj_path}")
+            print(f"Exported train_arm dim file: {dim_path}")
     else:
         print(f"No samples captured. Keep the viewer open longer (~0.5 sec per waypoint).")
-        print(f"Would have saved to: {collected_dir}/grasp_6dof_demo_*.h5")
+        print(f"Would have saved to: {collected_dir}/<timestamp>/grasp_6dof_demo_<timestamp>.h5")
 
     print('Test Completed Successfully!!')
     if viewer is not None:

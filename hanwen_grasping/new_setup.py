@@ -70,7 +70,8 @@ num_of_envs = 1
 row_num_of_envs = int(math.sqrt(num_of_envs))
 
 #env settings
-choose = np.random.randint(2)
+choose = 0
+#np.random.randint(2)
 if choose == 0:
     max_drawer_height = 0.40
     min_drawer_height = 0.40
@@ -90,9 +91,10 @@ else:
 piece_width = 0.03
 max_scaling_factor = 0
 fall_height = table_dims.z
-ADD_COVER = False
+ADD_COVER = True
 
-TARGET_OBJ_INDEX = [1, 3, 5]
+TARGET_OBJ_INDEX = [5]
+[1, 3, 5]
 MIN_RADIUS = 0.03471716871486391
 
 NUM_OF_OBJECTS = np.random.randint(MIN_NUM_OBSTACLES + 1, MAX_NUM_OBSTACLES + 1)

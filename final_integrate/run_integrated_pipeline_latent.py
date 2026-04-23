@@ -450,7 +450,7 @@ def main() -> None:
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if args.output_dir:
-        session_dir = os.path.abspath(args.output_dir)
+        session_dir = os.path.join(os.path.abspath(args.output_dir), stamp)
     else:
         session_dir = os.path.join(_PI_VLA_ROOT, "output", "final_integrate", stamp)
     os.makedirs(session_dir, exist_ok=True)
@@ -992,11 +992,13 @@ def main() -> None:
         args.latent_device,
     )
 
-    fourier_pred = _infer_fourier_on_image(
-        rgb_top,
-        _resolve_under_root(args.fourier_checkpoint),
-        args.fourier_device,
-    )
+    fourier_pred: Optional[np.ndarray] = None
+    if args.fourier_checkpoint is not None:
+        fourier_pred = _infer_fourier_on_image(
+            rgb_top,
+            _resolve_under_root(args.fourier_checkpoint),
+            args.fourier_device,
+        )
 
     latent_goal_true: Optional[np.ndarray] = None
     if q_goal_true is not None:
@@ -1029,10 +1031,14 @@ def main() -> None:
     _run_ntfield_video_with_goal_latent(latent_goal_pred, mp4_pred_latent, "predicted_latent_goal")
     _run_ntfield_video_with_goal_latent(latent_goal_true, mp4_true_latent, "original_latent_goal")
 
-    mp4_pred_fourier = os.path.join(session_dir, "ntfield_trajectory_predicted_goal_fourier.mp4")
-    mp4_true_fourier = os.path.join(session_dir, "ntfield_trajectory_original_goal_fourier.mp4")
-    _run_ntfield_video_with_fourier_features(fourier_pred, mp4_pred_fourier, "predicted_fourier_goal")
-    _run_ntfield_video_with_fourier_features(None, mp4_true_fourier, "original_fourier_goal")
+    if args.fourier_checkpoint is not None:
+        mp4_pred_fourier = os.path.join(session_dir, "ntfield_trajectory_predicted_goal_fourier.mp4")
+        mp4_true_fourier = os.path.join(session_dir, "ntfield_trajectory_original_goal_fourier.mp4")
+        _run_ntfield_video_with_fourier_features(fourier_pred, mp4_pred_fourier, "predicted_fourier_goal")
+        _run_ntfield_video_with_fourier_features(None, mp4_true_fourier, "original_fourier_goal")
+    else:
+        summary["videos"]["predicted_fourier_goal"] = None
+        summary["videos"]["original_fourier_goal"] = None
 
     with open(os.path.join(session_dir, "latent_goal_pred.json"), "w", encoding="utf-8") as f:
         json.dump({"latent_goal": latent_goal_pred.tolist()}, f, indent=2)

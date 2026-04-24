@@ -75,3 +75,5 @@ hanwen_grasping/checkpoints/
 img2objloc_model/checkpoints/sam_vit_h_4b8939.pth
 
 NTField_scaling/merged_h5/
+
+archive/

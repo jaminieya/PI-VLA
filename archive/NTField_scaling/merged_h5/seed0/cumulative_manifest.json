@@ -1,0 +1,86 @@
+{
+  "chunks_root": "/media/corallab-s1/4tbhdd/junheelim/PI-VLA/NTField_scaling/chunks/seed0",
+  "merged_root": "/media/corallab-s1/4tbhdd/junheelim/PI-VLA/NTField_scaling/merged_h5/seed0",
+  "levels": [
+    {
+      "id": "cumulative_000",
+      "num_files": 50
+    },
+    {
+      "id": "cumulative_001",
+      "num_files": 100
+    },
+    {
+      "id": "cumulative_002",
+      "num_files": 150
+    },
+    {
+      "id": "cumulative_003",
+      "num_files": 200
+    },
+    {
+      "id": "cumulative_004",
+      "num_files": 250
+    },
+    {
+      "id": "cumulative_005",
+      "num_files": 300
+    },
+    {
+      "id": "cumulative_006",
+      "num_files": 350
+    },
+    {
+      "id": "cumulative_007",
+      "num_files": 400
+    },
+    {
+      "id": "cumulative_008",
+      "num_files": 450
+    },
+    {
+      "id": "cumulative_009",
+      "num_files": 500
+    },
+    {
+      "id": "cumulative_010",
+      "num_files": 550
+    },
+    {
+      "id": "cumulative_011",
+      "num_files": 600
+    },
+    {
+      "id": "cumulative_012",
+      "num_files": 650
+    },
+    {
+      "id": "cumulative_013",
+      "num_files": 700
+    },
+    {
+      "id": "cumulative_014",
+      "num_files": 750
+    },
+    {
+      "id": "cumulative_015",
+      "num_files": 800
+    },
+    {
+      "id": "cumulative_016",
+      "num_files": 850
+    },
+    {
+      "id": "cumulative_017",
+      "num_files": 900
+    },
+    {
+      "id": "cumulative_018",
+      "num_files": 950
+    },
+    {
+      "id": "cumulative_019",
+      "num_files": 960
+    }
+  ]
+}

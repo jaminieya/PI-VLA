@@ -511,6 +511,24 @@ def main() -> None:
 
         return [p * NTFIELD_SCALE for p in path_norm]
 
+    # ── Success-checking helpers ─────────────────────────────────────────────
+    def _get_end_effector_position(
+        gym_inst, sim_inst, env_inst, ur_handle
+    ) -> np.ndarray:
+        """Return world-space XYZ of the end-effector (last rigid body = tool0 link)."""
+        rigid_states = gym_inst.get_actor_rigid_body_states(
+            env_inst, ur_handle, gymapi.STATE_POS
+        )
+        ee_state = rigid_states[-1]
+        return np.array(
+            [ee_state["pose"]["p"]["x"],
+             ee_state["pose"]["p"]["y"],
+             ee_state["pose"]["p"]["z"]],
+            dtype=np.float64,
+        )
+
+    SUCCESS_THRESHOLD_M = 0.10   # metres — tune to your task
+
     # ── Execute and record trajectory ────────────────────────────────────────
     reset_arm_to_q(gym, sim, env, ur, spj, slj, ej, wj1, wj2, wj3, viewer, q_start_live, n_steps=200)
 
@@ -538,9 +556,36 @@ def main() -> None:
         )
         _save_mp4_rgb(frames_nt, mp4_path, fps=args.video_fps)
         summary["videos"]["predicted_latent_goal"] = mp4_path
+
+        # ── Distance / success check ─────────────────────────────────────────
+        ee_pos = _get_end_effector_position(gym, sim, env, ur)
+        target_pos = np.array([ox, oy, oz], dtype=np.float64)
+        ee_to_target_dist = float(np.linalg.norm(ee_pos - target_pos))
+        success = ee_to_target_dist <= SUCCESS_THRESHOLD_M
+
+        summary["success_check"] = {
+            "ee_position_m":       ee_pos.tolist(),
+            "target_position_m":   target_pos.tolist(),
+            "ee_to_target_dist_m": ee_to_target_dist,
+            "threshold_m":         SUCCESS_THRESHOLD_M,
+            "success":             success,
+        }
+        print(
+            f"[success_check]  EE={ee_pos.round(4).tolist()}  "
+            f"target={target_pos.round(4).tolist()}  "
+            f"dist={ee_to_target_dist:.4f} m  "
+            f"{'✓ SUCCESS' if success else '✗ FAILURE'}  (thr={SUCCESS_THRESHOLD_M} m)"
+        )
     else:
         print("[warn] NTField planner returned an empty path.")
         summary["videos"]["predicted_latent_goal"] = None
+        summary["success_check"] = {
+            "ee_position_m":       None,
+            "target_position_m":   [ox, oy, oz],
+            "ee_to_target_dist_m": None,
+            "threshold_m":         SUCCESS_THRESHOLD_M,
+            "success":             False,
+        }
 
     # ── Save outputs ─────────────────────────────────────────────────────────
     with open(os.path.join(session_dir, "latent_goal_pred.json"), "w", encoding="utf-8") as f:

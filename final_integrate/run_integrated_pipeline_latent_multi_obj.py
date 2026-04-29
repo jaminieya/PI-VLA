@@ -3,10 +3,9 @@
 End-to-end PI-VLA integration (Isaac Gym + NTField + latent goal only).
 
 Run from PI-VLA root::
-
-  python final_integrate/run_integrated_pipeline_latent_only.py \\
-    --ntfield_checkpoint ntrl-demo/Experiments/.../Model_Epoch_*.pt \\
-    --latent_checkpoint models/best_z_goal_model_wonorm_mse_cos.pth
+  python final_integrate/run_integrated_pipeline_latent_multi_obj.py \
+    --ntfield_checkpoint teacher_model.pt \
+    --latent_checkpoint /home/hojinsohn/VLM-NT/PI-VLA/student_model_training/best_z_goal_model_multi_hybrid_0.5_multi_image_text_prompt_fusion_hybrid_0.5.pth
 
 If ``--output_dir`` is set, outputs go under ``<output_dir>/<timestamp>/``.
 Otherwise under ``output/final_integrate/<timestamp>/``.
@@ -35,6 +34,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -82,46 +82,144 @@ def _process_img(img: np.ndarray, img_size: int):
 
 
 # ---------------------------------------------------------------------------
-# Latent model
+# Text prompt helpers  (must match train_config_wonorm.py exactly)
 # ---------------------------------------------------------------------------
 
-def _get_latent_model(output_dim: int = 256):
-    """Matches StudentModelWonorm from train_config_wonorm.py."""
-    import torch.nn as nn
-    import torchvision.models as models
+def _tokenize_prompt(text: str) -> list:
+    return re.findall(r"[a-z0-9]+", text.lower())
 
-    class StudentHead(nn.Module):
-        def __init__(self, in_features, output_dim):
+
+def _encode_prompts(
+    prompts: list,
+    token_to_id: dict,
+    max_len: int,
+):
+    """Encode a list of prompt strings to a (N, max_len) LongTensor."""
+    import torch
+
+    pad_id = token_to_id.get("<pad>", 0)
+    unk_id = token_to_id.get("<unk>", 1)
+    out = torch.full((len(prompts), max_len), pad_id, dtype=torch.long)
+    for i, p in enumerate(prompts):
+        toks = _tokenize_prompt(p)[:max_len]
+        if not toks:
+            toks = ["<unk>"]
+        ids = [token_to_id.get(t, unk_id) for t in toks]
+        out[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Model definition  — must mirror StudentModelWonorm in train_config_wonorm.py
+# ---------------------------------------------------------------------------
+
+def _build_resnet18_backbone():
+    """Build ResNet18 backbone across torchvision versions."""
+    import torchvision.models as models
+    import torch.nn as nn
+
+    try:
+        backbone = models.resnet18(weights=None)
+    except TypeError:
+        backbone = models.resnet18(pretrained=False)
+    in_features = backbone.fc.in_features   # 512 for ResNet18
+    backbone.fc = nn.Identity()
+    return backbone, in_features
+
+
+def _get_latent_model(output_dim: int, vocab_size: int, text_embed_dim: int = 32):
+    """
+    Builds StudentModelWonorm: frozen ResNet18 backbone + lightweight adapter
+    + text prompt encoder fused into a two-layer MLP head.
+    Matches the updated architecture in train_config_wonorm.py.
+
+    Falls back gracefully when vocab_size is None/0 so that legacy
+    checkpoints (without a text encoder) still load correctly.
+    """
+    import torch
+    import torch.nn as nn
+
+    backbone, in_features = _build_resnet18_backbone()
+
+    # Freeze entire backbone — matches freeze_backbone=True, unfreeze_layers=()
+    for param in backbone.parameters():
+        param.requires_grad = False
+
+    class _TextPromptEncoder(nn.Module):
+        def __init__(self, vocab_size: int, embed_dim: int):
             super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(in_features, 512),
+            self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+
+        def forward(self, token_ids):
+            emb = self.embed(token_ids)                         # (B, T, D)
+            mask = (token_ids != 0).unsqueeze(-1).float()
+            denom = mask.sum(dim=1).clamp_min(1.0)
+            return (emb * mask).sum(dim=1) / denom              # (B, D)
+
+    class _StudentModelWonorm(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = backbone
+
+            # Adapter: projects frozen backbone output → 256-dim
+            self.adapter = nn.Sequential(
+                nn.Linear(in_features, 256),    # 512 → 256
                 nn.ReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(512, output_dim),
             )
 
-        def forward(self, x):
-            return self.net(x)
+            self.text_encoder = _TextPromptEncoder(
+                vocab_size=vocab_size,
+                embed_dim=text_embed_dim,       # 32
+            )
 
-    class StudentModel(nn.Module):
-        def __init__(self, output_dim):
-            super().__init__()
-            try:
-                backbone = models.resnet18(weights=None)
-            except TypeError:
-                backbone = models.resnet18(pretrained=False)
-            in_features = backbone.fc.in_features
-            backbone.fc = nn.Identity()
-            self.backbone = backbone
-            self.head = StudentHead(in_features, output_dim)
+            # Head: fused (256 + 32) → 256 → output_dim
+            self.head = nn.Sequential(
+                nn.Linear(256 + text_embed_dim, 256),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(256, output_dim),
+            )
 
-        def forward(self, x):
-            return self.head(self.backbone(x))
+        def forward(self, x, text_tokens):
+            with torch.no_grad():               # backbone always frozen at inference
+                image_feat = self.backbone(x)   # (B, 512)
+            adapted = self.adapter(image_feat)  # (B, 256)
+            text_feat = self.text_encoder(text_tokens)  # (B, 32)
+            fused = torch.cat([adapted, text_feat], dim=1)  # (B, 288)
+            return self.head(fused)             # (B, output_dim)
 
-    return StudentModel(output_dim)
+    return _StudentModelWonorm()
 
 
-def _infer_latent_on_image(image: np.ndarray, checkpoint_path: str, device: str) -> np.ndarray:
+# ---------------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------------
+
+def _infer_latent_on_image(
+    image: np.ndarray,
+    checkpoint_path: str,
+    device: str,
+    object_name: str = "object",
+) -> np.ndarray:
+    """
+    Run image→latent inference using the checkpoint.
+
+    Supports both the legacy image-only checkpoint and the new
+    image + text-prompt checkpoint produced by train_config_wonorm.py.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        RGB image (H×W×3, uint8).
+    checkpoint_path : str
+        Path to the ``.pth`` checkpoint.
+    device : str
+        ``"auto"``, ``"cpu"``, or a CUDA device string such as ``"cuda:0"``.
+    object_name : str
+        Object name used to build the text prompt (e.g. ``"bleach cleanser"``).
+        Defaults to ``"object"`` which matches the fallback used during
+        training for dict-shard samples without an ``object_name`` key.
+    """
     import torch
     from torchvision import transforms
 
@@ -129,10 +227,29 @@ def _infer_latent_on_image(image: np.ndarray, checkpoint_path: str, device: str)
         "cuda" if torch.cuda.is_available() and device == "auto" else device
     )
     ckpt = torch.load(os.path.abspath(checkpoint_path), map_location=dev)
-    z_dim = ckpt.get("z_dim", 256)
 
-    model = _get_latent_model(output_dim=z_dim).to(dev)
-    model.load_state_dict(ckpt["model_state_dict"])
+    z_dim = ckpt.get("z_dim", 256)
+    vocab_size: Optional[int] = ckpt.get("vocab_size", None)
+    token_to_id: Optional[dict] = ckpt.get("token_to_id", None)
+    max_prompt_len: int = int(ckpt.get("max_prompt_len", 8))
+
+    model = _get_latent_model(output_dim=z_dim, vocab_size=vocab_size or 0).to(dev)
+    state_dict = ckpt["model_state_dict"]
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as exc:
+        # Compatibility path: some checkpoints store the MLP head under
+        # "head.net.*" while this model defines it as plain "head.*".
+        remapped = {}
+        for key, value in state_dict.items():
+            if key.startswith("head.net."):
+                remapped[key.replace("head.net.", "head.", 1)] = value
+            else:
+                remapped[key] = value
+        try:
+            model.load_state_dict(remapped)
+        except RuntimeError:
+            raise exc
     model.eval()
 
     normalize = transforms.Normalize(
@@ -140,8 +257,18 @@ def _infer_latent_on_image(image: np.ndarray, checkpoint_path: str, device: str)
     )
     x = _process_img(image, 224).unsqueeze(0)
     x = normalize(x).to(dev)
+
     with torch.no_grad():
-        pred = model(x).squeeze(0).cpu().numpy()
+        if token_to_id:
+            prompt = f"grasp {object_name.strip().lower()}"
+            text_tokens = _encode_prompts(
+                [prompt], token_to_id, max_prompt_len
+            ).to(dev)
+        else:
+            # Compatibility path: text-conditioned checkpoints that do not
+            # include tokenizer metadata. Use an all-padding prompt.
+            text_tokens = torch.zeros((1, max_prompt_len), dtype=torch.long, device=dev)
+        pred = model(x, text_tokens).squeeze(0).cpu().numpy()
     return pred
 
 
@@ -162,8 +289,6 @@ def main() -> None:
         TABLE_DIMS_Y,
         TABLE_DIMS_Z,
         DRAWER_HEIGHT,
-        NUM_OF_OBJECTS,
-        TARGET_OBJ_INDEX,
         execute_path_and_time,
         get_swept_volume_size,
         reset_arm_to_q,
@@ -187,6 +312,21 @@ def main() -> None:
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Base dir; session is <output_dir>/TIMESTAMP (default: output/final_integrate/TIMESTAMP)")
     parser.add_argument("--object_z", type=float, default=0.18)
+    parser.add_argument(
+        "--target_obj_indices",
+        type=str,
+        default="1,3,5",
+        help=(
+            "Comma-separated object indices from object_urdf_grasp.txt. "
+            "Default matches multi-object collector: 1,3,5."
+        ),
+    )
+    parser.add_argument(
+        "--num_objects",
+        type=int,
+        default=3,
+        help="How many distinct objects to place (default: 3).",
+    )
     parser.add_argument("--ox_min", type=float, default=0.42)
     parser.add_argument("--ox_max", type=float, default=0.98)
     parser.add_argument("--oy_min", type=float, default=-0.38)
@@ -200,8 +340,18 @@ def main() -> None:
         help="Force PhysX on CPU (avoids some GPU PhysX + PyTorch interaction crashes).",
     )
     parser.add_argument("--latent_checkpoint", type=str, required=True,
-                        help="Path to image→latent goal checkpoint (ResNet18, output_dim=256)")
+                        help="Path to image→latent goal checkpoint (ResNet18 + text encoder, output_dim=z_dim)")
     parser.add_argument("--latent_device", type=str, default="auto")
+    # NEW: optional override for the object name used to build the text prompt.
+    # When omitted the default "object" prompt is used, which matches the
+    # fallback behaviour during training and is always safe to use.
+    parser.add_argument(
+        "--object_name",
+        type=str,
+        default=None,
+        help='Object name for the text prompt, e.g. "bleach cleanser". '
+             'Defaults to "object" (same fallback used during training).',
+    )
     parser.add_argument("--ntfield_step_size", type=float, default=0.02)
     parser.add_argument("--ntfield_max_steps", type=int, default=200)
     parser.add_argument("--ntfield_tol", type=float, default=0.01)
@@ -293,6 +443,17 @@ def main() -> None:
     if args.seed is not None:
         np.random.seed(args.seed)
 
+    target_obj_index: List[int] = [
+        int(x.strip()) for x in str(args.target_obj_indices).split(",") if x.strip()
+    ]
+    num_objects = int(args.num_objects)
+    if num_objects <= 0:
+        raise SystemExit("--num_objects must be >= 1")
+    if len(target_obj_index) < num_objects:
+        raise SystemExit(
+            f"Need at least {num_objects} indices in --target_obj_indices, got {len(target_obj_index)}"
+        )
+
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if args.output_dir:
         session_dir = os.path.join(os.path.abspath(args.output_dir), stamp)
@@ -300,8 +461,6 @@ def main() -> None:
         session_dir = os.path.join(_PI_VLA_ROOT, "output", "final_integrate", stamp)
     os.makedirs(session_dir, exist_ok=True)
 
-    ox = float(np.random.uniform(args.ox_min, args.ox_max))
-    oy = float(np.random.uniform(args.oy_min, args.oy_max))
     oz = float(args.object_z)
 
     ckpt_abs = _resolve_under_root(args.ntfield_checkpoint)
@@ -444,6 +603,10 @@ def main() -> None:
     trans_table = fcl.Transform(np.array([table_dims.x * 0.5 + 0.3, 0.0, table_dims.z * 0.5]))
     table_obj = fcl.CollisionObject(col_table, trans_table)
     object_collision_models = [table_obj]
+    table_x_min = table_pose.p.x - table_dims.x * 0.5 + 0.05
+    table_x_max = table_pose.p.x + table_dims.x * 0.5 - 0.10
+    table_y_min = table_pose.p.y - table_dims.y * 0.5 + 0.10
+    table_y_max = table_pose.p.y + table_dims.y * 0.5 - 0.20
     plane_normal = np.array([0.0, 0.0, 1.0], dtype=np.float64)
     col_plane = fcl.Plane(plane_normal, 0.0)
     plane_obj = fcl.CollisionObject(col_plane, fcl.Transform())
@@ -458,8 +621,13 @@ def main() -> None:
     object_status_list: List[Any] = []
     object_reader_tracker: List[Any] = []
     object_collision_lib: List[Any] = []
+    placed_object_locations: List[List[float]] = []
     spj = slj = ej = wj1 = wj2 = wj3 = None
-    target_file_idx = np.array(TARGET_OBJ_INDEX)
+    if len(target_obj_index) < num_objects:
+        raise RuntimeError(
+            f"Need at least {num_objects} entries in target object list, got {len(target_obj_index)}"
+        )
+    target_file_idx = np.random.choice(target_obj_index, num_objects, replace=False)
     main_cam_handle = None
     top_cam_handle = None
 
@@ -477,12 +645,17 @@ def main() -> None:
         objs_manager = fcl.DynamicAABBTreeCollisionManager()
         objs_manager.setup()
         obstacle_objs: List[Any] = []
+        gt_obj_pos_list: List[List[float]] = []
+        gt_target_pos = [
+            float(np.random.uniform(max(table_x_min, 0.20 + table_dims.x / 2), table_x_max)),
+            float(np.random.uniform(table_y_min, table_y_max)),
+            float(oz),
+        ]
 
-        object_scaling_factor = np.ones(NUM_OF_OBJECTS, dtype=np.float64)
+        object_scaling_factor = np.ones(num_objects, dtype=np.float64)
 
-        for k in range(NUM_OF_OBJECTS):
+        for k in range(num_objects):
             object_pose = gymapi.Transform()
-            object_pose.p = gymapi.Vec3(ox, oy, oz)
             file_path = object_collision_files[target_file_idx[k]]
             collision_mesh = obj_reader(asset_root + file_path)
             collision_mesh.set_scale(object_scaling_factor[k])
@@ -494,7 +667,36 @@ def main() -> None:
             m.beginModel(len(verts), len(tris))
             m.addSubModel(verts, tris)
             m.endModel()
-            t = fcl.Transform(np.array([ox, oy, oz]))
+            is_collision = True
+            tx = ty = 0.0
+            while is_collision:
+                tx = float(np.random.uniform(table_x_min, table_x_max))
+                ty = float(np.random.uniform(table_y_min, table_y_max))
+                t = fcl.Transform(np.array([tx, ty, oz]))
+
+                req = fcl.CollisionRequest()
+                rdata = fcl.CollisionData(request=req)
+                objs_manager.collide(
+                    fcl.CollisionObject(m, t), rdata, fcl.defaultCollisionCallback
+                )
+                is_collision = rdata.result.is_collision
+
+                if not is_collision:
+                    dist_target = float(
+                        np.sqrt((tx - gt_target_pos[0]) ** 2 + (ty - gt_target_pos[1]) ** 2)
+                    )
+                    if dist_target <= 0.2:
+                        is_collision = True
+                        continue
+                    for obj_xy in gt_obj_pos_list:
+                        dist_obj = float(np.sqrt((tx - obj_xy[0]) ** 2 + (ty - obj_xy[1]) ** 2))
+                        if dist_obj <= 0.16:
+                            is_collision = True
+                            break
+
+            object_pose.p = gymapi.Vec3(tx, ty, oz)
+            gt_obj_pos_list.append([tx, ty])
+            placed_object_locations.append([tx, ty, float(oz)])
             object_handles.append(
                 gym.create_actor(
                     envs[-1],
@@ -579,9 +781,34 @@ def main() -> None:
     top_view_path = os.path.join(session_dir, "top_view.png")
     cv2.imwrite(top_view_path, cv2.cvtColor(rgb_top, cv2.COLOR_RGB2BGR))
 
-    object_location = [float(ox), float(oy), float(oz)]
+    object_location = placed_object_locations[0] if placed_object_locations else [0.0, 0.0, float(oz)]
     with open(os.path.join(session_dir, "object_location.json"), "w", encoding="utf-8") as f:
-        json.dump({"xyz_m": object_location}, f, indent=2)
+        json.dump(
+            {
+                "xyz_m": object_location,
+                "xyz_m_all": placed_object_locations,
+            },
+            f,
+            indent=2,
+        )
+
+    # ── Determine the object name for the text prompt ────────────────────────
+    # Use --object_name if provided; otherwise derive a best-effort name from
+    # the YCB asset path for the target object (e.g. "003_cracker_box" →
+    # "cracker box").  Falls back to the neutral "object" string which matches
+    # the training-time default for unlabelled dict-shard samples.
+    if args.object_name:
+        infer_object_name = args.object_name.strip()
+    else:
+        try:
+            raw_fname = object_asset_files[target_file_idx[0]]
+            # YCB names look like "003_cracker_box/..." — strip the numeric prefix
+            stem = raw_fname.split("/")[-2] if "/" in raw_fname else raw_fname
+            stem = re.sub(r"^\d+_", "", stem)          # remove leading digits+underscore
+            infer_object_name = stem.replace("_", " ")
+        except Exception:
+            infer_object_name = "object"
+    print(f"[latent] Using object name for text prompt: '{infer_object_name}'", flush=True)
 
     # ── Get live q_start ─────────────────────────────────────────────────────
     dof_snapshot = gym.get_actor_dof_states(env, ur, gymapi.STATE_POS)
@@ -611,7 +838,7 @@ def main() -> None:
             grasp_data = np.load(grasp_file, allow_pickle=True)
             grasp_list = np.arange(len(grasp_data))
             np.random.shuffle(grasp_list)
-            true_xy = np.array([ox, oy], dtype=np.float64)
+            true_xy = np.array(object_location[:2], dtype=np.float64)
             target_idx = 0
             q_goal_true, _, _ = find_grasp_q_goal(
                 rac,
@@ -642,6 +869,7 @@ def main() -> None:
         rgb_top,
         _resolve_under_root(args.latent_checkpoint),
         args.latent_device,
+        object_name=infer_object_name,    # <-- new: pass object name
     )
     latent_goal_true: Optional[np.ndarray] = None
     if q_goal_true is not None:
@@ -670,39 +898,24 @@ def main() -> None:
         else float(args.ntfield_step_size) * 0.25
     )
 
-    summary: Dict[str, Any] = {
-        "session_dir": session_dir,
-        "object_pose_world_m": object_location,
-        "q_start_live": q_start_live.tolist(),
-        "q_goal_original_found": q_goal_true is not None,
-        "videos": {},
-        "ntfield_refine_max_steps": refine_max,
-        "ntfield_refine_step_size": refine_step,
-        "ntfield_refine_step_size_factor": args.ntfield_refine_step_size_factor,
-        "ntfield_refine_delta_clamp_rad": refine_delta_clamp_rad,
-        "note": (
-            "Latent planners minimize NTField latent distance to z_target; that is not joint "
-            "tracking to q_goal_true, so low ntfield_final_latent_dist does not imply the arm "
-            "reaches the grasp pose. Compare ntfield_*_vs_q_goal (endpoint L2/Linf vs q_goal_true) "
-            "with ntfield_trajectory_original_goal (joint-space NTField). When grasp succeeds, "
-            "joint + teacher-latent runs use the same ntfield_delta_clamp_rad / refine / stagnate; "
-            "optional refine-only overrides: --ntfield_refine_step_size_factor, "
-            "--ntfield_refine_delta_clamp_rad."
-        ),
-        "ntfield_stagnate_max_steps": int(args.ntfield_stagnate_max_steps),
-        "ntfield_stagnate_patience": int(args.ntfield_stagnate_patience),
-        "ntfield_stagnate_rel_eps": float(args.ntfield_stagnate_rel_eps),
-        "ntfield_stagnate_step_size": stagnate_step,
-    }
+    true_latent_error: Optional[Dict[str, float]] = None
     if latent_goal_true is not None:
         latent_diff = latent_goal_pred - latent_goal_true
-        summary["latent_goal_comparison"] = {
+        true_latent_error = {
             "mse": float(np.mean(np.square(latent_diff))),
             "l2": float(np.linalg.norm(latent_diff)),
             "max_abs": float(np.max(np.abs(latent_diff))),
         }
-    else:
-        summary["latent_goal_comparison"] = None
+    prompt_text = f"grasp {infer_object_name.strip().lower()}"
+    summary: Dict[str, Any] = {
+        "session_dir": session_dir,
+        "prompt": prompt_text,
+        "predicted_video": None,
+        "true_latent_error": true_latent_error,
+        "status": "Failure",
+        "planner_stop_reason": None,
+        "ntfield_final_latent_dist": None,
+    }
 
     # ── Gradient planner using predicted latent goal ─────────────────────────
     def ntfield_plan_gradient_with_goal_latent(
@@ -1004,10 +1217,12 @@ def main() -> None:
                 planner_playback=args.planner_playback,
             )
             _save_mp4_rgb(frames_nt, mp4_path, fps=args.video_fps)
-            summary["videos"][summary_label] = mp4_path
+            if summary_label == "predicted_latent_goal":
+                summary["predicted_video"] = mp4_path
         else:
             print(f"[warn] NTField planner returned an empty path ({summary_label}).")
-            summary["videos"][summary_label] = None
+            if summary_label == "predicted_latent_goal":
+                summary["predicted_video"] = None
 
     # ── Predicted latent goal (image) ────────────────────────────────────────
     path_pred, meta_pred = ntfield_plan_gradient_with_goal_latent(
@@ -1028,101 +1243,14 @@ def main() -> None:
         stagnate_step_size=stagnate_step,
     )
     summary["ntfield_final_latent_dist"] = meta_pred["final_latent_dist"]
-    summary["ntfield_planner_stopped"] = meta_pred["stopped"]
-    if q_goal_true is not None and path_pred:
-        summary["ntfield_predicted_latent_vs_q_goal"] = _path_end_joint_err_vs_goal(
-            path_pred, q_goal_true
-        )
-    else:
-        summary["ntfield_predicted_latent_vs_q_goal"] = None
+    summary["planner_stop_reason"] = meta_pred["stopped"]
+    if isinstance(meta_pred["stopped"], str) and meta_pred["stopped"].startswith("latent_tol"):
+        summary["status"] = "Success"
 
     mp4_path = os.path.join(session_dir, "ntfield_trajectory_predicted_latent_goal.mp4")
     _record_ntfield_path(path_pred, "predicted_latent_goal", mp4_path, "predicted_latent_goal")
 
-    # ── Same clamp schedule: teacher latent at true grasp + joint true goal ──
-    if q_goal_true is not None and not args.no_ground_truth_ntfield_compare:
-        mp4_joint = os.path.join(session_dir, "ntfield_trajectory_original_goal.mp4")
-        path_joint, meta_joint = ntfield_plan_joint_gradient(
-            nt_model,
-            q_start_live,
-            q_goal_true,
-            step_size=args.ntfield_step_size,
-            max_steps=args.ntfield_max_steps,
-            tol=args.ntfield_tol,
-            device=ntfield_device_str,
-            delta_clamp_rad=args.ntfield_delta_clamp_rad,
-            refine_max_steps=refine_max,
-            refine_step_size=refine_step,
-            refine_delta_clamp_rad=refine_delta_clamp_rad,
-            stagnate_max_steps=int(args.ntfield_stagnate_max_steps),
-            stagnate_patience=int(args.ntfield_stagnate_patience),
-            stagnate_rel_eps=float(args.ntfield_stagnate_rel_eps),
-            stagnate_step_size=stagnate_step,
-        )
-        summary["ntfield_original_goal_joint_err_norm"] = meta_joint["final_joint_err_norm"]
-        summary["ntfield_original_goal_joint_err_rad"] = meta_joint["final_joint_err_rad"]
-        summary["ntfield_original_goal_joint_stopped"] = meta_joint["stopped"]
-        _record_ntfield_path(path_joint, "original_goal", mp4_joint, "original_goal")
-
-        if latent_goal_true is not None:
-            mp4_true_latent = os.path.join(
-                session_dir, "ntfield_trajectory_original_goal_latent.mp4"
-            )
-            path_true_z, meta_true_z = ntfield_plan_gradient_with_goal_latent(
-                nt_net,
-                q_start_live.reshape(1, -1),
-                latent_goal_true.reshape(1, -1),
-                step_size=args.ntfield_step_size,
-                max_steps=args.ntfield_max_steps,
-                tol=args.ntfield_tol,
-                device=ntfield_device_str,
-                delta_clamp_rad=args.ntfield_delta_clamp_rad,
-                refine_max_steps=refine_max,
-                refine_step_size=refine_step,
-                refine_delta_clamp_rad=refine_delta_clamp_rad,
-                stagnate_max_steps=int(args.ntfield_stagnate_max_steps),
-                stagnate_patience=int(args.ntfield_stagnate_patience),
-                stagnate_rel_eps=float(args.ntfield_stagnate_rel_eps),
-                stagnate_step_size=stagnate_step,
-            )
-            summary["ntfield_original_goal_latent_final_dist"] = meta_true_z["final_latent_dist"]
-            summary["ntfield_original_goal_latent_stopped"] = meta_true_z["stopped"]
-            if path_true_z:
-                summary["ntfield_original_latent_vs_q_goal"] = _path_end_joint_err_vs_goal(
-                    path_true_z, q_goal_true
-                )
-            else:
-                summary["ntfield_original_latent_vs_q_goal"] = None
-            _record_ntfield_path(
-                path_true_z,
-                "original_latent_goal",
-                mp4_true_latent,
-                "original_latent_goal",
-            )
-        else:
-            summary["ntfield_original_goal_latent_final_dist"] = None
-            summary["ntfield_original_goal_latent_stopped"] = None
-            summary["videos"]["original_latent_goal"] = None
-            summary["ntfield_original_latent_vs_q_goal"] = None
-    else:
-        summary["ntfield_original_goal_joint_err_norm"] = None
-        summary["ntfield_original_goal_joint_err_rad"] = None
-        summary["ntfield_original_goal_joint_stopped"] = None
-        summary["ntfield_original_goal_latent_final_dist"] = None
-        summary["ntfield_original_goal_latent_stopped"] = None
-        summary["ntfield_original_latent_vs_q_goal"] = None
-        summary["videos"]["original_goal"] = None
-        summary["videos"]["original_latent_goal"] = None
-
     # ── Save outputs ─────────────────────────────────────────────────────────
-    with open(os.path.join(session_dir, "latent_goal_pred.json"), "w", encoding="utf-8") as f:
-        json.dump({"latent_goal": latent_goal_pred.tolist()}, f, indent=2)
-    with open(os.path.join(session_dir, "latent_goal_true.json"), "w", encoding="utf-8") as f:
-        json.dump(
-            {"latent_goal": None if latent_goal_true is None else latent_goal_true.tolist()},
-            f,
-            indent=2,
-        )
     with open(os.path.join(session_dir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 

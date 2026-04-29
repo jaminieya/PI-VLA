@@ -1,0 +1,36 @@
+nohup: ignoring input
+Starting multi-object collection:
+  total runs:      10000
+  GPUs:            3 (0,1,2)
+  base output dir: output/multi_obj/20260421
+  logs dir:        /home/hojinsohn/VLM-NT/PI-VLA/hanwen_grasping/collect_data/logs
+
+GPU 0 -> 3334 runs, output: output/multi_obj/20260421/gpu0
+GPU 1 -> 3333 runs, output: output/multi_obj/20260421/gpu1
+GPU 2 -> 3333 runs, output: output/multi_obj/20260421/gpu2
+
+Workers started:
+  GPU 0 log: /home/hojinsohn/VLM-NT/PI-VLA/hanwen_grasping/collect_data/logs/multi_obj_collect_gpu0.log
+  GPU 1 log: /home/hojinsohn/VLM-NT/PI-VLA/hanwen_grasping/collect_data/logs/multi_obj_collect_gpu1.log
+  GPU 2 log: /home/hojinsohn/VLM-NT/PI-VLA/hanwen_grasping/collect_data/logs/multi_obj_collect_gpu2.log
+Use: tail -f /home/hojinsohn/VLM-NT/PI-VLA/hanwen_grasping/collect_data/logs/multi_obj_collect_gpu0.log
+
+run_multi_obj_collect_10000.sh: line 91: 1368227 Killed                  ( FAILURES=0; for i in $(seq 1 "$RUNS_FOR_GPU");
+do
+    echo "[$(date '+%F %T')] [GPU $gpu] run ${i}/${RUNS_FOR_GPU}"; if ! CUDA_VISIBLE_DEVICES="$gpu" python collect_data/collect_multi_obj_data_for_student.py --headless --output_dir "$WORKER_OUTPUT_DIR"; then
+        FAILURES=$((FAILURES + 1)); echo "[$(date '+%F %T')] [GPU $gpu] WARNING: run ${i}/${RUNS_FOR_GPU} failed";
+    fi;
+done; echo "[$(date '+%F %T')] [GPU $gpu] done. failures=$FAILURES" ) > "$LOG_FILE" 2>&1
+run_multi_obj_collect_10000.sh: line 91: 1368228 Killed                  ( FAILURES=0; for i in $(seq 1 "$RUNS_FOR_GPU");
+do
+    echo "[$(date '+%F %T')] [GPU $gpu] run ${i}/${RUNS_FOR_GPU}"; if ! CUDA_VISIBLE_DEVICES="$gpu" python collect_data/collect_multi_obj_data_for_student.py --headless --output_dir "$WORKER_OUTPUT_DIR"; then
+        FAILURES=$((FAILURES + 1)); echo "[$(date '+%F %T')] [GPU $gpu] WARNING: run ${i}/${RUNS_FOR_GPU} failed";
+    fi;
+done; echo "[$(date '+%F %T')] [GPU $gpu] done. failures=$FAILURES" ) > "$LOG_FILE" 2>&1
+run_multi_obj_collect_10000.sh: line 91: 1368230 Killed                  ( FAILURES=0; for i in $(seq 1 "$RUNS_FOR_GPU");
+do
+    echo "[$(date '+%F %T')] [GPU $gpu] run ${i}/${RUNS_FOR_GPU}"; if ! CUDA_VISIBLE_DEVICES="$gpu" python collect_data/collect_multi_obj_data_for_student.py --headless --output_dir "$WORKER_OUTPUT_DIR"; then
+        FAILURES=$((FAILURES + 1)); echo "[$(date '+%F %T')] [GPU $gpu] WARNING: run ${i}/${RUNS_FOR_GPU} failed";
+    fi;
+done; echo "[$(date '+%F %T')] [GPU $gpu] done. failures=$FAILURES" ) > "$LOG_FILE" 2>&1
+All workers finished. Total failures reported: 0

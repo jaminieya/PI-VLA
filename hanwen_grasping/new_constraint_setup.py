@@ -69,36 +69,23 @@ from obj_reader import obj_reader
 num_of_envs = 1
 row_num_of_envs = int(math.sqrt(num_of_envs))
 
-#env settings
-choose = 0
-#np.random.randint(2)
-if choose == 0:
-    max_drawer_height = 0.40
-    min_drawer_height = 0.40
-    MIN_NUM_OBSTACLES = 5
-    MAX_NUM_OBSTACLES = 8
-    # table_dims = gymapi.Vec3(0.56, 0.86, 0.10) # S
-    table_dims = gymapi.Vec3(np.random.uniform(0.5, 0.7), np.random.uniform(0.8, 1.0), 0.10)
-
-else:
-    max_drawer_height = 0.55
-    min_drawer_height = 0.55
-    MIN_NUM_OBSTACLES = 7
-    MAX_NUM_OBSTACLES = 11
-    # table_dims = gymapi.Vec3(0.76, 1.16, 0.10) # L
-    table_dims = gymapi.Vec3(np.random.uniform(0.7, 0.9), np.random.uniform(1.0, 1.2), 0.10)
+#env settings (fixed to match constraint_env/collect_constraint_data.py)
+max_drawer_height = 0.40
+min_drawer_height = 0.40
+MIN_NUM_OBSTACLES = 5
+MAX_NUM_OBSTACLES = 8
+table_dims = gymapi.Vec3(0.8, 1.0, 0.10)
 
 piece_width = 0.03
 max_scaling_factor = 0
 fall_height = table_dims.z
-ADD_COVER = True
+ADD_COVER = False
 
-TARGET_OBJ_INDEX = [5]
-[1, 3, 5]
+TARGET_OBJ_INDEX = [1, 3, 5]
 MIN_RADIUS = 0.03471716871486391
 
 NUM_OF_OBJECTS = np.random.randint(MIN_NUM_OBSTACLES + 1, MAX_NUM_OBSTACLES + 1)
-NUM_OF_OBJECTS = 1
+NUM_OF_OBJECTS = 3
 
 #*************************************************************************************************#
 
@@ -129,6 +116,93 @@ def convert_rgb_image(raw_image):
             for k in range(3):
                 new_image[i][j][k] = raw_image[i][offset+k]
     return new_image
+
+
+def capture_camera_rgb_from_sensor(gym, sim, env, cam_handle, height, width):
+    """
+    Reliable RGB from Isaac Gym IMAGE_COLOR: step graphics, render sensors, then reshape (H,W,4)->RGB.
+    """
+    gym.step_graphics(sim)
+    gym.render_all_camera_sensors(sim)
+    raw = gym.get_camera_image(sim, env, cam_handle, gymapi.IMAGE_COLOR)
+    arr = np.asarray(raw, dtype=np.uint8)
+    expected = int(height) * int(width) * 4
+    if arr.size == expected:
+        rgba = arr.reshape((int(height), int(width), 4))
+        return rgba[..., :3].copy()
+    return convert_rgb_image(raw)
+
+
+def save_rig_camera_outputs(
+    gym,
+    sim,
+    env,
+    output_root,
+    env_id,
+    camera_props,
+    diag_left_handle,
+    diag_right_handle,
+    point_cloud_center_handle,
+    diag_left_cam_pos,
+    diag_left_cam_target,
+    diag_right_cam_pos,
+    diag_right_cam_target,
+    point_cloud_center_cam_pos,
+    point_cloud_center_cam_target,
+    tag=None,
+):
+    """Save three rig cameras to env_*_scene_{diag_left,diag_right,center}_views.npz (+ matching .png)."""
+    h, w = int(camera_props.height), int(camera_props.width)
+    gym.set_camera_location(diag_left_handle, env, diag_left_cam_pos, diag_left_cam_target)
+    gym.set_camera_location(diag_right_handle, env, diag_right_cam_pos, diag_right_cam_target)
+    gym.set_camera_location(point_cloud_center_handle, env, point_cloud_center_cam_pos, point_cloud_center_cam_target)
+
+    dl = capture_camera_rgb_from_sensor(gym, sim, env, diag_left_handle, h, w)
+    dr = capture_camera_rgb_from_sensor(gym, sim, env, diag_right_handle, h, w)
+    pc = capture_camera_rgb_from_sensor(gym, sim, env, point_cloud_center_handle, h, w)
+
+    dlp = np.array([diag_left_cam_pos.x, diag_left_cam_pos.y, diag_left_cam_pos.z], dtype=np.float64)
+    dlt = np.array([diag_left_cam_target.x, diag_left_cam_target.y, diag_left_cam_target.z], dtype=np.float64)
+    drp = np.array([diag_right_cam_pos.x, diag_right_cam_pos.y, diag_right_cam_pos.z], dtype=np.float64)
+    drt = np.array([diag_right_cam_target.x, diag_right_cam_target.y, diag_right_cam_target.z], dtype=np.float64)
+    pcp = np.array(
+        [point_cloud_center_cam_pos.x, point_cloud_center_cam_pos.y, point_cloud_center_cam_pos.z],
+        dtype=np.float64,
+    )
+    pct = np.array(
+        [point_cloud_center_cam_target.x, point_cloud_center_cam_target.y, point_cloud_center_cam_target.z],
+        dtype=np.float64,
+    )
+
+    base = os.path.join(output_root, f"env_{env_id}_{tag}" if tag else f"env_{env_id}")
+    # One bundle per rig camera: env_{id}_scene_{diag_left|diag_right|center}_views.{npz,png}
+    np.savez(
+        f"{base}_scene_diag_left_views.npz",
+        rgb=dl,
+        cam_pos=dlp,
+        cam_target=dlt,
+    )
+    np.savez(
+        f"{base}_scene_diag_right_views.npz",
+        rgb=dr,
+        cam_pos=drp,
+        cam_target=drt,
+    )
+    np.savez(
+        f"{base}_scene_center_views.npz",
+        rgb=pc,
+        cam_pos=pcp,
+        cam_target=pct,
+    )
+    Image.fromarray(dl, "RGB").save(f"{base}_scene_diag_left_views.png")
+    Image.fromarray(dr, "RGB").save(f"{base}_scene_diag_right_views.png")
+    Image.fromarray(pc, "RGB").save(f"{base}_scene_center_views.png")
+    print(
+        f"Saved rig cameras to {base}_scene_diag_left_views.*, {base}_scene_diag_right_views.*, "
+        f"{base}_scene_center_views.*",
+        flush=True,
+    )
+    return dl, dr, pc, dlp, dlt, drp, drt, pcp, pct
 
 def write_to_seg_image(raw_image, image_name):
     x_dim_raw, y_dim_raw = raw_image.shape
@@ -203,6 +277,269 @@ def quaternion_multiply(quaternion1, quaternion0):
                        -x1 * z0 + y1 * w0 + z1 * x0 + w1 * y0,
                        x1 * y0 - y1 * x0 + z1 * w0 + w1 * z0, 
                        -x1 * x0 - y1 * y0 - z1 * z0 + w1 * w0)
+
+
+def _viewer_forward_from_quat(quat):
+    """Compute a world-space forward unit vector from Isaac Gym quaternion."""
+    rot = R.from_quat([quat.x, quat.y, quat.z, quat.w])
+    # Isaac viewer/camera look axis follows OpenGL camera convention: local -Z.
+    return rot.apply(np.array([0.0, 0.0, -1.0], dtype=np.float64))
+
+
+def viewer_eye_target_env_local(gym, viewer, env):
+    """
+    Same convention as set_camera_location / viewer logs: eye and look-at target in env-local coords.
+    Target lies one unit along the viewer forward axis (sufficient for look_at direction).
+    """
+    cam_tf = gym.get_viewer_camera_transform(viewer, env)
+    pos = cam_tf.p
+    cam_dir = _viewer_forward_from_quat(cam_tf.r)
+    tgt = gymapi.Vec3(
+        float(pos.x + cam_dir[0]),
+        float(pos.y + cam_dir[1]),
+        float(pos.z + cam_dir[2]),
+    )
+    return pos, tgt
+
+
+def _mutate_vec3(dst, src):
+    dst.x = float(src.x)
+    dst.y = float(src.y)
+    dst.z = float(src.z)
+
+
+def compute_rig_cameras_table_anchored(table_pose, table_dims):
+    """
+    Three fixed *relative* bearings from the tabletop center: each eye looks at a common
+    target slightly above the table surface. Recomputes every call from table_pose so
+    layout tracks the table actor (same idea as the global camera at (3,0,0.3)->(0,0,0),
+    but tighter multi-view around the workspace).
+    """
+    ax = float(table_pose.p.x)
+    ay = float(table_pose.p.y)
+    az_top = float(table_pose.p.z + table_dims.z * 0.5)
+    # Look-at point on / just above the table.
+    tgt = gymapi.Vec3(ax, ay, az_top + 0.05)
+
+    # Eyes sit in the -X half-space (robot / room side) with +/-Y for diagonals.
+    diag_left_cam_pos = gymapi.Vec3(ax - 0.55, ay + 0.75, az_top + 0.40)
+    diag_left_cam_target = gymapi.Vec3(tgt.x, tgt.y, tgt.z)
+
+    diag_right_cam_pos = gymapi.Vec3(ax - 0.55, ay - 0.75, az_top + 0.40)
+    diag_right_cam_target = gymapi.Vec3(tgt.x, tgt.y, tgt.z)
+
+    point_cloud_center_cam_pos = gymapi.Vec3(ax - 1.05, ay, az_top + 0.35)
+    point_cloud_center_cam_target = gymapi.Vec3(tgt.x, tgt.y, tgt.z)
+
+    return (
+        diag_left_cam_pos,
+        diag_left_cam_target,
+        diag_right_cam_pos,
+        diag_right_cam_target,
+        point_cloud_center_cam_pos,
+        point_cloud_center_cam_target,
+    )
+
+
+def assign_viewer_pose_to_rig_slot(gym, viewer, env, cam_handle, cam_pos, cam_target, log_label, paste_var_prefix):
+    """Copy current viewer eye/target into rig camera Vec3s (mutate in place) and refresh the sensor."""
+    eye, tgt = viewer_eye_target_env_local(gym, viewer, env)
+    _mutate_vec3(cam_pos, eye)
+    _mutate_vec3(cam_target, tgt)
+    gym.set_camera_location(cam_handle, env, cam_pos, cam_target)
+    print(
+        f"[RigAssign {log_label}] env-local eye=({cam_pos.x:.4f}, {cam_pos.y:.4f}, {cam_pos.z:.4f}) "
+        f"target=({cam_target.x:.4f}, {cam_target.y:.4f}, {cam_target.z:.4f})",
+        flush=True,
+    )
+    print(
+        f"    Paste into new_constraint_setup.py:\n"
+        f"        {paste_var_prefix}_pos = gymapi.Vec3({cam_pos.x:.4f}, {cam_pos.y:.4f}, {cam_pos.z:.4f})\n"
+        f"        {paste_var_prefix}_target = gymapi.Vec3({cam_target.x:.4f}, {cam_target.y:.4f}, {cam_target.z:.4f})",
+        flush=True,
+    )
+
+
+def maybe_log_viewer_camera_on_move(gym, viewer, env, cache, camera_props, pos_eps=1e-4, dir_eps=1e-3):
+    """
+    Print viewer camera FOV + pose whenever position or look direction changes.
+    cache format: {"pos": np.array([x,y,z]), "dir": np.array([dx,dy,dz])}
+    """
+    if viewer is None:
+        return
+
+    cam_tf = gym.get_viewer_camera_transform(viewer, env)
+    cam_pos = np.array([cam_tf.p.x, cam_tf.p.y, cam_tf.p.z], dtype=np.float64)
+    cam_dir = _viewer_forward_from_quat(cam_tf.r)
+    cam_target = cam_pos + cam_dir
+    hfov_deg = float(camera_props.horizontal_fov)
+    cw = int(camera_props.width)
+    ch = int(camera_props.height)
+
+    def _emit():
+        print(
+            f"[ViewerCamera env-local] hfov_deg={hfov_deg:.4f} width={cw} height={ch} "
+            f"pos=({cam_pos[0]:.4f}, {cam_pos[1]:.4f}, {cam_pos[2]:.4f}) "
+            f"dir=({cam_dir[0]:.4f}, {cam_dir[1]:.4f}, {cam_dir[2]:.4f}) "
+            f"target=({cam_target[0]:.4f}, {cam_target[1]:.4f}, {cam_target[2]:.4f})",
+            flush=True,
+        )
+
+    if cache["pos"] is None:
+        cache["pos"] = cam_pos.copy()
+        cache["dir"] = cam_dir.copy()
+        _emit()
+        return
+
+    moved = np.linalg.norm(cam_pos - cache["pos"]) > pos_eps
+    rotated = np.linalg.norm(cam_dir - cache["dir"]) > dir_eps
+    if moved or rotated:
+        cache["pos"] = cam_pos.copy()
+        cache["dir"] = cam_dir.copy()
+        _emit()
+
+
+def _normalize_vec3(v, fallback):
+    n = np.linalg.norm(v)
+    if n < 1e-10:
+        return fallback.copy()
+    return v / n
+
+
+def setup_viewer_camera_controls(
+    gym, viewer, subscribe_rig_snapshot=False, subscribe_rig_assign_keys=False
+):
+    """Bind keyboard controls for manual real-time viewer camera control."""
+    if viewer is None:
+        return
+    gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_I, "cam_fwd")
+    gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_K, "cam_back")
+    gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_J, "cam_left")
+    gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_L, "cam_right")
+    gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_U, "cam_up")
+    gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_O, "cam_down")
+    gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_F, "cam_yaw_left")
+    gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_H, "cam_yaw_right")
+    gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_T, "cam_pitch_up")
+    gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_G, "cam_pitch_down")
+    if subscribe_rig_snapshot:
+        gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_S, "rig_snapshot")
+    if subscribe_rig_assign_keys:
+        gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_1, "rig_assign_diag_left")
+        gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_2, "rig_assign_diag_right")
+        gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_3, "rig_assign_point_cloud_center")
+
+
+def handle_viewer_camera_input(
+    gym,
+    viewer,
+    env,
+    move_step=0.01,
+    rot_step_deg=2.0,
+    rig_snapshot_callback=None,
+    rig_from_viewer_slots=None,
+):
+    """Apply keyboard camera control (viewer logs pose on every move separately).
+
+    rig_from_viewer_slots: optional dict with keys
+      'diag_left', 'diag_right', 'point_cloud_center' -> (cam_handle, cam_pos_vec3, cam_target_vec3)
+    """
+    if viewer is None:
+        return
+
+    changed = False
+    cam_tf = gym.get_viewer_camera_transform(viewer, env)
+    cam_pos = np.array([cam_tf.p.x, cam_tf.p.y, cam_tf.p.z], dtype=np.float64)
+    forward = _viewer_forward_from_quat(cam_tf.r)
+    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    right = _normalize_vec3(np.cross(forward, world_up), np.array([0.0, 1.0, 0.0], dtype=np.float64))
+    up = _normalize_vec3(np.cross(right, forward), world_up)
+
+    for evt in gym.query_viewer_action_events(viewer):
+        if evt.value <= 0:
+            continue
+        if evt.action == "rig_snapshot" and rig_snapshot_callback is not None:
+            rig_snapshot_callback()
+            continue
+        if rig_from_viewer_slots and evt.action == "rig_assign_diag_left":
+            h, p, t = rig_from_viewer_slots["diag_left"]
+            assign_viewer_pose_to_rig_slot(gym, viewer, env, h, p, t, "diag_left", "diag_left_cam")
+            continue
+        if rig_from_viewer_slots and evt.action == "rig_assign_diag_right":
+            h, p, t = rig_from_viewer_slots["diag_right"]
+            assign_viewer_pose_to_rig_slot(gym, viewer, env, h, p, t, "diag_right", "diag_right_cam")
+            continue
+        if rig_from_viewer_slots and evt.action == "rig_assign_point_cloud_center":
+            h, p, t = rig_from_viewer_slots["point_cloud_center"]
+            assign_viewer_pose_to_rig_slot(
+                gym, viewer, env, h, p, t, "point_cloud_center", "point_cloud_center_cam"
+            )
+            continue
+        if evt.action == "cam_fwd":
+            cam_pos += forward * move_step
+            changed = True
+        elif evt.action == "cam_back":
+            cam_pos -= forward * move_step
+            changed = True
+        elif evt.action == "cam_left":
+            cam_pos -= right * move_step
+            changed = True
+        elif evt.action == "cam_right":
+            cam_pos += right * move_step
+            changed = True
+        elif evt.action == "cam_up":
+            cam_pos += up * move_step
+            changed = True
+        elif evt.action == "cam_down":
+            cam_pos -= up * move_step
+            changed = True
+        elif evt.action == "cam_yaw_left":
+            yaw_rot = R.from_rotvec(world_up * math.radians(rot_step_deg))
+            forward = _normalize_vec3(yaw_rot.apply(forward), np.array([1.0, 0.0, 0.0], dtype=np.float64))
+            right = _normalize_vec3(np.cross(forward, world_up), np.array([0.0, 1.0, 0.0], dtype=np.float64))
+            up = _normalize_vec3(np.cross(right, forward), world_up)
+            changed = True
+        elif evt.action == "cam_yaw_right":
+            yaw_rot = R.from_rotvec(world_up * -math.radians(rot_step_deg))
+            forward = _normalize_vec3(yaw_rot.apply(forward), np.array([1.0, 0.0, 0.0], dtype=np.float64))
+            right = _normalize_vec3(np.cross(forward, world_up), np.array([0.0, 1.0, 0.0], dtype=np.float64))
+            up = _normalize_vec3(np.cross(right, forward), world_up)
+            changed = True
+        elif evt.action == "cam_pitch_up":
+            pitch_rot = R.from_rotvec(right * math.radians(rot_step_deg))
+            forward = _normalize_vec3(pitch_rot.apply(forward), np.array([1.0, 0.0, 0.0], dtype=np.float64))
+            right = _normalize_vec3(np.cross(forward, world_up), np.array([0.0, 1.0, 0.0], dtype=np.float64))
+            up = _normalize_vec3(np.cross(right, forward), world_up)
+            changed = True
+        elif evt.action == "cam_pitch_down":
+            pitch_rot = R.from_rotvec(right * -math.radians(rot_step_deg))
+            forward = _normalize_vec3(pitch_rot.apply(forward), np.array([1.0, 0.0, 0.0], dtype=np.float64))
+            right = _normalize_vec3(np.cross(forward, world_up), np.array([0.0, 1.0, 0.0], dtype=np.float64))
+            up = _normalize_vec3(np.cross(right, forward), world_up)
+            changed = True
+
+    if changed:
+        cam_target = cam_pos + forward
+        gym.viewer_camera_look_at(
+            viewer,
+            env,
+            gymapi.Vec3(float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2])),
+            gymapi.Vec3(float(cam_target[0]), float(cam_target[1]), float(cam_target[2])),
+        )
+
+
+def estimate_endpoint_joint_speeds(path, dt):
+    """Estimate per-joint velocity at start/end from a joint path."""
+    if path is None or len(path) < 2 or dt <= 0:
+        nan6 = np.full((6,), np.nan, dtype=np.float64)
+        return nan6, nan6
+    p0 = np.array(path[0], dtype=np.float64)
+    p1 = np.array(path[1], dtype=np.float64)
+    pn1 = np.array(path[-2], dtype=np.float64)
+    pn = np.array(path[-1], dtype=np.float64)
+    v_start = (p1 - p0) / dt
+    v_goal = (pn - pn1) / dt
+    return v_start, v_goal
 
 def interpolate_path_ntfield(path, steps_between=4):
     """Interpolate between consecutive waypoints for NTField path animation."""
@@ -546,6 +883,12 @@ def scale_config(config):
 
     return config
 
+
+def object_prompt_from_asset(asset_path):
+    """Create a simple text prompt from YCB asset path."""
+    obj_folder = asset_path.split("/")[-2]
+    return "grasp the " + obj_folder.replace("_", " ")
+
 def save_scene(init2grasp_path, grasp2init_path, obj_pos_list, gt_obj_pos_list, NUM_OF_OBJECTS, scene_info,
                target_mesh, obj_mesh, target_pos, gt_target_pos, obstacles_num, w_target,
                unknown_area, valid_area, potential_centers, method, MCTS_result=None):
@@ -770,9 +1113,15 @@ if __name__ == '__main__':
             {'name': '--no_walls', 'action': 'store_true', 'help': 'Remove side walls and upper cover on table (keep table only)'},
             {'name': '--no_h5_spawn_object', 'action': 'store_true', 'help': 'With --ntfield --h5_path: do not place object at HDF5 object_location / prompt (use random placement).'},
             {'name': '--headless', 'action': 'store_true', 'help': 'No interactive viewer; fixed-length animation for --ntfield --record (servers without DISPLAY).'},
+            {'name': '--skip_path_planning', 'action': 'store_true', 'help': 'Skip q_start->q_goal path planning in grasp mode and only save per-object goal joint configs.'},
+            {'name': '--camera_capture_only', 'action': 'store_true', 'help': 'Skip motion planning; fly viewer (logs pose). Keys 1/2/3 copy viewer to diag_left/diag_right/point_cloud_center rig; S saves PNG/npz; close viewer to save again.'},
+            {'name': '--rig_cams_anchored_table', 'action': 'store_true', 'help': 'Place the three rig cameras relative to tabletop center each run (re-aims with table_pose); default is fixed env-local Vec3 in script.'},
+            {'name': '--save', 'action': 'store_true', 'help': 'Legacy no-op: viewer camera FOV/pos/dir/target log on every camera move when a viewer exists.'},
         ],
     )
     args._session_eval_dir = None
+    output_root = os.path.abspath(os.path.join(file_dir, "..", "output", "constrained_multi_obj"))
+    os.makedirs(output_root, exist_ok=True)
     env_id = int(args.env_id)
     ntfield_h5_object_xyz = None
     if getattr(args, 'ntfield', False) and args.h5_path:
@@ -904,11 +1253,14 @@ if __name__ == '__main__':
 
     #*************************************************************************************************#
 
-    # create viewer using the default camera properties (optional: --headless for batch recording)
+    # create viewer (optional: --headless for batch recording)
+    # Use the same FOV as sensor cameras so tracked views match saved captures.
     #*************************************************************************************************#
     viewer = None
     if not getattr(args, 'headless', False):
-        viewer = gym.create_viewer(sim, gymapi.CameraProperties())
+        viewer_props = gymapi.CameraProperties()
+        viewer_props.horizontal_fov = 70.25
+        viewer = gym.create_viewer(sim, viewer_props)
         if viewer is None:
             raise ValueError('*** Failed to create viewer')
     else:
@@ -937,7 +1289,7 @@ if __name__ == '__main__':
                                     asset_options)
 
     #size of left/right cover will be decided by table size
-    drawer_height = np.random.random()*(max_drawer_height - min_drawer_height) + min_drawer_height
+    drawer_height = max_drawer_height
     side_cover_dims = gymapi.Vec3(table_dims.x, piece_width, drawer_height)
     left_cover_asset = gym.create_box(sim, side_cover_dims.x,
                                         side_cover_dims.y,
@@ -954,8 +1306,12 @@ if __name__ == '__main__':
                                             upper_cover_dims.y,
                                             upper_cover_dims.z,
                                             asset_options)
+    print(
+        f"Table size fixed: x={table_dims.x:.3f}m, y={table_dims.y:.3f}m, z={table_dims.z:.3f}m; "
+        f"drawer_height={drawer_height:.3f}m"
+    )
 
-    saved_env_name = './saved_as_result/env_' + str(env_id) + '_scene_info.npy'
+    saved_env_name = os.path.join(output_root, f'env_{env_id}_scene_info.npy')
     np.save(saved_env_name, np.array([table_dims.x, table_dims.y, table_dims.z, drawer_height]))
 
     asset_options.fix_base_link = False
@@ -1020,9 +1376,11 @@ if __name__ == '__main__':
                                                 table_dims.z + side_cover_dims.z/2.0]))
     right_cover_obj = fcl.CollisionObject(col_right_cover, trans_right_cover)
 
-    object_collision_models = [table_obj, left_cover_obj, right_cover_obj]
+    object_collision_models = [table_obj]
+    if not getattr(args, 'no_walls', False):
+        object_collision_models.extend([left_cover_obj, right_cover_obj])
 
-    if ADD_COVER:
+    if not getattr(args, 'no_walls', False) and ADD_COVER:
         col_upper_cover = fcl.Box(upper_cover_dims.x,
                                 upper_cover_dims.y,
                                 upper_cover_dims.z)
@@ -1063,7 +1421,9 @@ if __name__ == '__main__':
     envs = []
     ur5e_handles = []
     body_cam_handles = []
-    top_cam_handles = []
+    diag_left_cam_handles = []
+    diag_right_cam_handles = []
+    point_cloud_center_cam_handles = []
     camera_candidates = []
     # chosen_object = []
     chosen_scale = []
@@ -1117,10 +1477,10 @@ if __name__ == '__main__':
             and _nt_h5_ol is not None
             and _nt_h5_ol.size >= 3
         )
+        target_file_idx = np.random.choice(TARGET_OBJ_INDEX, NUM_OF_OBJECTS, replace=False)
         if h5_use_fixed:
-            target_file_idx = [_nt_h5_obj_idx]
-        else:
-            target_file_idx = np.random.choice(TARGET_OBJ_INDEX, NUM_OF_OBJECTS)
+            # Keep one object consistent with the HDF5 prompt-derived target.
+            target_file_idx[-1] = _nt_h5_obj_idx
         object_handles = []
 
         with open("object_name.txt", 'a') as f:
@@ -1143,7 +1503,7 @@ if __name__ == '__main__':
 
         for k in range(NUM_OF_OBJECTS):
             object_pose = gymapi.Transform()
-            if h5_use_fixed:
+            if h5_use_fixed and k == NUM_OF_OBJECTS - 1:
                 tx = float(_nt_h5_ol[0])
                 ty = float(_nt_h5_ol[1])
                 tz = float(_nt_h5_ol[2])
@@ -1229,19 +1589,68 @@ if __name__ == '__main__':
                                 viewpoint_candidate, 
                                 camera_focus)
 
-        # Top-down camera matching starter_code/collect_data.py angle
-        top_cam_handles.append(gym.create_camera_sensor(envs[-1], camera_props))
-        top_cam_pos = gymapi.Vec3(table_pose.p.x, table_pose.p.y + 0.001, 2)
-        top_cam_target = gymapi.Vec3(table_pose.p.x - 0.5, table_pose.p.y, table_pose.p.z)
-        gym.set_camera_location(top_cam_handles[-1], envs[-1], top_cam_pos, top_cam_target)
+        # Diagonal cameras (fixed env-local Vec3, or table-anchored when --rig_cams_anchored_table)
+        diag_left_cam_handles.append(gym.create_camera_sensor(envs[-1], camera_props))
+        if getattr(args, "rig_cams_anchored_table", False):
+            (
+                diag_left_cam_pos,
+                diag_left_cam_target,
+                diag_right_cam_pos,
+                diag_right_cam_target,
+                point_cloud_center_cam_pos,
+                point_cloud_center_cam_target,
+            ) = compute_rig_cameras_table_anchored(table_pose, table_dims)
+        else:
+            diag_left_cam_pos = gymapi.Vec3(-0.1300, 0.6069, 0.5000)
+            diag_left_cam_target = gymapi.Vec3(-0.8500, 1.2000, 0.8000)
+            diag_right_cam_pos = gymapi.Vec3(-0.3616, -0.6252, 0.4547)
+            diag_right_cam_target = gymapi.Vec3(-1.1427, -1.2303, 0.6088)
+            point_cloud_center_cam_pos = gymapi.Vec3(-0.4036, -0.1921, 0.4464)
+            point_cloud_center_cam_target = gymapi.Vec3(-1.3627, -0.4306, 0.5991)
+        gym.set_camera_location(diag_left_cam_handles[-1], envs[-1], diag_left_cam_pos, diag_left_cam_target)
+
+        diag_right_cam_handles.append(gym.create_camera_sensor(envs[-1], camera_props))
+        gym.set_camera_location(diag_right_cam_handles[-1], envs[-1], diag_right_cam_pos, diag_right_cam_target)
+
+        point_cloud_center_cam_handles.append(gym.create_camera_sensor(envs[-1], camera_props))
+        gym.set_camera_location(
+            point_cloud_center_cam_handles[-1],
+            envs[-1],
+            point_cloud_center_cam_pos,
+            point_cloud_center_cam_target,
+        )
 
     #*************************************************************************************************#
 
     #*************************************************************************************************#
     if viewer is not None:
-        cam_pos = gymapi.Vec3(table_pose.p.x, table_pose.p.y + 0.001, 2)
-        cam_target = gymapi.Vec3(table_pose.p.x - 0.5, table_pose.p.y, table_pose.p.z)
-        gym.viewer_camera_look_at(viewer, None, cam_pos, cam_target)
+        # viewer_camera_look_at(..., env, eye, target) expects eye/target in **env-local** coords (see Isaac Gym docs).
+        o = gym.get_env_origin(envs[-1])
+        eye_w = gymapi.Vec3(2.2, 0, 0.5)
+        tgt_w = gymapi.Vec3(0, 0, 0.5)
+        gym.viewer_camera_look_at(
+            viewer,
+            envs[-1],
+            gymapi.Vec3(eye_w.x - o.x, eye_w.y - o.y, eye_w.z - o.z),
+            gymapi.Vec3(tgt_w.x - o.x, tgt_w.y - o.y, tgt_w.z - o.z),
+        )
+        setup_viewer_camera_controls(
+            gym,
+            viewer,
+            subscribe_rig_snapshot=getattr(args, "camera_capture_only", False),
+            subscribe_rig_assign_keys=getattr(args, "camera_capture_only", False),
+        )
+        _cam_help = (
+            "Manual camera keys: I/K fwd/back, J/L left/right, U/O up/down, F/H yaw, T/G pitch. "
+            "Terminal logs FOV/pos/dir/target on every camera move."
+        )
+        if getattr(args, "camera_capture_only", False):
+            _cam_help += (
+                " Capture-only: S saves rig PNG+npz; 1/2/3 copy viewer pose to diag_left / diag_right / "
+                "point_cloud_center rig sensors (then S or close viewer to save)."
+            )
+        print(_cam_help)
+    viewer_cam_cache = {"pos": None, "dir": None}
     gym.set_light_parameters(sim, 0, gymapi.Vec3(0.3, 0.3, 0.3), gymapi.Vec3(1.0, 1.0, 1.0),
                                     gymapi.Vec3(-1.0, 0.0, 0.0))
     gym.set_light_parameters(sim, 1, gymapi.Vec3(0.3, 0.3, 0.3), gymapi.Vec3(1.0, 1.0, 1.0),
@@ -1253,9 +1662,10 @@ if __name__ == '__main__':
     real_position = False
     flex_collision_models = []
     object_mesh = []
+    trajectory_joint_configs = []
     t = 0
     #while not gym.query_viewer_has_closed(viewer):
-    for t in range(2000):
+    for t in range(200):
         if not real_position:
             gym.set_dof_target_position(envs[-1], spj, 0)
             gym.set_dof_target_position(envs[-1], slj, -math.pi/2)
@@ -1265,7 +1675,7 @@ if __name__ == '__main__':
             gym.set_dof_target_position(envs[-1], wj3, 0)
             real_position = True
 
-        if t == 999:
+        if t == 199:
             for i in range(len(object_handles)):
                 element = object_handles[i]
                 states = gym.get_actor_rigid_body_states(envs[-1], element, 1)
@@ -1294,16 +1704,105 @@ if __name__ == '__main__':
         # step the physics
         gym.simulate(sim)
         gym.fetch_results(sim, True)
+        dof_states = gym.get_actor_dof_states(envs[-1], ur5e_handles[-1], gymapi.STATE_POS)
+        q_step = np.array(dof_states["pos"][:6], dtype=np.float64)
+        trajectory_joint_configs.append(q_step)
 
         # update the viewer
         gym.step_graphics(sim)
         if viewer is not None:
             gym.draw_viewer(viewer, sim, True)
+            handle_viewer_camera_input(gym, viewer, envs[-1])
+            maybe_log_viewer_camera_on_move(gym, viewer, envs[-1], viewer_cam_cache, camera_props)
             gym.sync_frame_time(sim)
 
     #*************************************************************************************************#
 
+    if getattr(args, 'camera_capture_only', False):
+        print(
+            "Camera capture-only mode: logs [ViewerCamera env-local] on each camera move; "
+            "keys 1/2/3 assign viewer eye/target to rig cameras; "
+            "on viewer close saves rig RGB to env_*_scene_{diag_left,diag_right,center}_views.npz and matching .png."
+        )
+        if viewer is None:
+            print("Camera capture-only mode requires viewer (do not use --headless). Exiting.")
+            gym.destroy_sim(sim)
+            sys.exit(0)
+
+        _rig_from_viewer_slots = {
+            "diag_left": (diag_left_cam_handles[-1], diag_left_cam_pos, diag_left_cam_target),
+            "diag_right": (diag_right_cam_handles[-1], diag_right_cam_pos, diag_right_cam_target),
+            "point_cloud_center": (
+                point_cloud_center_cam_handles[-1],
+                point_cloud_center_cam_pos,
+                point_cloud_center_cam_target,
+            ),
+        }
+
+        def _save_rig_snapshots():
+            save_rig_camera_outputs(
+                gym,
+                sim,
+                envs[-1],
+                output_root,
+                env_id,
+                camera_props,
+                diag_left_cam_handles[-1],
+                diag_right_cam_handles[-1],
+                point_cloud_center_cam_handles[-1],
+                diag_left_cam_pos,
+                diag_left_cam_target,
+                diag_right_cam_pos,
+                diag_right_cam_target,
+                point_cloud_center_cam_pos,
+                point_cloud_center_cam_target,
+                tag=None,
+            )
+
+        while not gym.query_viewer_has_closed(viewer):
+            gym.simulate(sim)
+            gym.fetch_results(sim, True)
+            gym.step_graphics(sim)
+            gym.draw_viewer(viewer, sim, True)
+            handle_viewer_camera_input(
+                gym,
+                viewer,
+                envs[-1],
+                rig_snapshot_callback=_save_rig_snapshots,
+                rig_from_viewer_slots=_rig_from_viewer_slots,
+            )
+            maybe_log_viewer_camera_on_move(gym, viewer, envs[-1], viewer_cam_cache, camera_props)
+            gym.sync_frame_time(sim)
+        # Refresh sim/graphics for sensor capture (avoid draw_viewer here: window may already be invalid).
+        gym.simulate(sim)
+        gym.fetch_results(sim, True)
+        gym.step_graphics(sim)
+        print("Camera capture completed; saving rig camera snapshots…", flush=True)
+        try:
+            _save_rig_snapshots()
+        except Exception as e:
+            print(f"Error saving rig camera snapshots: {e}", flush=True)
+        gym.destroy_viewer(viewer)
+        gym.destroy_sim(sim)
+        sys.exit(0)
+
     robot_path = None
+    saved_q_s = np.full((6,), np.nan, dtype=np.float64)
+    saved_q_g = np.full((6,), np.nan, dtype=np.float64)
+    saved_grasp = np.full((7,), np.nan, dtype=np.float64)  # [x,y,z,qx,qy,qz,qw]
+    saved_language = ""
+    saved_speed_qs = np.full((6,), np.nan, dtype=np.float64)
+    saved_speed_qg = np.full((6,), np.nan, dtype=np.float64)
+    trajectory_joint_configs = []
+    diag_left_rgb = None
+    diag_right_rgb = None
+    point_cloud_center_rgb = None
+    diag_left_cam_pose = None
+    diag_left_cam_focus = None
+    diag_right_cam_pose = None
+    diag_right_cam_focus = None
+    point_cloud_center_cam_pose = None
+    point_cloud_center_cam_focus = None
     if getattr(args, 'ntfield', False):
         # NTField mode: plan path with trained model and animate in this environment
         import h5py
@@ -1393,6 +1892,29 @@ if __name__ == '__main__':
 
         path = gradient_plan(model, q_start, q_goal, step_size=0.02, max_steps=200, tol=0.01, device=device)
         robot_path = interpolate_path_ntfield(path, steps_between=4)
+        saved_q_s = np.array(q_start, dtype=np.float64)
+        saved_q_g = np.array(q_goal, dtype=np.float64)
+        saved_language = str(_nt_h5_prompt) if _nt_h5_prompt else ""
+        _h, _w = int(camera_props.height), int(camera_props.width)
+        diag_left_rgb = capture_camera_rgb_from_sensor(
+            gym, sim, envs[-1], diag_left_cam_handles[-1], _h, _w
+        )
+        diag_right_rgb = capture_camera_rgb_from_sensor(
+            gym, sim, envs[-1], diag_right_cam_handles[-1], _h, _w
+        )
+        point_cloud_center_rgb = capture_camera_rgb_from_sensor(
+            gym, sim, envs[-1], point_cloud_center_cam_handles[-1], _h, _w
+        )
+        diag_left_cam_pose = np.array([diag_left_cam_pos.x, diag_left_cam_pos.y, diag_left_cam_pos.z], dtype=np.float64)
+        diag_left_cam_focus = np.array([diag_left_cam_target.x, diag_left_cam_target.y, diag_left_cam_target.z], dtype=np.float64)
+        diag_right_cam_pose = np.array([diag_right_cam_pos.x, diag_right_cam_pos.y, diag_right_cam_pos.z], dtype=np.float64)
+        diag_right_cam_focus = np.array([diag_right_cam_target.x, diag_right_cam_target.y, diag_right_cam_target.z], dtype=np.float64)
+        point_cloud_center_cam_pose = np.array(
+            [point_cloud_center_cam_pos.x, point_cloud_center_cam_pos.y, point_cloud_center_cam_pos.z], dtype=np.float64
+        )
+        point_cloud_center_cam_focus = np.array(
+            [point_cloud_center_cam_target.x, point_cloud_center_cam_target.y, point_cloud_center_cam_target.z], dtype=np.float64
+        )
         print(f"NTField planned {len(path)} waypoints, interpolated to {len(robot_path)}")
 
     if robot_path is None:
@@ -1406,74 +1928,183 @@ if __name__ == '__main__':
         rac = RC.robot_arm_configuration(file_path, np.array([ur5e_pose.p.x, ur5e_pose.p.y, ur5e_pose.p.z]), scene_info)
         seed_state = [0.0]*ik_solver2.number_of_joints
 
-        print("Input object index to grasp")
-        target_idx = int(input(f"Choose from 0 to {NUM_OF_OBJECTS - 1}: "))
+        # Rebuild object meshes from current actor poses to keep indices aligned with user-selected target_idx.
+        object_mesh = []
+        for i_obj, handle in enumerate(object_handles):
+            states = gym.get_actor_rigid_body_states(envs[-1], handle, 1)
+            translation = np.array(states[0][0][0]).item()
+            temp_obj = object_reader_tracker[i_obj]
+            temp_obj.set_offset(np.array(translation))
+            vertices, faces = temp_obj.get_bounding_box_mesh()
+            object_mesh.append([vertices, faces])
 
-        grasp_file = "./assets/" + "/".join(object_asset_files[target_file_idx[target_idx]].split("/")[:-1]) + "/grasp_dict.npy"
-        grasp_data = np.load(grasp_file, allow_pickle=True)
+        # Save one feasible goal joint configuration per object (if found).
+        goal_joint_configs = np.full((NUM_OF_OBJECTS, 6), np.nan, dtype=np.float64)
+        goal_found_mask = np.zeros((NUM_OF_OBJECTS,), dtype=np.int32)
+        object_prompts = []
+        for obj_idx in range(NUM_OF_OBJECTS):
+            object_prompts.append(object_prompt_from_asset(object_asset_files[target_file_idx[obj_idx]]))
+            grasp_file_obj = "./assets/" + "/".join(object_asset_files[target_file_idx[obj_idx]].split("/")[:-1]) + "/grasp_dict.npy"
+            grasp_data_obj = np.load(grasp_file_obj, allow_pickle=True)
+            for grasp_idx in range(len(grasp_data_obj)):
+                target_grasp_pos = np.array(grasp_data_obj[grasp_idx]['target_pos'], dtype=np.float64)
+                target_grasp_quat = grasp_data_obj[grasp_idx]['target_quat']
+                target_grasp_pos[:2] = target_grasp_pos[:2] + GT_OBJ_POS_LIST[obj_idx][:2]
+                q_goal_candidate = rac.grasp_verify(target_grasp_pos, target_grasp_quat)
+                q_lift_candidate = rac.grasp_verify(target_grasp_pos + [0, 0, 0.01], target_grasp_quat)
+                if q_goal_candidate is None or q_lift_candidate is None:
+                    continue
+                goal_collision_free = rac.arm_collision_free(q_goal_candidate, plane_obj, object_collision_models, [])
+                lift_collision_free = rac.arm_collision_free(q_lift_candidate, plane_obj, object_collision_models, [])
+                if goal_collision_free and lift_collision_free:
+                    goal_joint_configs[obj_idx] = np.array(q_goal_candidate, dtype=np.float64)
+                    goal_found_mask[obj_idx] = 1
+                    break
 
-        # generate grasp
-        num_grasp = 0
-        swept_size = sys.maxsize
-        grasp_list = np.arange(len(grasp_data))
-        np.random.shuffle(np.arange(len(grasp_list)))
+        # Capture multi-view scene images at save time (env-local camera poses; step_graphics + sensor render).
+        (
+            diag_left_rgb,
+            diag_right_rgb,
+            point_cloud_center_rgb,
+            diag_left_cam_pose,
+            diag_left_cam_focus,
+            diag_right_cam_pose,
+            diag_right_cam_focus,
+            point_cloud_center_cam_pose,
+            point_cloud_center_cam_focus,
+        ) = save_rig_camera_outputs(
+            gym,
+            sim,
+            envs[-1],
+            output_root,
+            env_id,
+            camera_props,
+            diag_left_cam_handles[-1],
+            diag_right_cam_handles[-1],
+            point_cloud_center_cam_handles[-1],
+            diag_left_cam_pos,
+            diag_left_cam_target,
+            diag_right_cam_pos,
+            diag_right_cam_target,
+            point_cloud_center_cam_pos,
+            point_cloud_center_cam_target,
+            tag=None,
+        )
 
-        swept_volume1 = None
-        swept_volume2 = None
-        init2grasp_path = None
-        grasp2init_path = None
-        for grasp_idx in grasp_list:
-            target_grasp_pos = grasp_data[grasp_idx]['target_pos']
-            target_grasp_quat = grasp_data[grasp_idx]['target_quat']
-            target_grasp_pos[:2] = target_grasp_pos[:2] + GT_OBJ_POS_LIST[target_idx][:2]
-            init2grasp_angels_temp = rac.grasp_verify(target_grasp_pos, target_grasp_quat)
-            grasp2init_angels_temp = rac.grasp_verify(target_grasp_pos + [0,0,0.01], target_grasp_quat)
-            if init2grasp_angels_temp is None or grasp2init_angels_temp is None:
-                print("skip imposible grasp")
-                continue
+        goal_cfg_path = os.path.join(output_root, f'env_{env_id}_all_goal_configs.npz')
+        np.savez(
+            goal_cfg_path,
+            goal_joint_configs=goal_joint_configs,
+            goal_found_mask=goal_found_mask,
+            target_file_idx=np.array(target_file_idx, dtype=np.int32),
+            gt_obj_xy=np.array(GT_OBJ_POS_LIST, dtype=np.float64),
+            object_prompts=np.array(object_prompts, dtype=object),
+            diag_left_cam_pos=diag_left_cam_pose,
+            diag_left_cam_target=diag_left_cam_focus,
+            diag_right_cam_pos=diag_right_cam_pose,
+            diag_right_cam_target=diag_right_cam_focus,
+        )
+        print(f"Saved per-object goal configs to {goal_cfg_path} (found {int(goal_found_mask.sum())}/{NUM_OF_OBJECTS})")
+        print(
+            f"Saved scene images to "
+            f"{os.path.join(output_root, f'env_{env_id}_scene_diag_left_views.png')}, "
+            f"{os.path.join(output_root, f'env_{env_id}_scene_diag_right_views.png')}, "
+            f"{os.path.join(output_root, f'env_{env_id}_scene_center_views.png')}"
+        )
 
-            init2grasp_collision = rac.arm_collision_free(init2grasp_angels_temp, plane_obj, object_collision_models, [])
-            grasp2init_collision = rac.arm_collision_free(grasp2init_angels_temp, plane_obj, object_collision_models, [])
-            print("check collision init grasp")
-            print(init2grasp_collision, grasp2init_collision)
-            if not init2grasp_collision or not grasp2init_collision:
-                print("skip collision grasp")
-                continue
+        if getattr(args, 'skip_path_planning', False):
+            print("Skipping q_start->q_goal path planning (--skip_path_planning).")
+        else:
+            print("Input object index to grasp")
+            target_idx = int(input(f"Choose from 0 to {NUM_OF_OBJECTS - 1}: "))
+            saved_q_s = np.array([0.0, -math.pi / 2, 0.0, -math.pi / 2, 0.0, 0.0], dtype=np.float64)
+            saved_language = object_prompts[target_idx]
 
-            init2grasp_path_temp = RC.get_path2grasp(rac, init2grasp_angels_temp, scene_info, target_mesh=object_mesh[target_idx], time_limit=30, given_static_model = object_collision_models)
-            print(init2grasp_path_temp)
-            if init2grasp_path_temp is None:
-                print("No path generated\n")
-                continue
+            grasp_file = "./assets/" + "/".join(object_asset_files[target_file_idx[target_idx]].split("/")[:-1]) + "/grasp_dict.npy"
+            grasp_data = np.load(grasp_file, allow_pickle=True)
 
-            temp_mod_bbox = rac.modify_grasp_bbox(init2grasp_angels_temp, target_mesh=object_mesh[target_idx], visualize=False)
-            grasp2init_path_temp = RC.get_path2start(rac, grasp2init_angels_temp, temp_mod_bbox, scene_info, time_limit=30, given_static_model = object_collision_models)
-            print(grasp2init_path_temp)
-            if grasp2init_path_temp is None:
-                print("No path generated\n")
-                continue
-            swept_volume1_temp, swept_verts1_temp = rac.get_swept_volume(init2grasp_path_temp, frame_rate=60, scene_info=scene_info, animation=False, static_vi=False)
-            swept_volume2_temp, swept_verts2_temp = rac.get_swept_volume(grasp2init_path_temp, w_target=temp_mod_bbox, frame_rate=60, scene_info=scene_info, animation=False, static_vi=False)
-            num_grasp += 1
-            is_target_detected = True
-            # compare swept volumes
-            swept_center_temp, swept_verts_temp = rac.get_swept_center(swept_verts1_temp+swept_verts2_temp, scene_info, 0.6)
-            temp_swept_size = get_swept_volume_size(swept_verts_temp)
-            if temp_swept_size < swept_size:
-                swept_size = temp_swept_size
-                swept_volume1 = swept_volume1_temp
-                swept_volume2 = swept_volume2_temp
-                init2grasp_path = init2grasp_path_temp
-                grasp2init_path = grasp2init_path_temp
-                swept_center = swept_center_temp
-                swept_verts = swept_verts_temp
-                W_TARGET = temp_mod_bbox
-            if num_grasp == 1:
-                break
-        print("\n!!!!!!!!!!!!!!!!!!!", num_grasp ,'grasp generated!!!!!!!!!!!!!!!!!!!!!!!\n')
-        robot_path = init2grasp_path
+            # generate grasp
+            num_grasp = 0
+            swept_size = sys.maxsize
+            grasp_list = np.arange(len(grasp_data))
+            np.random.shuffle(grasp_list)
+
+            swept_volume1 = None
+            swept_volume2 = None
+            init2grasp_path = None
+            grasp2init_path = None
+            for grasp_idx in grasp_list:
+                target_grasp_pos = grasp_data[grasp_idx]['target_pos']
+                target_grasp_quat = grasp_data[grasp_idx]['target_quat']
+                target_grasp_pos[:2] = target_grasp_pos[:2] + GT_OBJ_POS_LIST[target_idx][:2]
+                init2grasp_angels_temp = rac.grasp_verify(target_grasp_pos, target_grasp_quat)
+                grasp2init_angels_temp = rac.grasp_verify(target_grasp_pos + [0,0,0.01], target_grasp_quat)
+                if init2grasp_angels_temp is None or grasp2init_angels_temp is None:
+                    print("skip imposible grasp")
+                    continue
+
+                init2grasp_collision = rac.arm_collision_free(init2grasp_angels_temp, plane_obj, object_collision_models, [])
+                grasp2init_collision = rac.arm_collision_free(grasp2init_angels_temp, plane_obj, object_collision_models, [])
+                print("check collision init grasp")
+                print(init2grasp_collision, grasp2init_collision)
+                if not init2grasp_collision or not grasp2init_collision:
+                    print("skip collision grasp")
+                    continue
+
+                init2grasp_path_temp = RC.get_path2grasp(rac, init2grasp_angels_temp, scene_info, target_mesh=object_mesh[target_idx], time_limit=30, given_static_model = object_collision_models)
+                print(init2grasp_path_temp)
+                if init2grasp_path_temp is None:
+                    print("No path generated\n")
+                    continue
+
+                temp_mod_bbox = rac.modify_grasp_bbox(init2grasp_angels_temp, target_mesh=object_mesh[target_idx], visualize=False)
+                grasp2init_path_temp = RC.get_path2start(rac, grasp2init_angels_temp, temp_mod_bbox, scene_info, time_limit=30, given_static_model = object_collision_models)
+                print(grasp2init_path_temp)
+                if grasp2init_path_temp is None:
+                    print("No path generated\n")
+                    continue
+                swept_volume1_temp, swept_verts1_temp = rac.get_swept_volume(init2grasp_path_temp, frame_rate=60, scene_info=scene_info, animation=False, static_vi=False)
+                swept_volume2_temp, swept_verts2_temp = rac.get_swept_volume(grasp2init_path_temp, w_target=temp_mod_bbox, frame_rate=60, scene_info=scene_info, animation=False, static_vi=False)
+                num_grasp += 1
+                is_target_detected = True
+                # compare swept volumes
+                swept_center_temp, swept_verts_temp = rac.get_swept_center(swept_verts1_temp+swept_verts2_temp, scene_info, 0.6)
+                temp_swept_size = get_swept_volume_size(swept_verts_temp)
+                if temp_swept_size < swept_size:
+                    swept_size = temp_swept_size
+                    swept_volume1 = swept_volume1_temp
+                    swept_volume2 = swept_volume2_temp
+                    init2grasp_path = init2grasp_path_temp
+                    grasp2init_path = grasp2init_path_temp
+                    swept_center = swept_center_temp
+                    swept_verts = swept_verts_temp
+                    W_TARGET = temp_mod_bbox
+                    saved_q_g = np.array(init2grasp_angels_temp, dtype=np.float64)
+                    saved_grasp = np.array(
+                        [
+                            target_grasp_pos[0],
+                            target_grasp_pos[1],
+                            target_grasp_pos[2],
+                            target_grasp_quat[0],
+                            target_grasp_quat[1],
+                            target_grasp_quat[2],
+                            target_grasp_quat[3],
+                        ],
+                        dtype=np.float64,
+                    )
+                if num_grasp == 1:
+                    break
+            print("\n!!!!!!!!!!!!!!!!!!!", num_grasp ,'grasp generated!!!!!!!!!!!!!!!!!!!!!!!\n')
+            robot_path = init2grasp_path
 
     if robot_path is None or len(robot_path) == 0:
+        if getattr(args, 'skip_path_planning', False) and not getattr(args, 'ntfield', False):
+            print("Path planning skipped; exiting after saving goal configurations.")
+            print('Test Completed Successfully!!')
+            if viewer is not None:
+                gym.destroy_viewer(viewer)
+            gym.destroy_sim(sim)
+            sys.exit(0)
         print("Error: No path to animate (grasp planning failed or --ntfield path empty)")
         if viewer is not None:
             gym.destroy_viewer(viewer)
@@ -1503,11 +2134,13 @@ if __name__ == '__main__':
         gym.step_graphics(sim)
         if viewer is not None:
             gym.draw_viewer(viewer, sim, True)
+            handle_viewer_camera_input(gym, viewer, envs[-1])
+            maybe_log_viewer_camera_on_move(gym, viewer, envs[-1], viewer_cam_cache, camera_props)
             gym.sync_frame_time(sim)
 
         if record_frames is not None:
             gym.render_all_camera_sensors(sim)
-            raw = gym.get_camera_image(sim, envs[-1], top_cam_handles[-1], gymapi.IMAGE_COLOR)
+            raw = gym.get_camera_image(sim, envs[-1], diag_left_cam_handles[-1], gymapi.IMAGE_COLOR)
             rgba = raw.reshape(camera_props.height, camera_props.width, 4)
             rgb = rgba[..., :3].copy()
             record_frames.append(rgb)
@@ -1520,6 +2153,80 @@ if __name__ == '__main__':
     else:
         while not gym.query_viewer_has_closed(viewer):
             _animate_robot_path_step()
+
+    if len(trajectory_joint_configs) > 1:
+        saved_speed_qs, saved_speed_qg = estimate_endpoint_joint_speeds(trajectory_joint_configs, sim_params.dt)
+    elif robot_path is not None and len(robot_path) > 1:
+        saved_speed_qs, saved_speed_qg = estimate_endpoint_joint_speeds(robot_path, sim_params.dt)
+
+    pointcloud_bundle_path = os.path.join(output_root, f'env_{env_id}_pointcloud_capture.npz')
+    np.savez(
+        pointcloud_bundle_path,
+        q_s=saved_q_s,
+        q_g=saved_q_g,
+        grasp=saved_grasp,
+        speed_qs=saved_speed_qs,
+        speed_qg=saved_speed_qg,
+        language=np.array(saved_language, dtype=object),
+        trajectory_joint_configs=np.array(trajectory_joint_configs, dtype=np.float64),
+        diag_right_rgb=diag_right_rgb,
+        diag_left_rgb=diag_left_rgb,
+        point_cloud_center_rgb=point_cloud_center_rgb,
+        diag_right_cam_pos=diag_right_cam_pose,
+        diag_right_cam_target=diag_right_cam_focus,
+        diag_left_cam_pos=diag_left_cam_pose,
+        diag_left_cam_target=diag_left_cam_focus,
+        point_cloud_center_cam_pos=point_cloud_center_cam_pose,
+        point_cloud_center_cam_target=point_cloud_center_cam_focus,
+    )
+    print(f"Saved point-cloud capture bundle to {pointcloud_bundle_path}")
+
+    # HDF5 export with collect_data-compatible naming style.
+    pointcloud_h5_path = os.path.join(output_root, f'env_{env_id}_pointcloud_capture.h5')
+    try:
+        import h5py
+
+        str_dt = h5py.special_dtype(vlen=str)
+        traj_arr = np.array(trajectory_joint_configs, dtype=np.float32)
+        goal_joint_configs = np.array(saved_q_g, dtype=np.float32).reshape(1, 6)
+        grasp_target_positions = np.array(saved_grasp[:3], dtype=np.float32).reshape(1, 3)
+        grasp_target_quaternions = np.array(saved_grasp[3:], dtype=np.float32).reshape(1, 4)
+        speed_qs_arr = np.array(saved_speed_qs, dtype=np.float32)
+        speed_qg_arr = np.array(saved_speed_qg, dtype=np.float32)
+        q_s_arr = np.array(saved_q_s, dtype=np.float32)
+        q_g_arr = np.array(saved_q_g, dtype=np.float32)
+
+        with h5py.File(pointcloud_h5_path, "w") as f:
+            # Keep collect_data-style core names where applicable.
+            f.create_dataset("trajectory_joint_configs", data=traj_arr)
+            f.create_dataset("goal_joint_configs", data=goal_joint_configs)
+            f.create_dataset("grasp_target_positions", data=grasp_target_positions)
+            f.create_dataset("grasp_target_quaternions", data=grasp_target_quaternions)
+
+            # Extra constrained-task metadata requested by user.
+            f.create_dataset("q_s", data=q_s_arr)
+            f.create_dataset("q_g", data=q_g_arr)
+            f.create_dataset("speed_qs", data=speed_qs_arr)
+            f.create_dataset("speed_qg", data=speed_qg_arr)
+            f.create_dataset("diag_left_rgb", data=np.array(diag_left_rgb, dtype=np.uint8), compression="gzip")
+            f.create_dataset("diag_right_rgb", data=np.array(diag_right_rgb, dtype=np.uint8), compression="gzip")
+            f.create_dataset("point_cloud_center_rgb", data=np.array(point_cloud_center_rgb, dtype=np.uint8), compression="gzip")
+            f.create_dataset("diag_left_cam_pos", data=np.array(diag_left_cam_pose, dtype=np.float32))
+            f.create_dataset("diag_left_cam_target", data=np.array(diag_left_cam_focus, dtype=np.float32))
+            f.create_dataset("diag_right_cam_pos", data=np.array(diag_right_cam_pose, dtype=np.float32))
+            f.create_dataset("diag_right_cam_target", data=np.array(diag_right_cam_focus, dtype=np.float32))
+            f.create_dataset("point_cloud_center_cam_pos", data=np.array(point_cloud_center_cam_pose, dtype=np.float32))
+            f.create_dataset("point_cloud_center_cam_target", data=np.array(point_cloud_center_cam_focus, dtype=np.float32))
+            lang_ds = f.create_dataset("language", (1,), dtype=str_dt)
+            lang_ds[:] = np.array([saved_language], dtype=object)
+
+            f.attrs["joint_dim"] = 6
+            f.attrs["num_objects"] = 1
+            f.attrs["camera_count"] = 3
+            f.flush()
+        print(f"Saved point-cloud capture HDF5 to {pointcloud_h5_path}")
+    except Exception as e:
+        print(f"Warning: could not save HDF5 capture file: {e}")
 
     # save recorded video
     if record_frames and len(record_frames) > 0:

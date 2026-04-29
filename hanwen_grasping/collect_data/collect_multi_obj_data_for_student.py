@@ -25,6 +25,7 @@ import open3d as o3d
 import fcl
 import cv2
 import copy
+import shutil
 
 import h5py
 
@@ -65,6 +66,7 @@ def _resolve_assets_dir():
 
 ASSETS_DIR = _resolve_assets_dir()
 SAVED_RESULT_DIR = os.path.join(_script_dir, "saved_as_result")
+PI_VLA_ROOT = os.path.dirname(package_root)
 
 util_dir = os.path.join(package_root, "util")
 grasp_util_dir = os.path.join(package_root, "grasp_util")
@@ -261,6 +263,88 @@ def resample_path(path, num_waypoints=20):
     return resampled
 
 
+def _table_box_mesh_vertices_faces(center_xyz, dims_xyz):
+    cx, cy, cz = center_xyz
+    dx, dy, dz = dims_xyz
+    v = np.array(
+        [
+            [cx - dx / 2.0, cy - dy / 2.0, cz - dz / 2.0],
+            [cx - dx / 2.0, cy + dy / 2.0, cz - dz / 2.0],
+            [cx + dx / 2.0, cy + dy / 2.0, cz - dz / 2.0],
+            [cx + dx / 2.0, cy - dy / 2.0, cz - dz / 2.0],
+            [cx - dx / 2.0, cy - dy / 2.0, cz + dz / 2.0],
+            [cx - dx / 2.0, cy + dy / 2.0, cz + dz / 2.0],
+            [cx + dx / 2.0, cy + dy / 2.0, cz + dz / 2.0],
+            [cx + dx / 2.0, cy - dy / 2.0, cz + dz / 2.0],
+        ],
+        dtype=np.float64,
+    )
+    f = np.array(
+        [
+            [0, 2, 1], [0, 2, 3],
+            [4, 6, 5], [4, 6, 7],
+            [5, 2, 1], [5, 2, 6],
+            [7, 2, 3], [7, 2, 6],
+            [4, 3, 0], [4, 3, 7],
+            [4, 1, 0], [4, 1, 5],
+        ],
+        dtype=np.int64,
+    )
+    return v, f
+
+
+def _write_obj(path, vertices, faces):
+    with open(path, "w") as f:
+        for vx, vy, vz in vertices:
+            f.write(f"v {vx:.8f} {vy:.8f} {vz:.8f}\n")
+        for i, j, k in faces:
+            f.write(f"f {i + 1} {j + 1} {k + 1}\n")
+
+
+def _export_train_arm_scene_dataset(output_dir, table_pose, table_dims, object_reader_tracker):
+    os.makedirs(output_dir, exist_ok=True)
+
+    vertices_all = []
+    faces_all = []
+    v_offset = 0
+
+    table_center = np.array([table_pose.p.x, table_pose.p.y, table_pose.p.z], dtype=np.float64)
+    table_size = np.array([table_dims.x, table_dims.y, table_dims.z], dtype=np.float64)
+    tv, tf = _table_box_mesh_vertices_faces(table_center, table_size)
+    vertices_all.append(tv)
+    faces_all.append(tf + v_offset)
+    v_offset += tv.shape[0]
+
+    for mesh_reader in object_reader_tracker:
+        ov = np.asarray(mesh_reader.get_vertices(), dtype=np.float64)
+        of = np.asarray(mesh_reader.get_faces(), dtype=np.int64)
+        if ov.size == 0 or of.size == 0:
+            continue
+        vertices_all.append(ov)
+        faces_all.append(of + v_offset)
+        v_offset += ov.shape[0]
+
+    if not vertices_all:
+        raise RuntimeError("No geometry available for scene export.")
+
+    vertices = np.concatenate(vertices_all, axis=0)
+    faces = np.concatenate(faces_all, axis=0)
+    obj_path = os.path.join(output_dir, "realpc.obj")
+    _write_obj(obj_path, vertices, faces)
+
+    dim_path = os.path.join(output_dir, "dim")
+    with open(dim_path, "w") as f:
+        f.write("6\n")
+        f.write("wrist_3_link\n")
+
+    urdf_src = os.path.join(ASSETS_DIR, "urdf", "ur5e", "ur5e.urdf")
+    urdf_dst = os.path.join(output_dir, "ur5e.urdf")
+    if os.path.isfile(urdf_src):
+        shutil.copy2(urdf_src, urdf_dst)
+
+    return obj_path, dim_path, urdf_dst
+
+
 def plan_init2grasp_path_for_slot(
     rac,
     plane_obj,
@@ -272,12 +356,15 @@ def plan_init2grasp_path_for_slot(
     slot_idx,
     max_consecutive_failures=15,
 ):
-    """Plan approach path for object at ``slot_idx``; return resampled path or None."""
+    """Plan approach path for object at ``slot_idx``; return metadata dict or None."""
     num_grasp = 0
     swept_size = sys.maxsize
     grasp_list = np.arange(len(grasp_data))
     np.random.shuffle(grasp_list)
     init2grasp_path = None
+    selected_grasp_idx = None
+    selected_target_grasp_pos = None
+    selected_target_grasp_quat = None
     consecutive_path_failures = 0
     for grasp_idx in grasp_list:
         if consecutive_path_failures >= max_consecutive_failures:
@@ -357,6 +444,9 @@ def plan_init2grasp_path_for_slot(
         if temp_swept_size < swept_size:
             swept_size = temp_swept_size
             init2grasp_path = init2grasp_path_temp
+            selected_grasp_idx = int(grasp_idx)
+            selected_target_grasp_pos = np.array(target_grasp_pos, dtype=np.float32)
+            selected_target_grasp_quat = np.array(target_grasp_quat, dtype=np.float32)
         if num_grasp == 1:
             break
 
@@ -365,7 +455,12 @@ def plan_init2grasp_path_for_slot(
     if len(init2grasp_path) > 1:
         init2grasp_path = interpolate_path(init2grasp_path, steps_between=2)
         init2grasp_path = resample_path(init2grasp_path, num_waypoints=10)
-    return init2grasp_path
+    return {
+        "path": init2grasp_path,
+        "grasp_idx": selected_grasp_idx,
+        "target_grasp_pos": selected_target_grasp_pos,
+        "target_grasp_quat": selected_target_grasp_quat,
+    }
 
 
 #*************************************************************************************************#
@@ -381,10 +476,21 @@ if __name__ == '__main__':
             {
                 "name": "--max_plan_attempts",
                 "type": int,
-                "default": 60,
+                "default": 10,
                 "help": "Max random layouts per episode until all 3 grasps plan (default: 60)",
             },
             {"name": "--headless", "action": "store_true", "help": "Run without creating a viewer"},
+            {
+                "name": "--output_dir",
+                "type": str,
+                "default": None,
+                "help": "Output root for timestamped runs (default: PI-VLA/output/multi_obj).",
+            },
+            {
+                "name": "--export_scene_bundle",
+                "action": "store_true",
+                "help": "Also export realpc.obj, dim, and ur5e.urdf per sample.",
+            },
         ],
     )
     env_id = int(args.env_id)
@@ -699,7 +805,7 @@ if __name__ == '__main__':
         grasp_data_by_slot.append(np.load(grasp_file_k, allow_pickle=True))
 
     successful_episodes = 0
-    max_plan_attempts = max(1, int(getattr(args, "max_plan_attempts", 60)))
+    max_plan_attempts = max(1, int(getattr(args, "max_plan_attempts", 10)))
     for episode_idx in range(num_episodes):
         print(f"\n================ Episode {episode_idx + 1}/{num_episodes} ================\n")
         episode_saved = False
@@ -812,7 +918,7 @@ if __name__ == '__main__':
                         vertices, faces = temp_obj.get_bounding_box_mesh()
                         object_mesh.append([vertices, faces])
 
-            init2grasp_paths = []
+            plan_results = []
             for k in range(NUM_OF_OBJECTS):
                 distractor_cols = [
                     flex_collision_models[j][0]
@@ -820,7 +926,7 @@ if __name__ == '__main__':
                     if j != k
                 ]
                 static_k = object_collision_models + distractor_cols
-                path_k = plan_init2grasp_path_for_slot(
+                result_k = plan_init2grasp_path_for_slot(
                     rac,
                     plane_obj,
                     scene_info,
@@ -830,18 +936,21 @@ if __name__ == '__main__':
                     GT_OBJ_POS_LIST,
                     k,
                 )
-                init2grasp_paths.append(path_k)
-                if path_k is not None:
-                    print(f"Slot {k}: path with {len(path_k)} waypoints")
+                plan_results.append(result_k)
+                if result_k is not None:
+                    print(f"Slot {k}: path with {len(result_k['path'])} waypoints")
 
-            if any(p is None for p in init2grasp_paths):
-                failed = [k for k, p in enumerate(init2grasp_paths) if p is None]
+            if any(p is None for p in plan_results):
+                failed = [k for k, p in enumerate(plan_results) if p is None]
                 print(f"No valid grasp for slot(s) {failed}; retrying with new poses.")
                 continue
+
+            init2grasp_paths = [plan_results[k]["path"] for k in range(NUM_OF_OBJECTS)]
 
             JOINT_DIM = 6
             START_SETTLE_STEPS = 30
             HOME_DOF = [0.7, -2.0, 2.5, -0.3, 0.7, 0.0]
+            TRAJ_STEPS_PER_WAYPOINT = 1
             display_names = [
                 get_object_display_name(object_asset_files[target_file_idx[k]])
                 for k in range(NUM_OF_OBJECTS)
@@ -859,6 +968,22 @@ if __name__ == '__main__':
             goal_joint_configs = np.stack(
                 [
                     np.array(init2grasp_paths[k][-1][:JOINT_DIM], dtype=np.float32)
+                    for k in range(NUM_OF_OBJECTS)
+                ]
+            )
+            grasp_indices = np.array(
+                [int(plan_results[k]["grasp_idx"]) for k in range(NUM_OF_OBJECTS)],
+                dtype=np.int32,
+            )
+            target_grasp_positions = np.stack(
+                [
+                    np.array(plan_results[k]["target_grasp_pos"], dtype=np.float32)
+                    for k in range(NUM_OF_OBJECTS)
+                ]
+            )
+            target_grasp_quaternions = np.stack(
+                [
+                    np.array(plan_results[k]["target_grasp_quat"], dtype=np.float32)
                     for k in range(NUM_OF_OBJECTS)
                 ]
             )
@@ -883,29 +1008,101 @@ if __name__ == '__main__':
             raw_top = gym.get_camera_image(sim, envs[-1], top_cam_handle, gymapi.IMAGE_COLOR)
             rgba_top = raw_top.reshape(camera_props.height, camera_props.width, 4)
             start_image = rgba_top[..., :3].copy()
+            raw_side = gym.get_camera_image(sim, envs[-1], side_cam_handle, gymapi.IMAGE_COLOR)
+            rgba_side = raw_side.reshape(camera_props.height, camera_props.width, 4)
+            start_image_side = rgba_side[..., :3].copy()
 
-            pi_vla_root = os.path.dirname(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            )
-            collected_dir = os.path.join(pi_vla_root, "output", "multi_obj")
-            os.makedirs(collected_dir, exist_ok=True)
+            # Replay each planned path and capture trajectory joints + top/side RGB.
+            trajectory_joint_configs = []
+            trajectory_images_top = []
+            trajectory_images_side = []
+            for k in range(NUM_OF_OBJECTS):
+                traj_q = []
+                traj_top = []
+                traj_side = []
+                for waypoint in init2grasp_paths[k]:
+                    for _ in range(TRAJ_STEPS_PER_WAYPOINT):
+                        gym.set_dof_target_position(envs[-1], spj, waypoint[0])
+                        gym.set_dof_target_position(envs[-1], slj, waypoint[1])
+                        gym.set_dof_target_position(envs[-1], ej, waypoint[2])
+                        gym.set_dof_target_position(envs[-1], wj1, waypoint[3])
+                        gym.set_dof_target_position(envs[-1], wj2, waypoint[4])
+                        gym.set_dof_target_position(envs[-1], wj3, waypoint[5])
+
+                        gym.simulate(sim)
+                        gym.fetch_results(sim, True)
+                        gym.step_graphics(sim)
+                        if viewer is not None:
+                            gym.draw_viewer(viewer, sim, True)
+                        gym.sync_frame_time(sim)
+
+                        gym.render_all_camera_sensors(sim)
+                        raw_top_step = gym.get_camera_image(sim, envs[-1], top_cam_handle, gymapi.IMAGE_COLOR)
+                        raw_side_step = gym.get_camera_image(sim, envs[-1], side_cam_handle, gymapi.IMAGE_COLOR)
+                        top_step = raw_top_step.reshape(camera_props.height, camera_props.width, 4)[..., :3].copy()
+                        side_step = raw_side_step.reshape(camera_props.height, camera_props.width, 4)[..., :3].copy()
+                        dof_states = gym.get_actor_dof_states(envs[-1], ur5e_handles[-1], gymapi.STATE_POS)
+                        q_step = np.array(dof_states["pos"][:JOINT_DIM], dtype=np.float32)
+
+                        traj_q.append(q_step)
+                        traj_top.append(top_step)
+                        traj_side.append(side_step)
+
+                trajectory_joint_configs.append(np.stack(traj_q, axis=0))
+                trajectory_images_top.append(np.stack(traj_top, axis=0))
+                trajectory_images_side.append(np.stack(traj_side, axis=0))
+
+            trajectory_joint_configs = np.stack(trajectory_joint_configs, axis=0)  # (O, T, 6)
+            trajectory_images_top = np.stack(trajectory_images_top, axis=0)        # (O, T, H, W, 3)
+            trajectory_images_side = np.stack(trajectory_images_side, axis=0)      # (O, T, H, W, 3)
+
+            default_output_dir = os.path.join(PI_VLA_ROOT, "output", "multi_obj")
+            if args.output_dir:
+                output_root = (
+                    args.output_dir
+                    if os.path.isabs(args.output_dir)
+                    else os.path.join(PI_VLA_ROOT, args.output_dir)
+                )
+                output_root = os.path.abspath(output_root)
+            else:
+                output_root = default_output_dir
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            out_path = os.path.join(collected_dir, f"grasp_multi3_demo_{timestamp}.h5")
+            run_dir = os.path.join(output_root, timestamp)
+            os.makedirs(run_dir, exist_ok=True)
+            out_path = os.path.join(run_dir, f"grasp_multi3_demo_{timestamp}.h5")
             str_dt = h5py.special_dtype(vlen=str)
             with h5py.File(out_path, "w") as f:
                 f.create_dataset("start_image", data=start_image.astype(np.uint8), compression="gzip")
+                f.create_dataset("start_image_side", data=start_image_side.astype(np.uint8), compression="gzip")
                 f.create_dataset("object_locations", data=object_locations)
                 name_ds = f.create_dataset("object_names", (NUM_OF_OBJECTS,), dtype=str_dt)
                 name_ds[:] = np.array(display_names, dtype=object)
                 folder_ds = f.create_dataset("object_id_folders", (NUM_OF_OBJECTS,), dtype=str_dt)
                 folder_ds[:] = np.array(id_folders, dtype=object)
                 f.create_dataset("goal_joint_configs", data=goal_joint_configs)
+                f.create_dataset("trajectory_joint_configs", data=trajectory_joint_configs)
+                f.create_dataset("trajectory_images_top", data=trajectory_images_top.astype(np.uint8), compression="gzip")
+                f.create_dataset("trajectory_images_side", data=trajectory_images_side.astype(np.uint8), compression="gzip")
+                f.create_dataset("grasp_indices", data=grasp_indices)
+                f.create_dataset("grasp_target_positions", data=target_grasp_positions)
+                f.create_dataset("grasp_target_quaternions", data=target_grasp_quaternions)
                 f.attrs["joint_dim"] = int(JOINT_DIM)
                 f.attrs["num_objects"] = int(NUM_OF_OBJECTS)
+                f.attrs["trajectory_steps_per_waypoint"] = int(TRAJ_STEPS_PER_WAYPOINT)
                 f.flush()
+
+            if args.export_scene_bundle:
+                obj_path, dim_path, urdf_path = _export_train_arm_scene_dataset(
+                    output_dir=run_dir,
+                    table_pose=table_pose,
+                    table_dims=table_dims,
+                    object_reader_tracker=object_reader_tracker,
+                )
             successful_episodes += 1
             episode_saved = True
             print(f"Saved 1 sample to {out_path}")
+            if args.export_scene_bundle:
+                print(f"Exported scene bundle: {obj_path}, {dim_path}, {urdf_path}")
 
         if not episode_saved:
             print(

@@ -10,6 +10,7 @@
 # Exits with os._exit() after HDF5 flush to avoid Isaac Gym destroy_sim segfaults on Linux.
 #
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from scipy.spatial.transform import Rotation as R
 import math
 import time
@@ -356,111 +357,76 @@ def plan_init2grasp_path_for_slot(
     slot_idx,
     max_consecutive_failures=15,
 ):
-    """Plan approach path for object at ``slot_idx``; return metadata dict or None."""
-    num_grasp = 0
-    swept_size = sys.maxsize
+    """IK + static collision check only (no OMPL / swept volume). Returns metadata dict or None.
+
+    ``scene_info`` and ``object_mesh`` are kept for a stable call signature; planning does not use them.
+    """
     grasp_list = np.arange(len(grasp_data))
     np.random.shuffle(grasp_list)
-    init2grasp_path = None
-    selected_grasp_idx = None
-    selected_target_grasp_pos = None
-    selected_target_grasp_quat = None
-    consecutive_path_failures = 0
+
+    consecutive_failures = 0
+
     for grasp_idx in grasp_list:
-        if consecutive_path_failures >= max_consecutive_failures:
-            print(
-                f"Slot {slot_idx}: stuck after {max_consecutive_failures} consecutive path failures."
-            )
+        if consecutive_failures >= max_consecutive_failures:
+            print(f"Slot {slot_idx}: stuck after {max_consecutive_failures} consecutive failures.")
             break
+
         target_grasp_pos = grasp_data[grasp_idx]["target_pos"].copy()
         target_grasp_quat = grasp_data[grasp_idx]["target_quat"]
+
         target_grasp_pos[:2] = target_grasp_pos[:2] + GT_OBJ_POS_LIST[slot_idx][:2]
-        init2grasp_angels_temp = rac.grasp_verify(target_grasp_pos, target_grasp_quat)
-        grasp2init_angels_temp = rac.grasp_verify(
+
+        goal_joint_config = rac.grasp_verify(target_grasp_pos, target_grasp_quat)
+        standoff_config = rac.grasp_verify(
             target_grasp_pos + [0, 0, 0.01], target_grasp_quat
         )
-        if init2grasp_angels_temp is None or grasp2init_angels_temp is None:
+
+        if goal_joint_config is None or standoff_config is None:
+            consecutive_failures += 1
             continue
 
-        init2grasp_collision = rac.arm_collision_free(
-            init2grasp_angels_temp, plane_obj, static_for_planning, []
+        goal_collision_free = rac.arm_collision_free(
+            goal_joint_config, plane_obj, static_for_planning, []
         )
-        grasp2init_collision = rac.arm_collision_free(
-            grasp2init_angels_temp, plane_obj, static_for_planning, []
+        standoff_collision_free = rac.arm_collision_free(
+            standoff_config, plane_obj, static_for_planning, []
         )
-        if not init2grasp_collision or not grasp2init_collision:
+
+        if not goal_collision_free or not standoff_collision_free:
+            consecutive_failures += 1
             continue
 
-        init2grasp_path_temp = RC.get_path2grasp(
-            rac,
-            init2grasp_angels_temp,
-            scene_info,
-            target_mesh=object_mesh[slot_idx],
-            time_limit=30,
-            given_static_model=static_for_planning,
-        )
-        if init2grasp_path_temp is None:
-            consecutive_path_failures += 1
-            continue
+        return {
+            "path": [goal_joint_config],
+            "grasp_idx": int(grasp_idx),
+            "target_grasp_pos": np.array(target_grasp_pos, dtype=np.float32),
+            "target_grasp_quat": np.array(target_grasp_quat, dtype=np.float32),
+        }
 
-        temp_mod_bbox = rac.modify_grasp_bbox(
-            init2grasp_angels_temp,
-            target_mesh=object_mesh[slot_idx],
-            visualize=False,
-        )
-        grasp2init_path_temp = RC.get_path2start(
-            rac,
-            grasp2init_angels_temp,
-            temp_mod_bbox,
-            scene_info,
-            time_limit=30,
-            given_static_model=static_for_planning,
-        )
-        if grasp2init_path_temp is None:
-            consecutive_path_failures += 1
-            continue
+    return None
 
-        consecutive_path_failures = 0
-        swept_volume1_temp, swept_verts1_temp = rac.get_swept_volume(
-            init2grasp_path_temp,
-            frame_rate=60,
-            scene_info=scene_info,
-            animation=False,
-            static_vi=False,
-        )
-        swept_volume2_temp, swept_verts2_temp = rac.get_swept_volume(
-            grasp2init_path_temp,
-            w_target=temp_mod_bbox,
-            frame_rate=60,
-            scene_info=scene_info,
-            animation=False,
-            static_vi=False,
-        )
-        num_grasp += 1
-        swept_center_temp, swept_verts_temp = rac.get_swept_center(
-            swept_verts1_temp + swept_verts2_temp, scene_info, 0.6
-        )
-        temp_swept_size = get_swept_volume_size(swept_verts_temp)
-        if temp_swept_size < swept_size:
-            swept_size = temp_swept_size
-            init2grasp_path = init2grasp_path_temp
-            selected_grasp_idx = int(grasp_idx)
-            selected_target_grasp_pos = np.array(target_grasp_pos, dtype=np.float32)
-            selected_target_grasp_quat = np.array(target_grasp_quat, dtype=np.float32)
-        if num_grasp == 1:
-            break
 
-    if init2grasp_path is None:
-        return None
-    if len(init2grasp_path) > 1:
-        init2grasp_path = interpolate_path(init2grasp_path, steps_between=2)
-        init2grasp_path = resample_path(init2grasp_path, num_waypoints=10)
-    return {
-        "path": init2grasp_path,
-        "grasp_idx": selected_grasp_idx,
-        "target_grasp_pos": selected_target_grasp_pos,
-        "target_grasp_quat": selected_target_grasp_quat,
-    }
+def _plan_slot(plan_args):
+    (
+        k,
+        rac,
+        plane_obj,
+        scene_info,
+        object_mesh,
+        static_k,
+        grasp_data_k,
+        GT_OBJ_POS_LIST,
+    ) = plan_args
+    return k, plan_init2grasp_path_for_slot(
+        rac,
+        plane_obj,
+        scene_info,
+        object_mesh,
+        static_k,
+        grasp_data_k,
+        GT_OBJ_POS_LIST,
+        k,
+    )
 
 
 #*************************************************************************************************#
@@ -485,6 +451,16 @@ if __name__ == '__main__':
                 "type": str,
                 "default": None,
                 "help": "Output root for timestamped runs (default: PI-VLA/output/multi_obj).",
+            },
+            {
+                "name": "--export_scene_bundle",
+                "action": "store_true",
+                "help": "Also export realpc.obj, dim, and ur5e.urdf per sample.",
+            },
+            {
+                "name": "--flat_output",
+                "action": "store_true",
+                "help": "Save HDF5 files directly under output_dir with timestamp in filename.",
             },
         ],
     )
@@ -567,11 +543,8 @@ if __name__ == '__main__':
     with open(os.path.join(ASSETS_DIR, "urdf", "ur5e", "ur5e_mimic_real_gripper_test.urdf")) as f:
         urdf_str = f.read()
 
+    # Disable viewer during collection for speed and stability.
     viewer = None
-    if not getattr(args, "headless", False):
-        viewer = gym.create_viewer(sim, gymapi.CameraProperties())
-        if viewer is None:
-            print("*** Failed to create viewer; switching to headless mode.")
 
     spacing = 2
     env_lower = gymapi.Vec3(-spacing, -spacing, 0)
@@ -880,15 +853,14 @@ if __name__ == '__main__':
             # --- 3. Settle simulation and lock in meshes ---
             flex_collision_models = []
             object_mesh = []
-            for settle_step in range(100):
+            for settle_step in range(30):
                 gym.simulate(sim)
                 gym.fetch_results(sim, True)
                 gym.step_graphics(sim)
                 if viewer is not None:
                     gym.draw_viewer(viewer, sim, True)
-                gym.sync_frame_time(sim)
 
-                if settle_step == 99:
+                if settle_step == 29:
                     for i_obj, element in enumerate(object_handles):
                         states = gym.get_actor_rigid_body_states(envs[-1], element, gymapi.STATE_POS)
                         px = states['pose']['p']['x'].item()
@@ -913,27 +885,34 @@ if __name__ == '__main__':
                         vertices, faces = temp_obj.get_bounding_box_mesh()
                         object_mesh.append([vertices, faces])
 
-            plan_results = []
+            plan_args = []
             for k in range(NUM_OF_OBJECTS):
                 distractor_cols = [
                     flex_collision_models[j][0]
                     for j in range(NUM_OF_OBJECTS)
                     if j != k
                 ]
-                static_k = object_collision_models + distractor_cols
-                result_k = plan_init2grasp_path_for_slot(
-                    rac,
-                    plane_obj,
-                    scene_info,
-                    object_mesh,
-                    static_k,
-                    grasp_data_by_slot[k],
-                    GT_OBJ_POS_LIST,
-                    k,
+                plan_args.append(
+                    (
+                        k,
+                        rac,
+                        plane_obj,
+                        scene_info,
+                        object_mesh,
+                        object_collision_models + distractor_cols,
+                        grasp_data_by_slot[k],
+                        GT_OBJ_POS_LIST,
+                    )
                 )
-                plan_results.append(result_k)
-                if result_k is not None:
-                    print(f"Slot {k}: path with {len(result_k['path'])} waypoints")
+
+            plan_results = [None] * NUM_OF_OBJECTS
+            with ThreadPoolExecutor(max_workers=NUM_OF_OBJECTS) as pool:
+                future_to_slot = [pool.submit(_plan_slot, args_k) for args_k in plan_args]
+                for future in as_completed(future_to_slot):
+                    k, result_k = future.result()
+                    plan_results[k] = result_k
+                    if result_k is not None:
+                        print(f"Slot {k}: path with {len(result_k['path'])} waypoints")
 
             if any(p is None for p in plan_results):
                 failed = [k for k, p in enumerate(plan_results) if p is None]
@@ -997,7 +976,6 @@ if __name__ == '__main__':
                 gym.step_graphics(sim)
                 if viewer is not None:
                     gym.draw_viewer(viewer, sim, True)
-                gym.sync_frame_time(sim)
 
             gym.render_all_camera_sensors(sim)
             raw_top = gym.get_camera_image(sim, envs[-1], top_cam_handle, gymapi.IMAGE_COLOR)
@@ -1007,15 +985,13 @@ if __name__ == '__main__':
             rgba_side = raw_side.reshape(camera_props.height, camera_props.width, 4)
             start_image_side = rgba_side[..., :3].copy()
 
-            # Replay each planned path and capture trajectory joints + top/side RGB.
+            # Replay each planned path and capture trajectory joint states only.
             trajectory_joint_configs = []
-            trajectory_images_top = []
-            trajectory_images_side = []
             for k in range(NUM_OF_OBJECTS):
                 traj_q = []
-                traj_top = []
-                traj_side = []
-                for waypoint in init2grasp_paths[k]:
+                # Save a single sample per trajectory: the final waypoint only.
+                trajectory_waypoints = [init2grasp_paths[k][-1]]
+                for waypoint in trajectory_waypoints:
                     for _ in range(TRAJ_STEPS_PER_WAYPOINT):
                         gym.set_dof_target_position(envs[-1], spj, waypoint[0])
                         gym.set_dof_target_position(envs[-1], slj, waypoint[1])
@@ -1029,27 +1005,15 @@ if __name__ == '__main__':
                         gym.step_graphics(sim)
                         if viewer is not None:
                             gym.draw_viewer(viewer, sim, True)
-                        gym.sync_frame_time(sim)
 
-                        gym.render_all_camera_sensors(sim)
-                        raw_top_step = gym.get_camera_image(sim, envs[-1], top_cam_handle, gymapi.IMAGE_COLOR)
-                        raw_side_step = gym.get_camera_image(sim, envs[-1], side_cam_handle, gymapi.IMAGE_COLOR)
-                        top_step = raw_top_step.reshape(camera_props.height, camera_props.width, 4)[..., :3].copy()
-                        side_step = raw_side_step.reshape(camera_props.height, camera_props.width, 4)[..., :3].copy()
                         dof_states = gym.get_actor_dof_states(envs[-1], ur5e_handles[-1], gymapi.STATE_POS)
                         q_step = np.array(dof_states["pos"][:JOINT_DIM], dtype=np.float32)
 
                         traj_q.append(q_step)
-                        traj_top.append(top_step)
-                        traj_side.append(side_step)
 
                 trajectory_joint_configs.append(np.stack(traj_q, axis=0))
-                trajectory_images_top.append(np.stack(traj_top, axis=0))
-                trajectory_images_side.append(np.stack(traj_side, axis=0))
 
             trajectory_joint_configs = np.stack(trajectory_joint_configs, axis=0)  # (O, T, 6)
-            trajectory_images_top = np.stack(trajectory_images_top, axis=0)        # (O, T, H, W, 3)
-            trajectory_images_side = np.stack(trajectory_images_side, axis=0)      # (O, T, H, W, 3)
 
             default_output_dir = os.path.join(PI_VLA_ROOT, "output", "multi_obj")
             if args.output_dir:
@@ -1062,40 +1026,69 @@ if __name__ == '__main__':
             else:
                 output_root = default_output_dir
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            run_dir = os.path.join(output_root, timestamp)
-            os.makedirs(run_dir, exist_ok=True)
-            out_path = os.path.join(run_dir, f"grasp_multi3_demo_{timestamp}.h5")
-            str_dt = h5py.special_dtype(vlen=str)
+            if args.flat_output:
+                os.makedirs(output_root, exist_ok=True)
+                run_dir = output_root
+                out_path = os.path.join(output_root, f"grasp_multi3_{timestamp}_env{env_id}.h5")
+            else:
+                run_dir = os.path.join(output_root, timestamp)
+                os.makedirs(run_dir, exist_ok=True)
+                out_path = os.path.join(run_dir, f"grasp_multi3_{timestamp}.h5")
             with h5py.File(out_path, "w") as f:
-                f.create_dataset("start_image", data=start_image.astype(np.uint8), compression="gzip")
-                f.create_dataset("start_image_side", data=start_image_side.astype(np.uint8), compression="gzip")
-                f.create_dataset("object_locations", data=object_locations)
+                str_dt = h5py.special_dtype(vlen=str)
+
+                # Start images are shared across all objects in this episode.
+                f.create_dataset(
+                    "start_image",
+                    data=start_image.astype(np.uint8),
+                    compression="gzip",
+                )
+                f.create_dataset(
+                    "start_image_side",
+                    data=start_image_side.astype(np.uint8),
+                    compression="gzip",
+                )
+
+                # Per-object metadata.
                 name_ds = f.create_dataset("object_names", (NUM_OF_OBJECTS,), dtype=str_dt)
                 name_ds[:] = np.array(display_names, dtype=object)
-                folder_ds = f.create_dataset("object_id_folders", (NUM_OF_OBJECTS,), dtype=str_dt)
-                folder_ds[:] = np.array(id_folders, dtype=object)
-                f.create_dataset("goal_joint_configs", data=goal_joint_configs)
-                f.create_dataset("trajectory_joint_configs", data=trajectory_joint_configs)
-                f.create_dataset("trajectory_images_top", data=trajectory_images_top.astype(np.uint8), compression="gzip")
-                f.create_dataset("trajectory_images_side", data=trajectory_images_side.astype(np.uint8), compression="gzip")
-                f.create_dataset("grasp_indices", data=grasp_indices)
-                f.create_dataset("grasp_target_positions", data=target_grasp_positions)
-                f.create_dataset("grasp_target_quaternions", data=target_grasp_quaternions)
-                f.attrs["joint_dim"] = int(JOINT_DIM)
-                f.attrs["num_objects"] = int(NUM_OF_OBJECTS)
-                f.attrs["trajectory_steps_per_waypoint"] = int(TRAJ_STEPS_PER_WAYPOINT)
-                f.flush()
+                id_ds = f.create_dataset("object_id_folders", (NUM_OF_OBJECTS,), dtype=str_dt)
+                id_ds[:] = np.array(id_folders, dtype=object)
 
-            obj_path, dim_path, urdf_path = _export_train_arm_scene_dataset(
-                output_dir=run_dir,
-                table_pose=table_pose,
-                table_dims=table_dims,
-                object_reader_tracker=object_reader_tracker,
-            )
+                f.create_dataset("object_locations", data=object_locations)
+                f.create_dataset("goal_joint_configs", data=goal_joint_configs)
+                f.create_dataset("grasp_indices", data=grasp_indices)
+                f.create_dataset("target_grasp_positions", data=target_grasp_positions)
+                f.create_dataset("target_grasp_quaternions", data=target_grasp_quaternions)
+
+                # Trajectory tensors have shape (NUM_OF_OBJECTS, T, ...).
+                f.create_dataset(
+                    "trajectory_joint_configs",
+                    data=trajectory_joint_configs,
+                    compression="gzip",
+                )
+                f.attrs["num_objects"] = NUM_OF_OBJECTS
+                f.attrs["joint_dim"] = int(JOINT_DIM)
+                f.attrs["num_steps"] = int(trajectory_joint_configs.shape[1])
+                f.attrs["timestamp"] = timestamp
+                f.flush()
+            print(f"Saved episode -> {out_path}")
+
+            if args.export_scene_bundle:
+                bundle_dir = run_dir
+                if args.flat_output:
+                    bundle_dir = os.path.join(output_root, f"scene_bundle_{timestamp}_env{env_id}")
+                obj_path, dim_path, urdf_path = _export_train_arm_scene_dataset(
+                    output_dir=bundle_dir,
+                    table_pose=table_pose,
+                    table_dims=table_dims,
+                    object_reader_tracker=object_reader_tracker,
+                )
             successful_episodes += 1
             episode_saved = True
-            print(f"Saved 1 sample to {out_path}")
-            print(f"Exported scene bundle: {obj_path}, {dim_path}, {urdf_path}")
+            print(f"Saved 1 episode to {out_path}")
+            if args.export_scene_bundle:
+                print(f"Exported scene bundle: {obj_path}, {dim_path}, {urdf_path}")
 
         if not episode_saved:
             print(

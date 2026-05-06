@@ -1,0 +1,20 @@
+nohup: ignoring input
+Starting multi-object collection:
+  total runs:      10000
+  GPUs:            3 (0,1,2)
+  base output dir: output/multi_obj/20260421
+  logs dir:        /home/hojinsohn/VLM-NT/PI-VLA/hanwen_grasping/collect_data/logs
+
+GPU 0 -> 3334 runs, output: output/multi_obj/20260421/gpu0
+GPU 1 -> 3333 runs, output: output/multi_obj/20260421/gpu1
+GPU 2 -> 3333 runs, output: output/multi_obj/20260421/gpu2
+
+Workers started:
+  GPU 0 log: /home/hojinsohn/VLM-NT/PI-VLA/hanwen_grasping/collect_data/logs/multi_obj_collect_gpu0.log
+  GPU 1 log: /home/hojinsohn/VLM-NT/PI-VLA/hanwen_grasping/collect_data/logs/multi_obj_collect_gpu1.log
+  GPU 2 log: /home/hojinsohn/VLM-NT/PI-VLA/hanwen_grasping/collect_data/logs/multi_obj_collect_gpu2.log
+Use: tail -f /home/hojinsohn/VLM-NT/PI-VLA/hanwen_grasping/collect_data/logs/multi_obj_collect_gpu0.log
+
+
+Stopping all workers...
+All workers finished. Total failures reported: 0

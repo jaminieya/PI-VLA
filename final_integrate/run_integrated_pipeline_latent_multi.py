@@ -8,6 +8,15 @@ goal generation with image->latent inference from
 `run_integrated_pipeline_latent.py`.
 
 It also adds `--ntfield_delta_clamp_rad` for latent planning stability.
+cd /home/hojinsohn/VLM-NT/PI-VLA
+
+python final_integrate/run_integrated_pipeline_latent_multi.py \
+  --ntfield_checkpoint "/home/hojinsohn/VLM-NT/PI-VLA/teacher_model.pt" \
+  --latent_checkpoint "/home/hojinsohn/VLM-NT/PI-VLA/final_integrate/_training_live_latent_multi_image_text_prompt_fusion.pth" \
+  --target_object_idx 0 \
+  --ntfield_device cuda:0 \
+  --latent_device auto \
+  --use_viewer
 """
 
 from __future__ import annotations

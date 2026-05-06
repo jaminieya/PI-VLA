@@ -18,7 +18,7 @@ fi
 
 if [[ -z "${CONDA_SH}" || ! -f "${CONDA_SH}" ]]; then
   echo "ERROR: Could not find conda.sh. Set CONDA_SH to your conda.sh path." >&2
-  echo "Example: CONDA_SH=~/miniconda3/etc/profile.d/conda.sh bash train_config.sh" >&2
+  echo "Example: CONDA_SH=~/miniconda3/etc/profile.d/conda.sh bash train_config_multi.sh" >&2
   exit 1
 fi
 
@@ -26,12 +26,12 @@ fi
 source "${CONDA_SH}"
 conda activate "${CONDA_ENV}"
 
-# Runs full_train.py under nohup and writes logs + PID.
+# Runs full_train_multi.py under nohup and writes logs + PID.
 # Usage:
-#   bash train_config.sh
-#   CUDA_VISIBLE_DEVICES=0 bash train_config.sh
-#   RUN_NAME=my_run bash train_config.sh
-#   RUN_NAME=exp1 WANDB_RUN_NAME=wonorm_v2 TRAIN_EPOCHS=50 TRAIN_LOSS_TYPE=mse bash train_config.sh
+#   bash train_config_multi.sh
+#   CUDA_VISIBLE_DEVICES=0 bash train_config_multi.sh
+#   RUN_NAME=my_multi_run bash train_config_multi.sh
+#   RUN_NAME=exp1 WANDB_RUN_NAME=multi_v1 TRAIN_EPOCHS=50 TRAIN_LOSS_TYPE=mse bash train_config_multi.sh
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -39,30 +39,31 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 # ---------------------------------------------------------------------------
 # Training config defaults (edit here)
 # You can still override any of these from CLI, e.g.:
-#   TRAIN_EPOCHS=50 TRAIN_LOSS_TYPE=mse bash train_config.sh
+#   TRAIN_EPOCHS=50 TRAIN_LOSS_TYPE=mse bash train_config_multi.sh
 # ---------------------------------------------------------------------------
-RUN_NAME="train_config"
-TRAIN_SCRIPT="full_train.py"
+RUN_NAME="train_config_multi"
+TRAIN_SCRIPT="full_train_multi.py"
 WANDB_ENABLED="true"
-WANDB_RUN_NAME="hybrid_mse_infonce_cosine"
+WANDB_RUN_NAME="multi_image_text_prompt_fusion_hybrid_0.5_loc_head2"
 WANDB_LOG_BATCHES="true"
 WANDB_BATCH_LOG_EVERY="10"
-TRAIN_EPOCHS="30"
-TRAIN_EVAL_EVERY="2"
+TRAIN_EPOCHS="100"
+TRAIN_EVAL_EVERY="10"
 TRAIN_BATCH_SIZE="128"
 TRAIN_LR="1e-4"
 TRAIN_LOSS_TYPE="hybrid"   # hybrid | mse | cos
 TRAIN_LOSS_ALPHA="0.5"     # used when TRAIN_LOSS_TYPE=hybrid
-TRAIN_CKPT_NAME="best_z_goal_model_hybrid_mse_infonce_cosine_{run_name}.pth" # supports {run_name}
-TRAIN_PCA_OUTPUT_DIR="/home/hojinsohn/VLM-NT/PI-VLA/output/pca_training_plots_hybrid_mse_infonce_cosine"
-TRAIN_INFONCE_WEIGHT="0.1"
+TRAIN_CKPT_NAME="best_z_goal_model_multi_hybrid_0.5_loc_head2_{run_name}.pth" # supports {run_name}
+TRAIN_PCA_OUTPUT_DIR="/home/hojinsohn/VLM-NT/PI-VLA/output/pca_training_plots_multi_loc_head2"
+TRAIN_INFONCE_WEIGHT="0.0"
 TRAIN_INFONCE_TEMP="0.1"
+TRAIN_MAX_PROMPT_LEN="8"
 
-# Export so full_train.py can read via os.getenv(...)
+# Export so full_train_multi.py can read via os.getenv(...)
 export WANDB_ENABLED WANDB_RUN_NAME WANDB_LOG_BATCHES WANDB_BATCH_LOG_EVERY
 export TRAIN_EPOCHS TRAIN_EVAL_EVERY TRAIN_BATCH_SIZE TRAIN_LR
 export TRAIN_LOSS_TYPE TRAIN_LOSS_ALPHA TRAIN_CKPT_NAME TRAIN_PCA_OUTPUT_DIR
-export TRAIN_INFONCE_WEIGHT TRAIN_INFONCE_TEMP
+export TRAIN_INFONCE_WEIGHT TRAIN_INFONCE_TEMP TRAIN_MAX_PROMPT_LEN
 
 TS="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="${REPO_ROOT}/PI-VLA/output/runs/${RUN_NAME}_${TS}"
@@ -81,6 +82,7 @@ echo "Config:     TRAIN_EPOCHS=${TRAIN_EPOCHS} TRAIN_EVAL_EVERY=${TRAIN_EVAL_EVE
 echo "Config:     TRAIN_LOSS_TYPE=${TRAIN_LOSS_TYPE} TRAIN_LOSS_ALPHA=${TRAIN_LOSS_ALPHA}"
 echo "Config:     TRAIN_CKPT_NAME=${TRAIN_CKPT_NAME}"
 echo "Config:     TRAIN_PCA_OUTPUT_DIR=${TRAIN_PCA_OUTPUT_DIR}"
+echo "Config:     TRAIN_MAX_PROMPT_LEN=${TRAIN_MAX_PROMPT_LEN}"
 
 cd "${SCRIPT_DIR}"
 

@@ -4,13 +4,16 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torchvision import models, transforms
+from student_model_cvae import CVAEStudent
 
 # ---------------------------------------------------------------------------
 # wandb (optional — auto-disables if not installed)
@@ -60,13 +63,18 @@ PI_VLA_ROOT = Path("/home/hojinsohn/VLM-NT/PI-VLA")
 INTEGRATION_SCRIPT = PI_VLA_ROOT / "final_integrate" / "run_integrated_pipeline_latent_multi_obj.py"
 NTFIELD_CHECKPOINT = str(PI_VLA_ROOT / "teacher_model.pt")
 INTEGRATION_OUTPUT_ROOT = PI_VLA_ROOT / "output" / "integration_eval_during_training"
-RUN_INTEGRATION_EVERY = 90          # run integration eval every N epochs
+# When INTEGRATION_ON_VAL_IMPROVE_ONLY=0, run integration every N epochs (and last epoch).
+RUN_INTEGRATION_EVERY = 20
 INTEGRATION_NUM_TRIALS = 10        # how many trials per eval
-INTEGRATION_PER_TRIAL_TIMEOUT = 300 # seconds per subprocess trial
+INTEGRATION_PER_TRIAL_TIMEOUT = 300  # seconds per trial budget (scaled for batch subprocess)
+# Total timeout for one integration subprocess = num_trials * per-trial * mult (override with INTEGRATION_EVAL_TIMEOUT).
+INTEGRATION_BATCH_TIMEOUT_MULT = float(os.getenv("INTEGRATION_BATCH_TIMEOUT_MULT", "1.25"))
 INTEGRATION_NTFIELD_TOL = 0.01
 INTEGRATION_NTFIELD_MAX_STEPS = 200
 INTEGRATION_NTFIELD_STEP_SIZE = 0.02
-INTEGRATION_VIDEOS_PER_EVAL = 2   # how many trial videos to upload per eval (<= NUM_TRIALS)
+# First N trials get wandb.Video uploads per integration run (env INTEGRATION_VIDEOS_PER_EVAL).
+INTEGRATION_VIDEOS_PER_EVAL = 8
+# One subprocess per eval with --num_trials (see run_integrated_pipeline_latent_multi_obj.py).
 # Temp checkpoint written every eval so the subprocess loads the *current* model.
 INTEGRATION_LIVE_CKPT = PI_VLA_ROOT / "final_integrate" / "_training_live_latent.pth"
 
@@ -90,6 +98,8 @@ def _wandb_log(data: dict, step: Optional[int] = None) -> None:
     """Safe wandb.log wrapper — silently skips if wandb isn't running."""
     if not _wandb_active():
         return
+    if not data:
+        return
     try:
         if step is not None:
             wandb.log(data, step=step)
@@ -97,6 +107,7 @@ def _wandb_log(data: dict, step: Optional[int] = None) -> None:
             wandb.log(data)
     except Exception as e:
         print(f"[wandb] log failed: {e}", flush=True)
+        traceback.print_exc()
 
 
 # ---------------------------------------------------------------------------
@@ -232,63 +243,38 @@ def train_val_indices_for_shard(
 
 
 # ---------------------------------------------------------------------------
+# KL-beta scheduling
 # ---------------------------------------------------------------------------
-# Loss helpers
-# ---------------------------------------------------------------------------
 
-class MultiPositiveInfoNCELoss(nn.Module):
-    def __init__(self, temperature=0.1, atol=1e-5):
-        super().__init__()
-        self.temperature = temperature
-        self.atol = atol
+def compute_kl_beta(
+    step: int,
+    schedule: str,
+    beta_start: float,
+    beta_end: float,
+    anneal_steps: int,
+    cycle_steps: int,
+) -> float:
+    """
+    Compute KL weight beta for the current optimization step.
+    Supported schedules:
+      - linear: ramp beta_start -> beta_end over anneal_steps, then hold.
+      - cyclical: ramp beta_start -> beta_end each cycle over cycle_steps.
+    """
+    if schedule == "linear":
+        if anneal_steps <= 0:
+            return beta_end
+        progress = min(max(step, 0) / anneal_steps, 1.0)
+        return beta_start + (beta_end - beta_start) * progress
 
-    def forward(self, pred, target):
-        # Normalize predictions and targets for cosine similarity
-        pred_n = nn.functional.normalize(pred, dim=1)
-        target_n = nn.functional.normalize(target, dim=1)
+    if schedule == "cyclical":
+        if cycle_steps <= 0:
+            return beta_end
+        cycle_step = step % cycle_steps
+        progress = cycle_step / cycle_steps
+        return beta_start + (beta_end - beta_start) * progress
 
-        # Logits: (B, B) matrix where Row i, Col j is similarity between pred[i] and target[j]
-        logits = torch.matmul(pred_n, target_n.T) / self.temperature
+    raise ValueError(f"Unsupported KL beta schedule: {schedule}")
 
-        # Create positive mask: 1 if target vectors are effectively identical, 0 otherwise.
-        # We use torch.isclose with a tight tolerance to handle floating-point nuances in latents.
-        mask = torch.isclose(
-            target.unsqueeze(1), 
-            target.unsqueeze(0), 
-            atol=self.atol
-        ).all(dim=-1).float()
-
-        # Compute log probabilities: log( exp(sim) / sum(exp(sim)) )
-        log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
-
-        # Mean over all true positives for each anchor, then mean over the batch
-        loss = - (mask * log_prob).sum(dim=1) / mask.sum(dim=1)
-
-        return loss.mean()
-
-class HybridDistillationLoss(nn.Module):
-    def __init__(self, alpha=0.5, infonce_weight=0.0, temperature=0.1):
-        super().__init__()
-        self.mse = nn.MSELoss()
-        self.cosine = nn.CosineSimilarity(dim=1)
-        self.alpha = alpha
-        self.infonce_weight = infonce_weight
-        
-        if self.infonce_weight > 0:
-            self.infonce = MultiPositiveInfoNCELoss(temperature=temperature)
-
-    def forward(self, pred, target):
-        # Base losses
-        mse_loss = self.mse(pred, target)
-        cos_loss = torch.mean(1 - self.cosine(pred, target))
-        base_loss = (self.alpha * mse_loss) + ((1 - self.alpha) * cos_loss)
-
-        # Add InfoNCE if configured
-        if self.infonce_weight > 0:
-            info_loss = self.infonce(pred, target)
-            return base_loss + (self.infonce_weight * info_loss)
-            
-        return base_loss
 
 # ---------------------------------------------------------------------------
 # Batch runner
@@ -300,6 +286,8 @@ def run_batches(
     batch_size, train, epoch, epochs,
     batch_counter, wandb_log_batches, wandb_batch_log_every,
     token_to_id, max_prompt_len,
+    kl_beta_schedule, kl_beta_start, kl_beta_end, kl_anneal_steps, kl_cycle_steps,
+    z_align_weight: float = 0.1,
 ):
     if not local_indices:
         return 0.0, 0
@@ -338,14 +326,29 @@ def run_batches(
 
         if train:
             optimizer.zero_grad(set_to_none=True)
-            z_pred = model(x, text_tokens)
-            loss = criterion(z_pred, y)
+            z_pred, kl_loss, aux = model(x, text_tokens, z_goal=y, return_aux=True)
+            recon_loss = criterion(z_pred, y)
+            prior_mu = aux.get("prior_mu")
+            posterior_mu = aux.get("posterior_mu")
+            if prior_mu is None or posterior_mu is None:
+                z_alignment_loss = torch.zeros((), device=x.device, dtype=x.dtype)
+            else:
+                z_alignment_loss = F.mse_loss(prior_mu, posterior_mu.detach())
+            beta = compute_kl_beta(
+                step=batch_counter[0],
+                schedule=kl_beta_schedule,
+                beta_start=kl_beta_start,
+                beta_end=kl_beta_end,
+                anneal_steps=kl_anneal_steps,
+                cycle_steps=kl_cycle_steps,
+            )
+            loss = recon_loss + beta * kl_loss + float(z_align_weight) * z_alignment_loss
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
         else:
             with torch.no_grad():
-                z_pred = model(x, text_tokens)
+                z_pred, _ = model(x, text_tokens, z_goal=None)
                 loss = criterion(z_pred, y)
             running_loss += loss.item()
 
@@ -364,6 +367,11 @@ def run_batches(
         if train and wandb_log_batches and (batch_counter[0] % wandb_batch_log_every == 0):
             _wandb_log({
                 "batch/train_loss": loss.item(),
+                "batch/recon_loss": recon_loss.item(),
+                "batch/kl_loss": kl_loss.item(),
+                "batch/z_alignment_loss": z_alignment_loss.item(),
+                "batch/z_align_weight": float(z_align_weight),
+                "batch/kl_beta": beta,
                 "batch/train_lr": optimizer.param_groups[0]["lr"],
                 "batch/epoch": epoch + 1,
                 "batch/step": batch_counter[0],
@@ -413,7 +421,7 @@ def evaluate_shardwise(
                 prompts = ["grasp object"] * len(chunk)
             text_tokens = encode_prompts(prompts, token_to_id, max_prompt_len).to(device, non_blocking=True)
             x = normalize(x)
-            pred = model(x, text_tokens)
+            pred, _ = model(x, text_tokens, z_goal=None)
 
             b = x.size(0)
             n_samples += b
@@ -432,176 +440,13 @@ def evaluate_shardwise(
         n_samples,
     )
 
-# # ---------------------------------------------------------------------------
-# # Model
-# # ---------------------------------------------------------------------------
-# class StudentHeadWonorm(nn.Module):
-#     def __init__(self, in_features, output_dim):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(in_features, 512),
-#             nn.ReLU(),
-#             nn.Dropout(0.2),
-#             nn.Linear(512, output_dim),
-#         )
-
-#     def forward(self, x):
-#         return self.net(x)
-
-
-# class TextPromptEncoder(nn.Module):
-#     def __init__(self, vocab_size: int, embed_dim: int = 128):
-#         super().__init__()
-#         self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-
-#     def forward(self, token_ids):
-#         emb = self.embed(token_ids)  # (B, T, D)
-#         mask = (token_ids != 0).unsqueeze(-1).float()
-#         denom = mask.sum(dim=1).clamp_min(1.0)
-#         return (emb * mask).sum(dim=1) / denom
-
-
-# class StudentModelWonorm(nn.Module):
-#     """Defined at module level so torch.save/load and pickle work correctly."""
-#     def __init__(self, output_dim: int, vocab_size: int, text_embed_dim: int = 128):
-#         super().__init__()
-#         backbone = build_resnet18()
-#         in_features = backbone.fc.in_features
-#         backbone.fc = nn.Identity()
-#         self.backbone = backbone
-#         self.text_encoder = TextPromptEncoder(vocab_size=vocab_size, embed_dim=text_embed_dim)
-#         self.head = StudentHeadWonorm(in_features + text_embed_dim, output_dim)
-
-#     def forward(self, x, text_tokens):
-#         image_feat = self.backbone(x)
-#         text_feat = self.text_encoder(text_tokens)
-#         fused = torch.cat([image_feat, text_feat], dim=1)
-#         return self.head(fused)
-
-# def get_model_wonorm(output_dim: int, vocab_size: int) -> nn.Module:
-#     return StudentModelWonorm(output_dim, vocab_size=vocab_size)
-
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-
-class StudentHeadWonorm(nn.Module):
-    def __init__(self, in_features, output_dim, dropout_p: float = 0.2):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_features, 256),   # reduced from 512
-            nn.ReLU(),
-            nn.Dropout(dropout_p),
-            nn.Linear(256, output_dim),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class TextPromptEncoder(nn.Module):
-    def __init__(self, vocab_size: int, embed_dim: int = 32):  # reduced from 128
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-
-    def forward(self, token_ids):
-        emb = self.embed(token_ids)          # (B, T, D)
-        mask = (token_ids != 0).unsqueeze(-1).float()
-        denom = mask.sum(dim=1).clamp_min(1.0)
-        return (emb * mask).sum(dim=1) / denom
-
-
-class StudentModelWonorm(nn.Module):
-    """
-    Lightweight student model for latent goal prediction.
-
-    Architecture:
-      - Frozen ResNet18 backbone (pretrained ImageNet) → 512-dim image feature
-      - Small learned text embedding (mean-pooled) → 32-dim text feature
-      - Adapter: Linear(512 → 256) + ReLU  [only trainable vision params]
-      - Head: Linear(256 + 32 → output_dim)
-
-    Trainable params: ~160K (vs ~11.5M in original)
-    Frozen params:    ~11.2M (ResNet18 backbone)
-    """
-    def __init__(
-        self,
-        output_dim: int,
-        vocab_size: int,
-        text_embed_dim: int = 32,
-        dropout_p: float = 0.2,
-        freeze_backbone: bool = True,
-        unfreeze_layers: tuple = ("layer4",),   # set to () to freeze all
-    ):
-        super().__init__()
-
-        # --- Vision backbone ---
-        backbone = build_resnet18()
-        in_features = backbone.fc.in_features   # 512 for ResNet18
-        backbone.fc = nn.Identity()
-        self.backbone = backbone
-
-        # Freeze backbone first, then selectively unfreeze requested layers
-        for param in self.backbone.parameters():
-            param.requires_grad = not freeze_backbone
-
-        if freeze_backbone and unfreeze_layers:
-            for name, param in self.backbone.named_parameters():
-                if any(name.startswith(layer) for layer in unfreeze_layers):
-                    param.requires_grad = True
-
-        # --- Lightweight adapter on top of frozen features ---
-        self.adapter = nn.Sequential(
-            nn.Linear(in_features, 256),
-            nn.ReLU(),
-            nn.Dropout(dropout_p),
-        )
-
-        # --- Text encoder ---
-        self.text_encoder = TextPromptEncoder(
-            vocab_size=vocab_size,
-            embed_dim=text_embed_dim,
-        )
-
-        # --- Fusion head ---
-        self.head = StudentHeadWonorm(
-            in_features=256 + text_embed_dim,
-            output_dim=output_dim,
-            dropout_p=dropout_p,
-        )
-
-    def forward(self, x, text_tokens):
-        with torch.set_grad_enabled(
-            any(p.requires_grad for p in self.backbone.parameters())
-        ):
-            image_feat = self.backbone(x)       # (B, 512)
-
-        adapted = self.adapter(image_feat)      # (B, 256)
-        text_feat = self.text_encoder(text_tokens)
-        fused = torch.cat([adapted, text_feat], dim=1)
-        return self.head(fused)
-
-    def count_parameters(self):
-        """Utility to print trainable vs frozen param counts."""
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        frozen    = sum(p.numel() for p in self.parameters() if not p.requires_grad)
-        total     = trainable + frozen
-        print(
-            f"Parameters | trainable: {trainable:,}  "
-            f"frozen: {frozen:,}  total: {total:,}",
-            flush=True,
-        )
-        return trainable, frozen, total
-
 
 def get_model_wonorm(output_dim: int, vocab_size: int, dropout_p: float = 0.2) -> nn.Module:
-    model = StudentModelWonorm(
+    model = CVAEStudent(
         output_dim=output_dim,
         vocab_size=vocab_size,
-        text_embed_dim=32,
+        latent_dim=128,
         dropout_p=dropout_p,
-        freeze_backbone=True,
-        unfreeze_layers=(),       # freeze ALL of ResNet18
     )
     model.count_parameters()
     return model
@@ -673,7 +518,7 @@ def collect_val_embeddings(
                 prompts = ["grasp object"] * len(chunk)
             text_tokens = encode_prompts(prompts, token_to_id, max_prompt_len).to(device, non_blocking=True)
             x = normalize(x)
-            pred = model(x, text_tokens)
+            pred, _ = model(x, text_tokens, z_goal=None)
             pred = pred.cpu()
             preds.append(pred)
             targets.append(y)
@@ -773,7 +618,33 @@ def _save_live_checkpoint_for_integration(
         "model_state_dict": model.state_dict(),
         "z_dim": z_dim,
         "vocab_size": vocab_size,
+        "latent_dim": int(getattr(model, "latent_dim", 128)),
     }, ckpt_path)
+
+
+def _resolve_integration_media_path(
+    maybe_path: Optional[str],
+    base_dir: Optional[Union[str, Path]],
+) -> Optional[str]:
+    """
+    Turn a path from ``pipeline_summary.json`` into an absolute path the training
+    process can open. Handles paths saved relative to ``trial_dir`` / ``session_dir``.
+    """
+    if not maybe_path or not isinstance(maybe_path, str):
+        return None
+    p = Path(maybe_path).expanduser()
+    if p.is_file():
+        return str(p.resolve())
+    if base_dir is None:
+        return None
+    b = Path(base_dir)
+    for cand in (b / maybe_path, b / p.name):
+        try:
+            if cand.is_file():
+                return str(cand.resolve())
+        except OSError:
+            continue
+    return None
 
 
 def _parse_integration_trial_result(session_dir: Path) -> dict:
@@ -812,10 +683,15 @@ def _parse_integration_trial_result(session_dir: Path) -> dict:
     except Exception as e:
         return {"success": False, "reason": f"summary_parse_error: {e}", "summary": None, "video": None}
 
-    video = summary.get("predicted_video")
-    if not video:
-        video = (summary.get("videos") or {}).get("predicted_latent_goal")
-    video_exists = bool(video) and Path(video).is_file()
+    session_for_path = str(summary.get("session_dir") or session_dir)
+    video_raw = summary.get("predicted_video")
+    if not video_raw:
+        video_raw = (summary.get("videos") or {}).get("predicted_latent_goal")
+    video = _resolve_integration_media_path(
+        video_raw if isinstance(video_raw, str) else None,
+        session_for_path,
+    )
+    video_exists = video is not None
 
     status_str = str(summary.get("status", "")).strip().lower()
     if status_str in {"success", "failure"}:
@@ -857,6 +733,204 @@ def _parse_integration_trial_result(session_dir: Path) -> dict:
     }
 
 
+def _find_latest_integration_session(eval_dir: Path) -> Optional[Path]:
+    """Newest directory under ``eval_dir`` that contains integration outputs."""
+    if not eval_dir.is_dir():
+        return None
+    hits: List[Path] = []
+    for p in eval_dir.rglob("batch_summary.json"):
+        hits.append(p.parent)
+    for p in eval_dir.rglob("pipeline_summary.json"):
+        hits.append(p.parent)
+    if not hits:
+        return None
+    hits.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    return hits[0]
+
+
+def _merge_batch_trials_into_metrics(session_dir: Path) -> Dict[str, Any]:
+    """
+    Parse ``batch_summary.json`` from ``run_integrated_pipeline_latent_multi_obj.py``
+    (``--num_trials`` batch). Falls back to a single ``pipeline_summary.json`` under
+    ``session_dir`` for older layouts.
+    """
+    batch_path = session_dir / "batch_summary.json"
+    if batch_path.is_file():
+        with batch_path.open("r", encoding="utf-8") as f:
+            batch = json.load(f)
+        trials_out: List[Dict[str, Any]] = []
+        for t in batch.get("trials") or []:
+            st = str(t.get("status", "")).strip().lower()
+            ok = st == "success"
+            if st == "error":
+                ok = False
+            td = t.get("session_dir") or t.get("trial_dir")
+            td_s = str(td) if td else str(session_dir)
+            vid_raw = t.get("predicted_video")
+            vid = _resolve_integration_media_path(
+                vid_raw if isinstance(vid_raw, str) else None,
+                td_s,
+            )
+            dist = t.get("ntfield_final_latent_dist")
+            dist_f: Optional[float] = None
+            if isinstance(dist, (int, float)) and dist == dist:
+                dist_f = float(dist)
+            lg = t.get("latent_goal_l2")
+            lg_f: Optional[float] = None
+            if isinstance(lg, (int, float)) and lg == lg:
+                lg_f = float(lg)
+            ee = t.get("ee_to_target_dist_m")
+            sc_raw = t.get("success_check")
+            sc = sc_raw if isinstance(sc_raw, dict) else {}
+            if ee is None:
+                ee = sc.get("ee_to_target_dist_m")
+            ee_f: Optional[float] = None
+            if isinstance(ee, (int, float)) and ee == ee:
+                ee_f = float(ee)
+            ee_succ = sc.get("success")
+            trials_out.append(
+                {
+                    "trial": int(t.get("trial_index", len(trials_out))),
+                    "success": ok,
+                    "latent_error_l2": dist_f,
+                    "planner_final_latent_dist": dist_f,
+                    "latent_goal_l2": lg_f,
+                    "path_length": t.get("path_length"),
+                    "planner_stop_reason": t.get("planner_stop_reason"),
+                    "trial_dir": td_s,
+                    "video": vid,
+                    "exit_code": 0 if st != "error" else 1,
+                    "timed_out": False,
+                    "error": t.get("error"),
+                    "ee_to_target_dist_m": ee_f,
+                    "ee_thresh_success": ee_succ,
+                }
+            )
+        return {
+            "batch": batch,
+            "trials": trials_out,
+            "success_rate": float(batch.get("success_rate", 0.0)),
+            "num_success": int(batch.get("success_count", 0)),
+        }
+
+    pr = _parse_integration_trial_result(session_dir)
+    success = bool(pr.get("success", False))
+    dist = pr.get("latent_error_l2")
+    summ = pr.get("summary") or {}
+    td = summ.get("session_dir") or str(session_dir)
+    vid = pr.get("video")
+    ee0 = summ.get("ee_to_target_dist_m")
+    sc0 = summ.get("success_check") if isinstance(summ.get("success_check"), dict) else {}
+    if ee0 is None:
+        ee0 = sc0.get("ee_to_target_dist_m")
+    ee0_f: Optional[float] = None
+    if isinstance(ee0, (int, float)) and ee0 == ee0:
+        ee0_f = float(ee0)
+    return {
+        "batch": None,
+        "trials": [
+            {
+                "trial": 0,
+                "success": success,
+                "latent_error_l2": dist,
+                "planner_final_latent_dist": dist,
+                "latent_goal_l2": summ.get("latent_goal_l2"),
+                "path_length": summ.get("path_length"),
+                "planner_stop_reason": summ.get("planner_stop_reason"),
+                "trial_dir": str(td),
+                "video": str(vid) if vid else None,
+                "exit_code": 0,
+                "timed_out": False,
+                "error": None,
+                "ee_to_target_dist_m": ee0_f,
+                "ee_thresh_success": sc0.get("success"),
+            }
+        ],
+        "success_rate": 1.0 if success else 0.0,
+        "num_success": 1 if success else 0,
+    }
+
+
+def _run_integration_subprocess(
+    eval_dir: Path,
+    live_ckpt_path: Path,
+    epoch: int,
+    num_trials: int,
+) -> Dict[str, Any]:
+    """
+    One subprocess: ``run_integrated_pipeline_latent_multi_obj.py --num_trials N``
+    writes ``<eval_dir>/<timestamp>/batch_summary.json`` and per-trial folders.
+    """
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable,
+        str(INTEGRATION_SCRIPT),
+        "--ntfield_checkpoint",
+        str(NTFIELD_CHECKPOINT),
+        "--latent_checkpoint",
+        str(live_ckpt_path),
+        "--output_dir",
+        str(eval_dir.resolve()),
+        "--num_trials",
+        str(num_trials),
+        "--seed",
+        str(10_000 + int(epoch)),
+        "--ntfield_step_size",
+        str(INTEGRATION_NTFIELD_STEP_SIZE),
+        "--ntfield_max_steps",
+        str(INTEGRATION_NTFIELD_MAX_STEPS),
+        "--ntfield_tol",
+        str(INTEGRATION_NTFIELD_TOL),
+    ]
+    log_path = eval_dir / f"integration_subprocess_epoch_{epoch:03d}.log"
+    t_budget = int(
+        os.getenv(
+            "INTEGRATION_EVAL_TIMEOUT",
+            str(
+                int(num_trials * INTEGRATION_PER_TRIAL_TIMEOUT * INTEGRATION_BATCH_TIMEOUT_MULT + 120)
+            ),
+        )
+    )
+    t0 = time.time()
+    timed_out = False
+    exit_code = -999
+    try:
+        with log_path.open("w") as logf:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(PI_VLA_ROOT),
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                timeout=max(120, t_budget),
+                check=False,
+            )
+            exit_code = int(proc.returncode)
+        elapsed = time.time() - t0
+    except subprocess.TimeoutExpired:
+        elapsed = time.time() - t0
+        exit_code = -1
+        timed_out = True
+
+    session = _find_latest_integration_session(eval_dir)
+    merged: Dict[str, Any] = {
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "elapsed_sec": elapsed,
+        "session_dir": str(session) if session else None,
+        "trials": [],
+        "batch": None,
+        "success_rate": 0.0,
+        "num_success": 0,
+    }
+    if session is not None:
+        try:
+            parsed = _merge_batch_trials_into_metrics(session)
+            merged.update(parsed)
+        except Exception as e:
+            merged["parse_error"] = str(e)
+    return merged
+
+
 def run_integration_eval(
     model: nn.Module,
     z_dim: int,
@@ -864,16 +938,29 @@ def run_integration_eval(
     live_ckpt_path: Path,
     vocab_size: Optional[int],
     num_trials: int = INTEGRATION_NUM_TRIALS,
+    integration_max_workers: Optional[int] = None,
+    wandb_step: Optional[int] = None,
 ) -> dict:
     """
-    Run the end-to-end Isaac Gym + NTField pipeline `num_trials` times using
-    the *current* model weights (saved to a temporary checkpoint) and report
-    success rate + timing stats.
+    Run the end-to-end Isaac Gym + NTField pipeline ``num_trials`` times in a
+    **single** subprocess (``--num_trials`` on ``run_integrated_pipeline_latent_multi_obj.py``),
+    then parse ``batch_summary.json`` / per-trial ``pipeline_summary.json``.
 
-    Uses subprocess per trial because Isaac Gym has strict import-order
-    requirements and holds global state that conflicts with an already-running
-    torch/CUDA training process.
+    ``integration_max_workers`` is kept for API compatibility but is ignored:
+    parallel multi-process integration is disabled in favor of one batch run
+    per epoch (matches NTField load-once inside the integration script).
+
+    ``wandb_step`` should be the same global training step used for batch logs
+    (e.g. ``global_batch_counter[0]``) so media and scalars stay monotonic in W&B.
+
+    Override ``INTEGRATION_VIDEOS_PER_EVAL`` env to upload more than the default
+    first-two-trial videos each epoch.
     """
+    _ = integration_max_workers  # API compat; batch subprocess only
+
+    videos_cap = max(0, int(os.getenv("INTEGRATION_VIDEOS_PER_EVAL", str(INTEGRATION_VIDEOS_PER_EVAL))))
+    wandb_vid_fps = max(1, int(round(float(os.getenv("INTEGRATION_WANDB_VIDEO_FPS", "30")))))
+
     was_training = model.training
     model.eval()
 
@@ -882,127 +969,169 @@ def run_integration_eval(
     eval_dir = INTEGRATION_OUTPUT_ROOT / f"epoch_{epoch:03d}"
     eval_dir.mkdir(parents=True, exist_ok=True)
 
-    trial_records = []
-    per_trial_times = []
-    per_trial_latent_l2 = []
+    trial_records: List[Dict[str, Any]] = []
+    per_trial_times: List[float] = []
+    per_trial_latent_l2: List[float] = []
+    per_trial_path_len: List[float] = []
+    per_trial_goal_l2: List[float] = []
+    per_trial_ee: List[float] = []
     n_success = 0
 
-    # wandb artifacts collected across trials
-    wandb_table_rows = []
-    wandb_video_payload: dict = {}
-    wandb_topview_payload: dict = {}
+    wandb_table_rows: List[List[Any]] = []
+    wandb_video_payload: Dict[str, Any] = {}
+    wandb_topview_payload: Dict[str, Any] = {}
 
     print(
-        f" -> Running integrated evaluation: {num_trials} trials "
-        f"(epoch {epoch}), outputs at {eval_dir}",
+        f" -> Running integrated evaluation: {num_trials} trials in one subprocess "
+        f"(epoch {epoch}), outputs under {eval_dir}/<timestamp>/",
         flush=True,
     )
 
-    for trial in range(num_trials):
-        trial_dir = eval_dir / f"trial_{trial:02d}"
-        trial_dir.mkdir(parents=True, exist_ok=True)
+    batch = _run_integration_subprocess(eval_dir, live_ckpt_path, epoch, num_trials)
+    exit_code = int(batch.get("exit_code", -999))
+    timed_out = bool(batch.get("timed_out", False))
+    elapsed_total = float(batch.get("elapsed_sec", 0.0))
+    session_dir_s = batch.get("session_dir")
+    raw_trials: List[Dict[str, Any]] = list(batch.get("trials") or [])
+    if not raw_trials and num_trials > 0:
+        for t in range(num_trials):
+            raw_trials.append(
+                {
+                    "trial": t,
+                    "success": False,
+                    "latent_error_l2": None,
+                    "trial_dir": str(eval_dir),
+                    "video": None,
+                    "exit_code": exit_code,
+                    "timed_out": timed_out,
+                    "error": batch.get("parse_error") or batch.get("run_error"),
+                    "ee_to_target_dist_m": None,
+                    "ee_thresh_success": None,
+                }
+            )
 
-        cmd = [
-            sys.executable,
-            str(INTEGRATION_SCRIPT),
-            "--ntfield_checkpoint", str(NTFIELD_CHECKPOINT),
-            "--latent_checkpoint", str(live_ckpt_path),
-            "--output_dir", str(trial_dir),
-            "--seed", str(1000 + trial),                # reproducible per-trial scenes
-            "--ntfield_step_size", str(INTEGRATION_NTFIELD_STEP_SIZE),
-            "--ntfield_max_steps", str(INTEGRATION_NTFIELD_MAX_STEPS),
-            "--ntfield_tol", str(INTEGRATION_NTFIELD_TOL),
-        ]
+    n_t = max(len(raw_trials), 1)
+    per_wall = elapsed_total / float(n_t)
 
-        log_path = trial_dir / "run.log"
-        t0 = time.time()
-        try:
-            with log_path.open("w") as logf:
-                proc = subprocess.run(
-                    cmd,
-                    cwd=str(PI_VLA_ROOT),
-                    stdout=logf,
-                    stderr=subprocess.STDOUT,
-                    timeout=INTEGRATION_PER_TRIAL_TIMEOUT,
-                    check=False,
-                )
-            elapsed = time.time() - t0
-            exit_code = proc.returncode
-            timed_out = False
-        except subprocess.TimeoutExpired:
-            elapsed = time.time() - t0
-            exit_code = -1
-            timed_out = True
+    for rec in raw_trials:
+        trial = int(rec.get("trial", 0))
+        elapsed = float(rec.get("elapsed_sec", per_wall))
+        ex = int(rec.get("exit_code", exit_code))
+        tout = bool(rec.get("timed_out", timed_out))
+        success = bool(rec.get("success", False))
+        latent_error_l2 = rec.get("latent_error_l2")
+        trial_dir = Path(str(rec.get("trial_dir", eval_dir)))
+        path_len = rec.get("path_length")
+        stop_r = rec.get("planner_stop_reason")
+        goal_l2 = rec.get("latent_goal_l2")
+        ee_dist = rec.get("ee_to_target_dist_m")
+        ee_thresh_ok = rec.get("ee_thresh_success")
 
-        parsed = _parse_integration_trial_result(trial_dir)
-        # Some Isaac Gym runs can report shutdown segfaults after writing
-        # outputs; rely on the explicit success_check payload for task success.
-        success = (not timed_out) and bool(parsed.get("success", False))
-        latent_error_l2 = parsed.get("latent_error_l2")
         if success:
             n_success += 1
         per_trial_times.append(elapsed)
-        if latent_error_l2 is not None:
+        if isinstance(latent_error_l2, (int, float)) and latent_error_l2 == latent_error_l2:
             per_trial_latent_l2.append(float(latent_error_l2))
+        if isinstance(path_len, int):
+            per_trial_path_len.append(float(path_len))
+        if isinstance(goal_l2, (int, float)) and goal_l2 == goal_l2:
+            per_trial_goal_l2.append(float(goal_l2))
+        if isinstance(ee_dist, (int, float)) and ee_dist == ee_dist:
+            per_trial_ee.append(float(ee_dist))
 
-        trial_records.append({
-            "trial": trial,
-            "elapsed_sec": elapsed,
-            "exit_code": exit_code,
-            "timed_out": timed_out,
-            "success": success,
-            "latent_error_l2": latent_error_l2,
-            "trial_dir": str(trial_dir),
-            "video": parsed.get("video"),
-        })
+        trial_records.append(
+            {
+                "trial": trial,
+                "elapsed_sec": elapsed,
+                "exit_code": ex,
+                "timed_out": tout,
+                "success": success,
+                "latent_error_l2": latent_error_l2,
+                "path_length": path_len,
+                "planner_stop_reason": stop_r,
+                "latent_goal_l2": goal_l2,
+                "planner_final_latent_dist": rec.get("planner_final_latent_dist"),
+                "trial_dir": str(trial_dir),
+                "video": rec.get("video"),
+                "error": rec.get("error"),
+                "ee_to_target_dist_m": ee_dist,
+                "ee_thresh_success": ee_thresh_ok,
+            }
+        )
         print(
-            f"    trial {trial+1:02d}/{num_trials}: "
-            f"success={success} | latent_error_l2={latent_error_l2} | "
-            f"time={elapsed:6.2f}s | exit={exit_code}"
-            + (" | TIMEOUT" if timed_out else ""),
+            f"    trial {trial + 1:02d}/{num_trials}: "
+            f"success={success} | planner_final_latent_dist={latent_error_l2} | "
+            f"path_len={path_len} | ee_m={ee_dist} | stop={stop_r} | "
+            f"time={elapsed:6.2f}s | exit={ex}"
+            + (" | TIMEOUT" if tout else ""),
             flush=True,
         )
 
-        # -- wandb per-trial assets --
         if _wandb_active():
-            video_path = parsed.get("video")
+            video_path = rec.get("video")
             top_view_path = trial_dir / "top_view.png"
+            vp: Optional[Path] = None
+            if video_path:
+                vp = Path(str(video_path))
+                if not vp.is_file():
+                    alt = trial_dir / vp.name
+                    if alt.is_file():
+                        vp = alt
+                    else:
+                        vp = None
+                        if trial < videos_cap:
+                            print(
+                                f"    [wandb] skip video trial {trial}: path not found {video_path!r}",
+                                flush=True,
+                            )
 
-            # Upload up to INTEGRATION_VIDEOS_PER_EVAL videos per eval.
+            vid_key = f"integration/video/epoch_{epoch:03d}/trial_{trial:02d}"
             if (
-                video_path is not None
-                and Path(video_path).is_file()
-                and trial < INTEGRATION_VIDEOS_PER_EVAL
+                vp is not None
+                and vp.is_file()
+                and trial < videos_cap
             ):
                 try:
-                    wandb_video_payload[f"integration/video/trial_{trial:02d}"] = wandb.Video(
-                        str(video_path),
-                        caption=f"epoch {epoch} | trial {trial} | success={success}",
-                        format="mp4",
-                    )
+                    if vp.stat().st_size < 64:
+                        print(f"    [wandb] skip video trial {trial}: file too small {vp}", flush=True)
+                    else:
+                        wandb_video_payload[vid_key] = wandb.Video(
+                            str(vp.resolve()),
+                            caption=f"epoch {epoch} | trial {trial} | success={success}",
+                            format="mp4",
+                            fps=wandb_vid_fps,
+                        )
                 except Exception as e:
                     print(f"    [wandb] video upload failed for trial {trial}: {e}", flush=True)
 
-            if top_view_path.is_file() and trial < INTEGRATION_VIDEOS_PER_EVAL:
+            if top_view_path.is_file() and trial < videos_cap:
                 try:
-                    wandb_topview_payload[f"integration/top_view/trial_{trial:02d}"] = wandb.Image(
+                    wandb_topview_payload[
+                        f"integration/top_view/epoch_{epoch:03d}/trial_{trial:02d}"
+                    ] = wandb.Image(
                         str(top_view_path),
                         caption=f"epoch {epoch} | trial {trial} | success={success}",
                     )
                 except Exception as e:
                     print(f"    [wandb] top_view upload failed for trial {trial}: {e}", flush=True)
 
-            # Row for the per-trial table.
-            wandb_table_rows.append([
-                epoch,
-                trial,
-                bool(success),
-                float(elapsed),
-                int(exit_code),
-                bool(timed_out),
-                (float(latent_error_l2) if latent_error_l2 is not None else None),
-                str(trial_dir),
-            ])
+            wandb_table_rows.append(
+                [
+                    epoch,
+                    trial,
+                    bool(success),
+                    float(elapsed),
+                    int(ex),
+                    bool(tout),
+                    (float(latent_error_l2) if isinstance(latent_error_l2, (int, float)) else None),
+                    (int(path_len) if isinstance(path_len, int) else None),
+                    (str(stop_r) if stop_r is not None else None),
+                    (float(goal_l2) if isinstance(goal_l2, (int, float)) else None),
+                    (float(ee_dist) if isinstance(ee_dist, (int, float)) else None),
+                    ee_thresh_ok,
+                    str(trial_dir),
+                ]
+            )
 
     times = np.asarray(per_trial_times, dtype=np.float64) if per_trial_times else np.zeros(0)
     latent_l2_arr = (
@@ -1010,21 +1139,38 @@ def run_integration_eval(
         if per_trial_latent_l2
         else np.zeros(0)
     )
-    agg = {
+    path_arr = np.asarray(per_trial_path_len, dtype=np.float64) if per_trial_path_len else np.zeros(0)
+    goal_l2_arr = np.asarray(per_trial_goal_l2, dtype=np.float64) if per_trial_goal_l2 else np.zeros(0)
+    ee_arr = np.asarray(per_trial_ee, dtype=np.float64) if per_trial_ee else np.zeros(0)
+
+    batch_payload = batch.get("batch")
+    agg: Dict[str, Any] = {
         "epoch": epoch,
         "num_trials": num_trials,
         "num_success": n_success,
         "success_rate": (n_success / num_trials) if num_trials > 0 else 0.0,
+        "subprocess_exit_code": exit_code,
+        "subprocess_timed_out": timed_out,
+        "integration_session_dir": session_dir_s,
         "mean_time_sec": float(times.mean()) if times.size else 0.0,
         "median_time_sec": float(np.median(times)) if times.size else 0.0,
         "min_time_sec": float(times.min()) if times.size else 0.0,
         "max_time_sec": float(times.max()) if times.size else 0.0,
         "std_time_sec": float(times.std()) if times.size else 0.0,
+        "wall_time_sec": elapsed_total,
         "num_trials_with_latent_error_l2": int(latent_l2_arr.size),
         "mean_true_latent_error_l2": float(latent_l2_arr.mean()) if latent_l2_arr.size else None,
         "median_true_latent_error_l2": float(np.median(latent_l2_arr)) if latent_l2_arr.size else None,
         "min_true_latent_error_l2": float(latent_l2_arr.min()) if latent_l2_arr.size else None,
         "max_true_latent_error_l2": float(latent_l2_arr.max()) if latent_l2_arr.size else None,
+        "mean_path_length": float(path_arr.mean()) if path_arr.size else None,
+        "mean_latent_goal_l2": float(goal_l2_arr.mean()) if goal_l2_arr.size else None,
+        "num_trials_with_ee_dist": int(ee_arr.size),
+        "mean_ee_to_target_dist_m": float(ee_arr.mean()) if ee_arr.size else None,
+        "median_ee_to_target_dist_m": float(np.median(ee_arr)) if ee_arr.size else None,
+        "min_ee_to_target_dist_m": float(ee_arr.min()) if ee_arr.size else None,
+        "max_ee_to_target_dist_m": float(ee_arr.max()) if ee_arr.size else None,
+        "batch_summary": batch_payload,
         "trials": trial_records,
     }
 
@@ -1037,38 +1183,55 @@ def run_integration_eval(
     new_file = not csv_path.exists()
     with csv_path.open("a", encoding="utf-8") as f:
         if new_file:
-            f.write("epoch,num_trials,num_success,success_rate,mean_time_sec,"
-                    "median_time_sec,min_time_sec,max_time_sec,"
-                    "num_trials_with_latent_error_l2,mean_true_latent_error_l2\n")
+            f.write(
+                "epoch,num_trials,num_success,success_rate,wall_time_sec,mean_time_sec,"
+                "median_time_sec,min_time_sec,max_time_sec,"
+                "num_trials_with_latent_error_l2,mean_true_latent_error_l2,"
+                "mean_path_length,mean_latent_goal_l2,mean_ee_to_target_dist_m,"
+                "num_trials_with_ee_dist,subprocess_exit_code\n"
+            )
         mean_latent_l2_csv = (
             ""
             if agg["mean_true_latent_error_l2"] is None
             else f"{agg['mean_true_latent_error_l2']:.6f}"
         )
+        mpl = agg["mean_path_length"]
+        mgl = agg["mean_latent_goal_l2"]
+        mpl_s = "" if mpl is None else f"{mpl:.4f}"
+        mgl_s = "" if mgl is None else f"{mgl:.6f}"
+        mee = agg["mean_ee_to_target_dist_m"]
+        mee_s = "" if mee is None else f"{mee:.6f}"
+        nee = agg["num_trials_with_ee_dist"]
         f.write(
             f"{agg['epoch']},{agg['num_trials']},{agg['num_success']},"
-            f"{agg['success_rate']:.6f},{agg['mean_time_sec']:.4f},"
+            f"{agg['success_rate']:.6f},{agg['wall_time_sec']:.4f},"
+            f"{agg['mean_time_sec']:.4f},"
             f"{agg['median_time_sec']:.4f},{agg['min_time_sec']:.4f},"
             f"{agg['max_time_sec']:.4f},"
             f"{agg['num_trials_with_latent_error_l2']},"
-            f"{mean_latent_l2_csv}\n"
+            f"{mean_latent_l2_csv},{mpl_s},{mgl_s},{mee_s},{nee},"
+            f"{agg['subprocess_exit_code']}\n"
         )
 
     print(
         f" -> Integrated eval @ epoch {epoch}: "
         f"success {n_success}/{num_trials} ({100.0*agg['success_rate']:.1f}%) | "
-        f"mean time {agg['mean_time_sec']:.2f}s | "
-        f"median {agg['median_time_sec']:.2f}s",
+        f"wall {agg['wall_time_sec']:.1f}s | "
+        f"mean per-trial time {agg['mean_time_sec']:.2f}s | "
+        f"session={session_dir_s}",
         flush=True,
     )
 
-    # ---- wandb: log aggregate metrics + videos + table in ONE call ----
+    # ---- wandb: scalars + table, then media (second log, same step) ----
     if _wandb_active():
         payload: dict = {
             "epoch": epoch,
             "integration/success_rate":  agg["success_rate"],
             "integration/num_success":   agg["num_success"],
             "integration/num_trials":    agg["num_trials"],
+            "integration/subprocess_exit_code": agg["subprocess_exit_code"],
+            "integration/subprocess_timed_out": int(bool(agg["subprocess_timed_out"])),
+            "integration/wall_time_sec": agg["wall_time_sec"],
             "integration/mean_time_sec": agg["mean_time_sec"],
             "integration/median_time_sec": agg["median_time_sec"],
             "integration/min_time_sec":    agg["min_time_sec"],
@@ -1076,26 +1239,64 @@ def run_integration_eval(
             "integration/std_time_sec":    agg["std_time_sec"],
             "integration/num_trials_with_latent_error_l2": agg["num_trials_with_latent_error_l2"],
         }
+        if agg["mean_path_length"] is not None:
+            payload["integration/mean_path_length"] = agg["mean_path_length"]
+        if agg["mean_latent_goal_l2"] is not None:
+            payload["integration/mean_latent_goal_l2"] = agg["mean_latent_goal_l2"]
+        if agg["mean_ee_to_target_dist_m"] is not None:
+            payload["integration/mean_ee_to_target_dist_m"] = agg["mean_ee_to_target_dist_m"]
+            payload["integration/median_ee_to_target_dist_m"] = agg["median_ee_to_target_dist_m"]
+            payload["integration/min_ee_to_target_dist_m"] = agg["min_ee_to_target_dist_m"]
+            payload["integration/max_ee_to_target_dist_m"] = agg["max_ee_to_target_dist_m"]
+            payload["integration/num_trials_with_ee_dist"] = agg["num_trials_with_ee_dist"]
         if agg["mean_true_latent_error_l2"] is not None:
             payload["integration/mean_true_latent_error_l2"] = agg["mean_true_latent_error_l2"]
             payload["integration/median_true_latent_error_l2"] = agg["median_true_latent_error_l2"]
             payload["integration/min_true_latent_error_l2"] = agg["min_true_latent_error_l2"]
             payload["integration/max_true_latent_error_l2"] = agg["max_true_latent_error_l2"]
-        payload.update(wandb_video_payload)
-        payload.update(wandb_topview_payload)
 
         # Per-trial table (nice sortable/filterable view in wandb UI).
         try:
             trials_table = wandb.Table(
-                columns=["epoch", "trial", "success", "elapsed_sec",
-                         "exit_code", "timed_out", "latent_error_l2", "trial_dir"],
+                columns=[
+                    "epoch",
+                    "trial",
+                    "success",
+                    "elapsed_sec",
+                    "exit_code",
+                    "timed_out",
+                    "planner_final_latent_dist",
+                    "path_length",
+                    "planner_stop_reason",
+                    "latent_goal_l2",
+                    "ee_to_target_dist_m",
+                    "ee_thresh_success",
+                    "trial_dir",
+                ],
                 data=wandb_table_rows,
             )
             payload[f"integration/trials_table_epoch_{epoch:03d}"] = trials_table
         except Exception as e:
             print(f"[wandb] trial table log failed: {e}", flush=True)
 
-        _wandb_log(payload)
+        # Log scalars + table first, then media in a second call (same step). Large
+        # mp4s + Table in one payload sometimes fails to render video in the UI.
+        media_merged = {**wandb_video_payload, **wandb_topview_payload}
+        _wandb_log(payload, step=wandb_step)
+        if media_merged:
+            _wandb_log(media_merged, step=wandb_step)
+            print(
+                f"[wandb] integration media @ step {wandb_step}: "
+                f"{len(wandb_video_payload)} videos (WANDB fps={wandb_vid_fps}), "
+                f"{len(wandb_topview_payload)} top_views",
+                flush=True,
+            )
+        elif videos_cap > 0:
+            print(
+                f"[wandb] integration: no video/image media logged "
+                f"(videos_cap={videos_cap}; missing mp4 under trial dirs?)",
+                flush=True,
+            )
 
     if was_training:
         model.train()
@@ -1134,31 +1335,35 @@ def train():
     eval_every = int(os.getenv("TRAIN_EVAL_EVERY", "2"))
     batch_size = int(os.getenv("TRAIN_BATCH_SIZE", "128"))
     lr = float(os.getenv("TRAIN_LR", "1e-4"))
-    loss_type = os.getenv("TRAIN_LOSS_TYPE", "hybrid").strip().lower()
-    loss_alpha = float(os.getenv("TRAIN_LOSS_ALPHA", "0.5"))
-    infonce_weight = float(os.getenv("TRAIN_INFONCE_WEIGHT", "0.1")) # Set to 0.0 to disable
-    infonce_temp = float(os.getenv("TRAIN_INFONCE_TEMP", "0.1"))
+    kl_beta_start = float(os.getenv("TRAIN_KL_BETA_START", "0.0"))
+    kl_beta_end = float(os.getenv("TRAIN_KL_BETA_END", "1.0"))
+    kl_beta_schedule = os.getenv("TRAIN_KL_BETA_SCHEDULE", "linear").strip().lower()
+    kl_anneal_steps = int(os.getenv("TRAIN_KL_ANNEAL_STEPS", "20000"))
+    kl_cycle_steps = int(os.getenv("TRAIN_KL_CYCLE_STEPS", "10000"))
+    z_align_weight = float(os.getenv("TRAIN_Z_ALIGN_WEIGHT", "0.1"))
+    if kl_beta_schedule not in {"linear", "cyclical"}:
+        raise ValueError(
+            f"TRAIN_KL_BETA_SCHEDULE must be 'linear' or 'cyclical', got: {kl_beta_schedule}"
+        )
+
+    # Approximate optimizer steps per epoch (one full pass over train indices).
+    batches_per_epoch = max(1, (train_size + batch_size - 1) // batch_size)
+    approx_total_steps = batches_per_epoch * epochs
+    approx_kl_cycles = approx_total_steps / max(kl_cycle_steps, 1)
+    print(
+        f"Step budget (train): n_total={n_total} train_size={train_size} | "
+        f"~{batches_per_epoch} batches/epoch @ batch_size={batch_size} | "
+        f"~{approx_total_steps} steps over {epochs} epochs | "
+        f"~{approx_kl_cycles:.1f} full β cycles (TRAIN_KL_CYCLE_STEPS={kl_cycle_steps})",
+        flush=True,
+    )
 
     best_val_mae = float("inf")
     best_val_cos = float("inf")
     best_val_n   = 0
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    if loss_type == "mse":
-        criterion = nn.MSELoss()
-    elif loss_type == "cos":
-        criterion = lambda pred, target: torch.mean(
-            1 - nn.functional.cosine_similarity(pred, target, dim=1)
-        )
-    elif loss_type == "hybrid":
-        criterion = HybridDistillationLoss(
-            alpha=loss_alpha, 
-            infonce_weight=infonce_weight, 
-            temperature=infonce_temp
-        )
-    else:
-        raise ValueError(
-            f"Unsupported TRAIN_LOSS_TYPE='{loss_type}'. Use one of: hybrid, mse, cos."
-        )
+    # CVAE uses fixed reconstruction loss (MSE) + KL term in run_batches.
+    criterion = nn.MSELoss()
         
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     pca_output_dir = Path(os.getenv("TRAIN_PCA_OUTPUT_DIR", str(PCA_OUTPUT_DIR)))
@@ -1170,8 +1375,15 @@ def train():
 
     print(
         f"Config | epochs={epochs} eval_every={eval_every} batch_size={batch_size} "
-        f"lr={lr:.6g} loss_type={loss_type} loss_alpha={loss_alpha} "
+        f"lr={lr:.6g} recon_loss=mse "
         f"dropout={dropout_p:.3f}",
+        flush=True,
+    )
+    print(
+        "KL beta | "
+        f"schedule={kl_beta_schedule} start={kl_beta_start:.6f} end={kl_beta_end:.6f} "
+        f"anneal_steps={kl_anneal_steps} cycle_steps={kl_cycle_steps} "
+        f"| z_align_weight={z_align_weight:.4f}",
         flush=True,
     )
     print(
@@ -1187,7 +1399,23 @@ def train():
     run_slug_raw = wandb_run_name if wandb_run_name else "run"
     run_slug = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in run_slug_raw)
     integration_live_ckpt = INTEGRATION_LIVE_CKPT.with_name(f"_training_live_latent_{run_slug}.pth")
-    print(f"Integration | live_ckpt={integration_live_ckpt}", flush=True)
+    run_integration_every = max(1, int(os.getenv("RUN_INTEGRATION_EVERY", str(RUN_INTEGRATION_EVERY))))
+    integration_num_trials = max(1, int(os.getenv("INTEGRATION_NUM_TRIALS", str(INTEGRATION_NUM_TRIALS))))
+    integration_on_val_improve_only = _env_bool("INTEGRATION_ON_VAL_IMPROVE_ONLY", True)
+    integration_force_final = _env_bool("INTEGRATION_FORCE_FINAL_EPOCH", False)
+    if integration_on_val_improve_only:
+        integ_mode = (
+            f"on val MAE improvement (set INTEGRATION_ON_VAL_IMPROVE_ONLY=0 to use every "
+            f"{run_integration_every} ep; INTEGRATION_FORCE_FINAL_EPOCH=1 to also run last epoch)"
+        )
+    else:
+        integ_mode = f"every {run_integration_every} epochs (RUN_INTEGRATION_EVERY) and last epoch"
+    print(
+        f"Integration | live_ckpt={integration_live_ckpt} | {integ_mode} | "
+        f"trials={integration_num_trials} (INTEGRATION_NUM_TRIALS) | "
+        f"timeout mult={INTEGRATION_BATCH_TIMEOUT_MULT} (INTEGRATION_BATCH_TIMEOUT_MULT)",
+        flush=True,
+    )
 
     INTEGRATION_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -1209,18 +1437,27 @@ def train():
             "optimizer": "Adam",
             "lr_initial": lr,
             "scheduler": "CosineAnnealingLR",
-            "loss": f"{loss_type}(alpha={loss_alpha})" if loss_type == "hybrid" else loss_type,
+            "loss": "cvae_recon_mse_plus_beta_kl",
+            "z_align_weight": z_align_weight,
+            "kl_beta_schedule": kl_beta_schedule,
+            "kl_beta_start": kl_beta_start,
+            "kl_beta_end": kl_beta_end,
+            "kl_anneal_steps": kl_anneal_steps,
+            "kl_cycle_steps": kl_cycle_steps,
             "model": "StudentModelWonorm(ResNet18 + text prompt embedding fusion -> MLP 512 -> z_dim)",
             "dropout": dropout_p,
             "prompt_template": "grasp {object_name}",
             "text_vocab_size": len(token_to_id),
             "max_prompt_len": max_prompt_len,
-            "run_integration_every": RUN_INTEGRATION_EVERY,
-            "integration_num_trials": INTEGRATION_NUM_TRIALS,
+            "run_integration_every": run_integration_every,
+            "integration_on_val_improve_only": integration_on_val_improve_only,
+            "integration_force_final_epoch": integration_force_final,
+            "integration_num_trials": integration_num_trials,
             "integration_videos_per_eval": INTEGRATION_VIDEOS_PER_EVAL,
             "integration_ntfield_tol": INTEGRATION_NTFIELD_TOL,
             "integration_ntfield_max_steps": INTEGRATION_NTFIELD_MAX_STEPS,
             "integration_ntfield_step_size": INTEGRATION_NTFIELD_STEP_SIZE,
+            "integration_batch_subprocess": True,
             "ntfield_checkpoint": NTFIELD_CHECKPOINT,
             "device": str(device),
         }
@@ -1240,6 +1477,7 @@ def train():
         # Keep wandb batch-step monotonic across all epochs.
         global_batch_counter = [0]
         for epoch in range(epochs):
+            did_new_best = False
             shard_order = torch.randperm(len(shard_files)).tolist()
             running_loss    = 0.0
             n_batches_total = 0
@@ -1252,6 +1490,8 @@ def train():
                     batch_size, True, epoch, epochs, global_batch_counter,
                     wandb_log_batches, wandb_batch_log_every,
                     token_to_id, max_prompt_len,
+                    kl_beta_schedule, kl_beta_start, kl_beta_end, kl_anneal_steps, kl_cycle_steps,
+                    z_align_weight,
                 )
                 running_loss    += loss_sum
                 n_batches_total += nb
@@ -1265,13 +1505,16 @@ def train():
                 flush=True,
             )
 
-            # Per-epoch training scalars.
-            _wandb_log({
-                "epoch": epoch + 1,
-                "train/loss": avg_train_loss,
-                "train/lr": current_lr,
-                "train/num_batches": n_batches_total,
-            })
+            # Per-epoch training scalars (same step as batch logs — avoids mixed implicit/explicit step).
+            _wandb_log(
+                {
+                    "epoch": epoch + 1,
+                    "train/loss": avg_train_loss,
+                    "train/lr": current_lr,
+                    "train/num_batches": n_batches_total,
+                },
+                step=global_batch_counter[0],
+            )
 
             if (epoch + 1) % eval_every == 0 or (epoch + 1) == epochs:
                 val_mse, val_mae, val_cos, val_n = evaluate_shardwise(
@@ -1315,9 +1558,10 @@ def train():
                         )
                     except Exception as e:
                         print(f"[wandb] PCA image log failed: {e}", flush=True)
-                _wandb_log(val_payload)
+                _wandb_log(val_payload, step=global_batch_counter[0])
 
-                if val_mae < best_val_mae:
+                did_new_best = val_mae < best_val_mae
+                if did_new_best:
                     best_val_mae = val_mae
                     best_val_cos = val_cos
                     best_val_n   = val_n
@@ -1333,6 +1577,7 @@ def train():
                     torch.save({
                         "model_state_dict": model.state_dict(),
                         "z_dim":   z_dim,
+                        "latent_dim": int(getattr(model, "latent_dim", 128)),
                         "vocab_size": len(token_to_id),
                         "token_to_id": token_to_id,
                         "max_prompt_len": max_prompt_len,
@@ -1345,12 +1590,15 @@ def train():
                         f"| Cos: {best_val_cos:.6f}",
                         flush=True,
                     )
-                    _wandb_log({
-                        "epoch": epoch + 1,
-                        "val/best_mae": best_val_mae,
-                        "val/best_cos_distance": best_val_cos,
-                        "val/best_epoch": epoch + 1,
-                    })
+                    _wandb_log(
+                        {
+                            "epoch": epoch + 1,
+                            "val/best_mae": best_val_mae,
+                            "val/best_cos_distance": best_val_cos,
+                            "val/best_epoch": epoch + 1,
+                        },
+                        step=global_batch_counter[0],
+                    )
                     # Also upload the checkpoint as a wandb artifact so you
                     # can pull down whichever best ckpt you want later.
                     if _wandb_active():
@@ -1371,9 +1619,21 @@ def train():
                             print(f"[wandb] artifact upload failed: {e}", flush=True)
 
             # ------------------------------------------------------------------
-            # Periodic integrated-pipeline evaluation (Isaac Gym + NTField)
+            # Integrated-pipeline evaluation (Isaac Gym + NTField)
+            # Default: only when validation MAE improves. Optional: legacy schedule
+            # (INTEGRATION_ON_VAL_IMPROVE_ONLY=0) or final-epoch run (INTEGRATION_FORCE_FINAL_EPOCH=1).
             # ------------------------------------------------------------------
-            if (epoch + 1) % RUN_INTEGRATION_EVERY == 0 or (epoch + 1) == epochs:
+            run_integration = False
+            if integration_on_val_improve_only:
+                if did_new_best:
+                    run_integration = True
+                elif integration_force_final and (epoch + 1) == epochs:
+                    run_integration = True
+            else:
+                if (epoch + 1) % run_integration_every == 0 or (epoch + 1) == epochs:
+                    run_integration = True
+
+            if run_integration:
                 try:
                     run_integration_eval(
                         model,
@@ -1381,7 +1641,8 @@ def train():
                         epoch=epoch + 1,
                         live_ckpt_path=integration_live_ckpt,
                         vocab_size=len(token_to_id),
-                        num_trials=INTEGRATION_NUM_TRIALS,
+                        num_trials=integration_num_trials,
+                        wandb_step=global_batch_counter[0],
                     )
                 except Exception as e:
                     # Never let evaluation kill training.

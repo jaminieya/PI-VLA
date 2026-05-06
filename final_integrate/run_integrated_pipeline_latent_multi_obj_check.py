@@ -4,9 +4,9 @@ End-to-end PI-VLA integration (Isaac Gym + NTField + latent goal only).
 
 python "final_integrate/run_integrated_pipeline_latent_multi_obj_check.py" \
   --ntfield_checkpoint "/home/hojinsohn/VLM-NT/PI-VLA/teacher_model.pt" \
-  --latent_checkpoint "/home/hojinsohn/VLM-NT/PI-VLA/student_model_training/best_z_goal_model_multi_hybrid_0.5_multi_image_text_prompt_fusion_hybrid_0.5.pth" \
+  --latent_checkpoint "/home/hojinsohn/VLM-NT/PI-VLA/student_model_training/best_z_goal_model_mdn_mdn_K8_bs256_lr3em4_ep90_20260505_114200.pth" \
   --output_dir "output/manual_check_run" \
-  --seed 1007 \
+  --seed 1002 \
   --ntfield_step_size 0.02 \
   --ntfield_max_steps 200 \
   --ntfield_tol 0.01
@@ -58,8 +58,16 @@ _COLLECT_DATA_DIR = os.path.join(HANWEN_GRASPING_ROOT, "collect_data")
 _UTIL_DIR = os.path.join(_COLLECT_DATA_DIR, "util")
 _GRASP_UTIL_DIR = os.path.join(_COLLECT_DATA_DIR, "grasp_util")
 _NTRL_DEMO = os.path.join(_PI_VLA_ROOT, "ntrl-demo")
+_STUDENT_TRAINING_DIR = os.path.join(_PI_VLA_ROOT, "student_model_training")
 
-for _p in (HANWEN_GRASPING_ROOT, _UTIL_DIR, _GRASP_UTIL_DIR, _PI_VLA_ROOT, _NTRL_DEMO):
+for _p in (
+    HANWEN_GRASPING_ROOT,
+    _UTIL_DIR,
+    _GRASP_UTIL_DIR,
+    _PI_VLA_ROOT,
+    _NTRL_DEMO,
+    _STUDENT_TRAINING_DIR,
+):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -168,6 +176,19 @@ def _get_latent_model(output_dim: int, vocab_size: int, text_embed_dim: int = 32
             denom = mask.sum(dim=1).clamp_min(1.0)
             return (emb * mask).sum(dim=1) / denom              # (B, D)
 
+    class _StudentHeadWonorm(nn.Module):
+        def __init__(self, in_features: int, output_dim: int, dropout_p: float = 0.2):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(in_features, 256),
+                nn.ReLU(),
+                nn.Dropout(dropout_p),
+                nn.Linear(256, output_dim),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
     class _StudentModelWonorm(nn.Module):
         def __init__(self):
             super().__init__()
@@ -177,21 +198,22 @@ def _get_latent_model(output_dim: int, vocab_size: int, text_embed_dim: int = 32
             self.adapter = nn.Sequential(
                 nn.Linear(in_features, 256),    # 512 → 256
                 nn.ReLU(),
+                nn.Dropout(0.2),
             )
 
             self.text_encoder = _TextPromptEncoder(
-                vocab_size=vocab_size,
+                vocab_size=max(int(vocab_size), 2),
                 embed_dim=text_embed_dim,       # 32
             )
 
-            # Head: fused (256 + 32) → 256 → output_dim
-            self.head = nn.Sequential(
-                nn.Linear(256 + text_embed_dim, 256),
-                nn.ReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(256, output_dim),
+            # Matches full_train_multi.py:
+            #   self.head = StudentHeadWonorm(...)
+            # so checkpoint keys are under "head.net.*".
+            self.head = _StudentHeadWonorm(
+                in_features=256 + text_embed_dim,
+                output_dim=output_dim,
+                dropout_p=0.2,
             )
-
         def forward(self, x, text_tokens):
             with torch.no_grad():               # backbone always frozen at inference
                 image_feat = self.backbone(x)   # (B, 512)
@@ -212,12 +234,13 @@ def _infer_latent_on_image(
     checkpoint_path: str,
     device: str,
     object_name: str = "object",
+    latent_goal_true: np.ndarray = None,
 ) -> np.ndarray:
     """
     Run image→latent inference using the checkpoint.
 
-    Supports both the legacy image-only checkpoint and the new
-    image + text-prompt checkpoint produced by train_config_wonorm.py.
+    Uses the same MDNStudent architecture as training and enforces strict
+    checkpoint loading. Any architecture drift fails fast with an error.
 
     Parameters
     ----------
@@ -231,6 +254,8 @@ def _infer_latent_on_image(
         Object name used to build the text prompt (e.g. ``"bleach cleanser"``).
         Defaults to ``"object"`` which matches the fallback used during
         training for dict-shard samples without an ``object_name`` key.
+    latent_goal_true : np.ndarray
+        True latent goal (256,). If provided, use it instead of the predicted latent goal.
     """
     import torch
     from torchvision import transforms
@@ -245,23 +270,22 @@ def _infer_latent_on_image(
     token_to_id: Optional[dict] = ckpt.get("token_to_id", None)
     max_prompt_len: int = int(ckpt.get("max_prompt_len", 8))
 
-    model = _get_latent_model(output_dim=z_dim, vocab_size=vocab_size or 0).to(dev)
+    from student_model_mdn import MDNStudent
+
+    n_components = int(ckpt.get("n_components", 8))
+    model = MDNStudent(
+        output_dim=z_dim,
+        vocab_size=max(int(vocab_size or 0), 2),
+        n_components=n_components,
+    ).to(dev)
     state_dict = ckpt["model_state_dict"]
     try:
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict, strict=True)
     except RuntimeError as exc:
-        # Compatibility path: some checkpoints store the MLP head under
-        # "head.net.*" while this model defines it as plain "head.*".
-        remapped = {}
-        for key, value in state_dict.items():
-            if key.startswith("head.net."):
-                remapped[key.replace("head.net.", "head.", 1)] = value
-            else:
-                remapped[key] = value
-        try:
-            model.load_state_dict(remapped)
-        except RuntimeError:
-            raise exc
+        raise RuntimeError(
+            "Strict checkpoint load failed for MDNStudent. "
+            "Training/integration model architecture mismatch detected."
+        ) from exc
     model.eval()
 
     normalize = transforms.Normalize(
@@ -271,20 +295,33 @@ def _infer_latent_on_image(
     x = normalize(x).to(dev)
 
     with torch.no_grad():
-        if vocab_size:
-            if token_to_id:
-                prompt = f"grasp {object_name.strip().lower()}"
-                text_tokens = _encode_prompts(
-                    [prompt], token_to_id, max_prompt_len
-                ).to(dev)
-            else:
-                # Compatibility path: text-conditioned checkpoints that do not
-                # include tokenizer metadata. Use an all-padding prompt.
-                text_tokens = torch.zeros((1, max_prompt_len), dtype=torch.long, device=dev)
-            pred = model(x, text_tokens).squeeze(0).cpu().numpy()
+        if token_to_id:
+            prompt = f"grasp {object_name.strip().lower()}"
+            text_tokens = _encode_prompts(
+                [prompt], token_to_id, max_prompt_len
+            ).to(dev)
         else:
-            # Legacy checkpoint — forward without text tokens
-            pred = model(x).squeeze(0).cpu().numpy()
+            # Compatibility path: text-conditioned checkpoints that do not
+            # include tokenizer metadata. Use an all-padding prompt.
+            text_tokens = torch.zeros((1, max_prompt_len), dtype=torch.long, device=dev)
+        # pred, _ = model(x, text_tokens, z_goal=None)
+        preds = model.get_multiple_latent_predictions(x, text_tokens, num_samples=30)
+        # preds: (30, 1, 256)
+        if latent_goal_true is not None:
+            true_latent_t = torch.as_tensor(
+                latent_goal_true, dtype=preds.dtype, device=preds.device
+            ).reshape(1, -1)
+            dists = ((preds - true_latent_t) ** 2).sum(dim=-1)         # (30, 1)
+            best_idx = dists.argmin(dim=0)                         # (1,)
+            best_pred = preds[best_idx, torch.arange(preds.size(1))]  # (1, 256)
+            pred = best_pred.squeeze(0).cpu().numpy()
+        else:
+            # Option A: pick the one closest to the mean prediction
+            mean_pred = preds.mean(dim=0)                          # (1, 256)
+            dists = ((preds - mean_pred) ** 2).sum(dim=-1)         # (30, 1)
+            best_idx = dists.argmin(dim=0)                         # (1,)
+            best_pred = preds[best_idx, torch.arange(preds.size(1))]  # (1, 256)
+            pred = best_pred.squeeze(0).cpu().numpy()
 
     return pred
 
@@ -357,7 +394,7 @@ def main() -> None:
         help="Force PhysX on CPU (avoids some GPU PhysX + PyTorch interaction crashes).",
     )
     parser.add_argument("--latent_checkpoint", type=str, required=True,
-                        help="Path to image→latent goal checkpoint (ResNet18 + text encoder, output_dim=z_dim)")
+                        help="Path to image→latent goal checkpoint (MDNStudent: ResNet18 + text encoder + mixture head, output_dim=z_dim)")
     parser.add_argument("--latent_device", type=str, default="auto")
     # NEW: optional override for the object name used to build the text prompt.
     # When omitted the default "object" prompt is used, which matches the
@@ -788,6 +825,24 @@ def main() -> None:
             gym.draw_viewer(viewer, sim, True)
         gym.sync_frame_time(sim)
 
+    # ── Match collect_multi_obj_data_for_student.py: HOME_DOF settle before
+    # start_image — same targets and step count so q_start matches training.
+    _HOME_DOF = [0.7, -2.0, 2.5, -0.3, 0.7, 0.0]
+    _START_SETTLE_STEPS = 30
+    for _ in range(_START_SETTLE_STEPS):
+        gym.set_dof_target_position(env, spj, _HOME_DOF[0])
+        gym.set_dof_target_position(env, slj, _HOME_DOF[1])
+        gym.set_dof_target_position(env, ej, _HOME_DOF[2])
+        gym.set_dof_target_position(env, wj1, _HOME_DOF[3])
+        gym.set_dof_target_position(env, wj2, _HOME_DOF[4])
+        gym.set_dof_target_position(env, wj3, _HOME_DOF[5])
+        gym.simulate(sim)
+        gym.fetch_results(sim, True)
+        gym.step_graphics(sim)
+        if viewer is not None:
+            gym.draw_viewer(viewer, sim, True)
+        gym.sync_frame_time(sim)
+
     # ── Capture top-view image ───────────────────────────────────────────────
     assert top_cam_handle is not None
     gym.render_all_camera_sensors(sim)
@@ -833,6 +888,8 @@ def main() -> None:
 
     # ── Grasp joint goal (same as run_integrated_pipeline_latent.py) ─────────
     q_goal_true: Optional[np.ndarray] = None
+    rrt_path_true: Optional[List[np.ndarray]] = None
+    rrt_plan_s: Optional[float] = None
     if not args.no_ground_truth_ntfield_compare:
         if not object_mesh:
             print(
@@ -857,7 +914,7 @@ def main() -> None:
             np.random.shuffle(grasp_list)
             true_xy = np.array(object_location[:2], dtype=np.float64)
             target_idx = 0
-            q_goal_true, _, _ = find_grasp_q_goal(
+            q_goal_true, rrt_path_true, rrt_plan_s = find_grasp_q_goal(
                 rac,
                 RC,
                 scene_info,
@@ -881,13 +938,8 @@ def main() -> None:
                     indent=2,
                 )
 
-    # ── Infer latent goal from image + teacher latent at true grasp (if any) ─
-    latent_goal_pred = _infer_latent_on_image(
-        rgb_top,
-        _resolve_under_root(args.latent_checkpoint),
-        args.latent_device,
-        object_name=infer_object_name,    # <-- new: pass object name
-    )
+    print(f"[latent] q_goal_true: {q_goal_true}", flush=True)
+
     latent_goal_true: Optional[np.ndarray] = None
     if q_goal_true is not None:
         latent_goal_true = _compute_z_goal(
@@ -896,6 +948,15 @@ def main() -> None:
             q_goal_true.reshape(1, -1),
             dev_nt,
         )
+
+    # ── Infer latent goal from image + teacher latent at true grasp (if any) ─
+    latent_goal_pred = _infer_latent_on_image(
+        rgb_top,
+        _resolve_under_root(args.latent_checkpoint),
+        args.latent_device,
+        object_name=infer_object_name,    # <-- new: pass object name
+        latent_goal_true=latent_goal_true,
+    )
 
     refine_max = args.ntfield_refine_max_steps
     if refine_max < 0:
@@ -947,6 +1008,8 @@ def main() -> None:
         "session_dir": session_dir,
         "prompt": prompt_text,
         "predicted_video": None,
+        "rrt_video": None,
+        "rrt_plan_s": rrt_plan_s,
         "latent_goal_predicted_path": latent_goal_pred_path,
         "latent_goal_true_path": latent_goal_true_path,
         "latent_goal_diff_path": latent_goal_diff_path,
@@ -1263,6 +1326,42 @@ def main() -> None:
             if summary_label == "predicted_latent_goal":
                 summary["predicted_video"] = None
 
+    def _record_rrt_path(
+        path_raw: Optional[List[np.ndarray]],
+        label: str,
+        mp4_path: str,
+    ) -> None:
+        if path_raw and len(path_raw) >= 2:
+            reset_arm_to_q(
+                gym, sim, env, ur, spj, slj, ej, wj1, wj2, wj3, viewer, q_start_live, n_steps=200
+            )
+            path_rrt = _path_as_6_list(path_raw)
+            frames_rrt: List[np.ndarray] = []
+            execute_path_and_time(
+                gym,
+                sim,
+                env,
+                ur,
+                spj,
+                slj,
+                ej,
+                wj1,
+                wj2,
+                wj3,
+                viewer,
+                path_rrt,
+                label,
+                main_cam_handle=main_cam_handle,
+                camera_props=camera_props,
+                record_rgb=frames_rrt,
+                planner_playback=args.planner_playback,
+            )
+            _save_mp4_rgb(frames_rrt, mp4_path, fps=args.video_fps)
+            summary["rrt_video"] = mp4_path
+        else:
+            print("[warn] RRT planner returned an empty path (original_goal_rrt).")
+            summary["rrt_video"] = None
+
     # ── Predicted latent goal (image) ────────────────────────────────────────
     path_pred, meta_pred = ntfield_plan_gradient_with_goal_latent(
         nt_net,
@@ -1289,9 +1388,14 @@ def main() -> None:
     mp4_path = os.path.join(session_dir, "ntfield_trajectory_predicted_latent_goal.mp4")
     _record_ntfield_path(path_pred, "predicted_latent_goal", mp4_path, "predicted_latent_goal")
 
+    # ── RRT trajectory to the true grasp goal (if available) ─────────────────
+    if q_goal_true is not None:
+        rrt_mp4_path = os.path.join(session_dir, "rrt_trajectory_original_goal.mp4")
+        _record_rrt_path(rrt_path_true, "original_goal_rrt", rrt_mp4_path)
+
     # ── True latent goal (teacher z(q_start, q_goal_true)) ───────────────────
     if latent_goal_true is not None:
-        latent_goal_true_noisy = latent_goal_true + np.random.normal(0, 0.27, latent_goal_true.shape)
+        latent_goal_true_noisy = latent_goal_true + np.random.normal(0, 0.0001, latent_goal_true.shape)
         l2_dist_noisy = np.linalg.norm(latent_goal_true_noisy - latent_goal_true)
         linf_dist_noisy = np.max(np.abs(latent_goal_true_noisy - latent_goal_true))
         print(f"L2 distance between noisy and true latent goal: {l2_dist_noisy}")

@@ -1,13 +1,38 @@
-#
-# Batch runner: RRTConnect vs NTField benchmark over a fixed (x, y) grid of object poses.
-#
-# From PI-VLA repository root:
-#   python trajectory_evaluation/comparison/run_rrt_ntfield_benchmark_batch.py
-#
-# --planner-playback {direct,settle} is forwarded to each benchmark (default: direct).
-# Optional: pass extra Isaac Gym / benchmark flags after -- :
-#   python trajectory_evaluation/comparison/run_rrt_ntfield_benchmark_batch.py --planner-playback settle -- --sim_device cpu
-#
+'''
+
+python trajectory_evaluation/multi_comparison/run_student_multi_benchmark_batch.py \
+  --student-checkpoint /home/hojinsohn/VLM-NT/PI-VLA/student_model_training/best_z_goal_model_mdn_mdn_K8_bs256_lr3em4_ep90_20260505_114200.pth \
+  --checkpoint /home/hojinsohn/VLM-NT/PI-VLA/teacher_model.pt \
+  --seed 123 \
+  --save-final-geometric-debug \
+  --out-root /home/hojinsohn/VLM-NT/PI-VLA/output/trajectory_evaluation/student_multi_batch_mdn_new
+
+python trajectory_evaluation/multi_comparison/run_student_multi_benchmark_batch.py \
+  --student-checkpoint /home/hojinsohn/VLM-NT/PI-VLA/student_model_training/best_z_goal_model_regression_mse_bs256_lr3em4_ep90_20260507_155428.pth \
+  --checkpoint /home/hojinsohn/VLM-NT/PI-VLA/teacher_model.pt \
+  --seed 123 \
+  --no-video \
+  --save-final-geometric-debug \
+  --out-root /home/hojinsohn/VLM-NT/PI-VLA/output/trajectory_evaluation/student_multi_batch_regression_mse
+
+python trajectory_evaluation/multi_comparison/run_student_multi_benchmark_batch.py \
+  --student-checkpoint /home/hojinsohn/VLM-NT/PI-VLA/student_model_training/best_z_goal_model_regression_hybrid_contra_bs256_lr3em4_ep40_20260507_201445.pth \
+  --checkpoint /home/hojinsohn/VLM-NT/PI-VLA/teacher_model.pt \
+  --seed 123 \
+  --no-video \
+  --save-final-geometric-debug \
+  --out-root /home/hojinsohn/VLM-NT/PI-VLA/output/trajectory_evaluation/student_multi_batch_regression_hybrid_contra
+
+python trajectory_evaluation/multi_comparison/run_student_multi_benchmark_batch.py \
+  --student-checkpoint /home/hojinsohn/VLM-NT/PI-VLA/student_model_training/best_z_goal_model_regression_hybrid_bs256_lr3em4_ep40_20260507_180418.pth \
+  --checkpoint /home/hojinsohn/VLM-NT/PI-VLA/teacher_model.pt \
+  --seed 123 \
+  --no-video \
+  --save-final-geometric-debug \
+  --out-root /home/hojinsohn/VLM-NT/PI-VLA/output/trajectory_evaluation/student_multi_batch_regression_hybrid_cos
+  
+
+'''
 from __future__ import annotations
 
 import argparse
@@ -19,15 +44,13 @@ from datetime import datetime
 from pathlib import Path
 
 _PI_VLA_ROOT = Path(__file__).resolve().parents[2]
-_BENCHMARK = _PI_VLA_ROOT / "trajectory_evaluation" / "comparison" / "run_rrt_ntfield_benchmark.py"
+_BENCHMARK = _PI_VLA_ROOT / "trajectory_evaluation" / "multi_comparison" / "run_student_multi_benchmark.py"
 
 DEFAULT_CHECKPOINT = (
-    "ntrl-demo/Experiments/UR5_trajectory_no_wall_accuracy_check/"
-    "trajectory_03_25_20_28/Model_Epoch_05000_ValLoss_7.820605e-01.pt"
-    # "output/models/Model_Epoch_04600_ValLoss_2.942264e-03.pt"
+    "/home/hojinsohn/VLM-NT/PI-VLA/teacher_model.pt"
 )
 
-# User-specified grid (x, y) in world meters; z is fixed via --object-z unless overridden.
+# Grid for designated target object pose (x, y), z set by --object-z
 OBJECT_XY_GRID = [
     (0.5, 0.3),
     (0.7, 0.3),
@@ -50,7 +73,7 @@ def _subdir_name(x: float, y: float, index: int) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run run_rrt_ntfield_benchmark.py for each (x,y) in OBJECT_XY_GRID."
+        description="Run run_student_multi_benchmark.py for each (x,y) in OBJECT_XY_GRID."
     )
     parser.add_argument(
         "--checkpoint",
@@ -59,16 +82,22 @@ def main() -> None:
         help="NTField checkpoint path relative to PI-VLA root or absolute",
     )
     parser.add_argument(
+        "--student-checkpoint",
+        type=str,
+        required=True,
+        help="Student checkpoint path relative to PI-VLA root or absolute",
+    )
+    parser.add_argument(
         "--object-z",
         type=float,
         default=0.18,
-        help="Mustard actor z (world m); not varied on the grid",
+        help="Designated target object z (world m); not varied on the grid",
     )
     parser.add_argument(
         "--out-root",
         type=str,
         default=None,
-        help="Parent directory for this batch (default: output/trajectory_evaluation/batch_<timestamp>/)",
+        help="Parent directory for this batch (default: output/trajectory_evaluation/multi_batch_<timestamp>/)",
     )
     parser.add_argument("--seed", type=int, default=None, help="Passed to each benchmark run")
     parser.add_argument(
@@ -146,16 +175,24 @@ def main() -> None:
     if args.out_root:
         out_root = Path(args.out_root).resolve()
     else:
-        out_root = _PI_VLA_ROOT / "output" / "trajectory_evaluation" / f"batch_{stamp}"
+        out_root = _PI_VLA_ROOT / "output" / "trajectory_evaluation" / f"multi_batch_{stamp}"
     out_root.mkdir(parents=True, exist_ok=True)
 
     ckpt_arg = args.checkpoint
+    student_ckpt_arg = args.student_checkpoint
     if not os.path.isabs(ckpt_arg):
         ckpt_resolved = (_PI_VLA_ROOT / ckpt_arg).resolve()
     else:
         ckpt_resolved = Path(ckpt_arg).resolve()
+    if not os.path.isabs(student_ckpt_arg):
+        student_ckpt_resolved = (_PI_VLA_ROOT / student_ckpt_arg).resolve()
+    else:
+        student_ckpt_resolved = Path(student_ckpt_arg).resolve()
     if not ckpt_resolved.is_file():
         print(f"Checkpoint not found: {ckpt_resolved}", file=sys.stderr)
+        sys.exit(1)
+    if not student_ckpt_resolved.is_file():
+        print(f"Student checkpoint not found: {student_ckpt_resolved}", file=sys.stderr)
         sys.exit(1)
 
     rows = []
@@ -178,13 +215,16 @@ def main() -> None:
             str(args.object_z),
             "--ntfield_checkpoint",
             ckpt_arg if not os.path.isabs(ckpt_arg) else str(ckpt_resolved),
+            "--student_checkpoint",
+            student_ckpt_arg if not os.path.isabs(student_ckpt_arg) else str(student_ckpt_resolved),
             "--record_dir",
             str(run_dir),
             "--output_json",
             str(out_json),
         ]
         if args.seed is not None:
-            cmd.extend(["--seed", str(args.seed)])
+            # Deterministic but distinct RNG stream per grid position.
+            cmd.extend(["--seed", str(int(args.seed) + i)])
         cmd.extend(["--ntfield_waypoint_mode", args.ntfield_waypoint_mode])
         cmd.extend(["--ntfield_fixed_waypoints", str(args.ntfield_fixed_waypoints)])
         cmd.extend(["--planner_playback", args.planner_playback])
@@ -236,7 +276,9 @@ def main() -> None:
     summary = {
         "created": datetime.now().isoformat(),
         "pi_vla_root": str(_PI_VLA_ROOT),
+        "benchmark_script": str(_BENCHMARK),
         "checkpoint": str(ckpt_resolved),
+        "student_checkpoint": str(student_ckpt_resolved),
         "planner_playback": args.planner_playback,
         "ntfield_waypoint_mode": args.ntfield_waypoint_mode,
         "ntfield_fixed_waypoints": int(args.ntfield_fixed_waypoints),

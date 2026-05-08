@@ -1,13 +1,3 @@
-#
-# Batch runner: RRTConnect vs NTField benchmark over a fixed (x, y) grid of object poses.
-#
-# From PI-VLA repository root:
-#   python trajectory_evaluation/comparison/run_rrt_ntfield_benchmark_batch.py
-#
-# --planner-playback {direct,settle} is forwarded to each benchmark (default: direct).
-# Optional: pass extra Isaac Gym / benchmark flags after -- :
-#   python trajectory_evaluation/comparison/run_rrt_ntfield_benchmark_batch.py --planner-playback settle -- --sim_device cpu
-#
 from __future__ import annotations
 
 import argparse
@@ -19,15 +9,14 @@ from datetime import datetime
 from pathlib import Path
 
 _PI_VLA_ROOT = Path(__file__).resolve().parents[2]
-_BENCHMARK = _PI_VLA_ROOT / "trajectory_evaluation" / "comparison" / "run_rrt_ntfield_benchmark.py"
+_BENCHMARK = _PI_VLA_ROOT / "trajectory_evaluation" / "multi_comparison" / "run_rrt_ntfield_multi_benchmark.py"
 
 DEFAULT_CHECKPOINT = (
     "ntrl-demo/Experiments/UR5_trajectory_no_wall_accuracy_check/"
     "trajectory_03_25_20_28/Model_Epoch_05000_ValLoss_7.820605e-01.pt"
-    # "output/models/Model_Epoch_04600_ValLoss_2.942264e-03.pt"
 )
 
-# User-specified grid (x, y) in world meters; z is fixed via --object-z unless overridden.
+# Grid for designated target object pose (x, y), z set by --object-z
 OBJECT_XY_GRID = [
     (0.5, 0.3),
     (0.7, 0.3),
@@ -50,7 +39,7 @@ def _subdir_name(x: float, y: float, index: int) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run run_rrt_ntfield_benchmark.py for each (x,y) in OBJECT_XY_GRID."
+        description="Run run_rrt_ntfield_multi_benchmark.py for each (x,y) in OBJECT_XY_GRID."
     )
     parser.add_argument(
         "--checkpoint",
@@ -62,13 +51,13 @@ def main() -> None:
         "--object-z",
         type=float,
         default=0.18,
-        help="Mustard actor z (world m); not varied on the grid",
+        help="Designated target object z (world m); not varied on the grid",
     )
     parser.add_argument(
         "--out-root",
         type=str,
         default=None,
-        help="Parent directory for this batch (default: output/trajectory_evaluation/batch_<timestamp>/)",
+        help="Parent directory for this batch (default: output/trajectory_evaluation/multi_batch_<timestamp>/)",
     )
     parser.add_argument("--seed", type=int, default=None, help="Passed to each benchmark run")
     parser.add_argument(
@@ -146,7 +135,7 @@ def main() -> None:
     if args.out_root:
         out_root = Path(args.out_root).resolve()
     else:
-        out_root = _PI_VLA_ROOT / "output" / "trajectory_evaluation" / f"batch_{stamp}"
+        out_root = _PI_VLA_ROOT / "output" / "trajectory_evaluation" / f"multi_batch_{stamp}"
     out_root.mkdir(parents=True, exist_ok=True)
 
     ckpt_arg = args.checkpoint
@@ -236,6 +225,7 @@ def main() -> None:
     summary = {
         "created": datetime.now().isoformat(),
         "pi_vla_root": str(_PI_VLA_ROOT),
+        "benchmark_script": str(_BENCHMARK),
         "checkpoint": str(ckpt_resolved),
         "planner_playback": args.planner_playback,
         "ntfield_waypoint_mode": args.ntfield_waypoint_mode,

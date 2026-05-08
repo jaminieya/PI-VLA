@@ -1,23 +1,3 @@
-#
-# trajectory_evaluation/comparison/run_rrt_ntfield_benchmark.py
-#
-# Fixed scene: table (0.8, 1.0, 0.1) m, single YCB 011_banana at user-provided world pose.
-# 1) Grasp pipeline -> goal joints q_goal (same as collect_data / integrated).
-# 2) RRTConnect get_path2grasp from current sim q_start; record planning time, path joint motion, execution time.
-# 3) Reset arm to q_start; NTField gradient plan; same metrics.
-#
-# Playback: RRT and NTField paths are never joint-interpolated (no extra points between planner samples).
-# Default --planner_playback direct uses one physics step per planner waypoint so video matches planner
-# discretization. Use --planner_playback settle for multi-step dwell per waypoint (slower convergence look).
-#
-# Result JSON includes full planner joint paths as rrtconnect/ntfield "trajectory_waypoints_rad"
-# (6-DoF UR5e rad per row, same ordering as execute_path_and_time playback).
-#
-# Run from PI-VLA root (headless by default; writes rrt.mp4 + ntfield.mp4 under output/trajectory_evaluation/):
-#   python trajectory_evaluation/comparison/run_rrt_ntfield_benchmark.py \
-#     --object_x 0.55 --object_y 0.0 --object_z 0.18 \
-#     --ntfield_checkpoint ntrl-demo/Experiments/.../Model_Epoch_*.pt
-#
 from __future__ import annotations
 
 import argparse
@@ -55,23 +35,22 @@ from trajectory_evaluation.ntfield.eval_trajectory_ntfield import _ModelShim, lo
 from planning.gradient_planner_trajectory import SCALE as NTFIELD_SCALE
 from planning.gradient_planner_trajectory import plan as ntfield_plan
 
-# --- Fixed benchmark layout (matches user request) ---
 TABLE_DIMS_X = 0.8
 TABLE_DIMS_Y = 1.0
 TABLE_DIMS_Z = 0.10
 DRAWER_HEIGHT = 0.40
-NUM_OF_OBJECTS = 1
-# 011_banana is index 5 in assets/urdf/ycb/object_urdf_grasp.txt (0-based list)
-BANANA_ASSET_IDX = 5
-TARGET_OBJ_INDEX = [BANANA_ASSET_IDX]
+NUM_OF_OBJECTS = 3
+# Three different default YCB objects (matches legacy new_setup pattern [1, 3, 5]).
+# The first entry is the designated target object at (--object_x, --object_y, --object_z).
+TARGET_OBJ_INDEX = [1, 3, 5]
 ADD_COVER = False
-max_scaling_factor = 0
+MAX_RANDOM_PLACEMENT_ATTEMPTS = 500
+XY_MIN_SEPARATION = 0.16
 
 sim_dt = 1.0 / 60.0
 SETTLE_STEPS = 15
 FINAL_HOLD_STEPS = 80
 RAD_PER_SIM_STEP_HEURISTIC = 0.018
-# Single-sphere EE proxy radius sized to include the gripper envelope (not only the tip).
 EE_COLLISION_PROXY_RADIUS_M = 0.09
 EE_PROXY_MAX_RADIUS_M_DEFAULT = 0.025
 
@@ -89,7 +68,6 @@ def _path_as_6_list(path):
 
 
 def _resample_path_fixed_waypoints(path_6, target_count):
-    """Resample a joint path to exactly target_count waypoints (inclusive endpoints)."""
     if path_6 is None:
         return None
     if target_count is None or int(target_count) <= 0:
@@ -101,14 +79,12 @@ def _resample_path_fixed_waypoints(path_6, target_count):
         return [path_6[0] for _ in range(target_count)]
     if target_count == 1:
         return [path_6[0]]
-
     arr = np.asarray(path_6, dtype=np.float64).reshape(-1, 6)
     seg = np.linalg.norm(np.diff(arr, axis=0), axis=1)
     s = np.concatenate(([0.0], np.cumsum(seg)))
     total = float(s[-1])
     if total <= 1e-12:
         return [arr[0].tolist() for _ in range(target_count)]
-
     s_new = np.linspace(0.0, total, target_count)
     out = np.empty((target_count, 6), dtype=np.float64)
     for j in range(6):
@@ -130,7 +106,6 @@ def get_swept_volume_size(main_swept):
 
 
 def joint_metrics(path_6, q_start, q_goal):
-    """path_6: list of 6-tuples. Returns dict of motion statistics."""
     arr = np.array(path_6, dtype=np.float64).reshape(-1, 6)
     out = {}
     q0 = np.asarray(q_start, dtype=np.float64).reshape(6)
@@ -200,19 +175,13 @@ def _compute_ee_proxy_from_gripper(
     center_mode="between_fingertips",
     max_radius_m=EE_PROXY_MAX_RADIUS_M_DEFAULT,
 ):
-    """
-    Build EE sphere proxy from gripper mesh.
-    - center_mode=ee_origin: center at EE frame origin.
-    - center_mode=between_fingertips: midpoint between left/right fingertip proxy points.
-    """
+    """Build EE sphere proxy from gripper mesh (matches comparison/run_rrt_ntfield_benchmark.py)."""
     pose_array = rac.calculate_transform_from_angles(dof_result)
     ee_center = np.asarray(pose_array[8][0], dtype=np.float64).reshape(3)
     grip_verts_local = np.asarray(rac.collision_models_["gripper"][0], dtype=np.float64).reshape(-1, 3)
     grip_rot = R.from_quat(np.asarray(pose_array[8][1], dtype=np.float64)).as_matrix()
     grip_verts_world = (grip_verts_local @ grip_rot.T) + ee_center.reshape(1, 3)
 
-    # Gripper is mirrored around local x=0 in this project setup.
-    # We use the furthest local-z points on each side as fingertip proxies.
     center_world = ee_center
     center_local = np.zeros(3, dtype=np.float64)
     if center_mode == "between_fingertips":
@@ -225,9 +194,7 @@ def _compute_ee_proxy_from_gripper(
             right_world = grip_verts_world[right_mask]
             left_tip_idx = int(np.argmax(left_local[:, 2]))
             right_tip_idx = int(np.argmax(right_local[:, 2]))
-            left_tip = left_world[left_tip_idx]
-            right_tip = right_world[right_tip_idx]
-            center_world = 0.5 * (left_tip + right_tip)
+            center_world = 0.5 * (left_world[left_tip_idx] + right_world[right_tip_idx])
             center_local = 0.5 * (left_local[left_tip_idx] + right_local[right_tip_idx])
 
     derived_radius = float(np.max(np.linalg.norm(grip_verts_local - center_local.reshape(1, 3), axis=1)))
@@ -236,95 +203,147 @@ def _compute_ee_proxy_from_gripper(
     return center_world, derived_radius
 
 
-def ee_object_pair_collision_check(
+def _evaluate_ee_proxy_against_scene(
     rac,
     dof_result,
-    target_obj_collision_obj,
+    flex_collision_models,
+    target_idx,
+    spawned_object_asset_indices,
     center_mode="between_fingertips",
     max_radius_m=EE_PROXY_MAX_RADIUS_M_DEFAULT,
 ):
     """
-    Explicit FCL pair query:
-    - EE proxy is a single sphere.
-    - Sphere center can be EE frame origin or midpoint between fingertip proxies.
-    - Sphere radius is auto-derived from gripper mesh and capped by --ee_proxy_max_radius_m.
-    - Success condition: sphere proxy collides with target object collision model.
+    Single FCL pair query of EE sphere proxy against:
+    - the designated target object's settled BVH mesh (must collide for grasp to count),
+    - every other (obstacle) object's settled BVH mesh (must NOT collide).
+
+    Returns a dict with: target/obstacles/no_obstacle_collision/success/ee_center_world_m/radius_m.
     """
-    ee_proxy_center_world, derived_radius = _compute_ee_proxy_from_gripper(
-        rac,
-        dof_result,
-        center_mode=center_mode,
-        max_radius_m=max_radius_m,
+    if not flex_collision_models or target_idx < 0 or target_idx >= len(flex_collision_models):
+        return {
+            "evaluated": False,
+            "target": None,
+            "obstacles": [],
+            "no_obstacle_collision": False,
+            "success": False,
+            "ee_center_world_m": None,
+            "radius_m": None,
+        }
+    ee_center, derived_radius = _compute_ee_proxy_from_gripper(
+        rac, dof_result, center_mode=center_mode, max_radius_m=max_radius_m
     )
-    ee_proxy_obj = fcl.CollisionObject(fcl.Sphere(derived_radius), fcl.Transform(ee_proxy_center_world))
-    req = fcl.CollisionRequest(num_max_contacts=20, enable_contact=True)
-    res = fcl.CollisionResult()
-    num_contacts = int(fcl.collide(ee_proxy_obj, target_obj_collision_obj, req, res))
-    is_collision = bool(num_contacts > 0)
-    return is_collision, ee_proxy_center_world.tolist(), num_contacts, derived_radius
+    ee_proxy_obj = fcl.CollisionObject(fcl.Sphere(derived_radius), fcl.Transform(ee_center))
+
+    def _pair(co):
+        req = fcl.CollisionRequest(num_max_contacts=20, enable_contact=True)
+        res = fcl.CollisionResult()
+        n = int(fcl.collide(ee_proxy_obj, co, req, res))
+        return bool(n > 0), int(n)
+
+    target_co = flex_collision_models[target_idx][0]
+    target_hit, target_n = _pair(target_co)
+    target_block = {
+        "object_index": int(target_idx),
+        "asset_index": int(spawned_object_asset_indices[target_idx]) if spawned_object_asset_indices is not None else None,
+        "collision": bool(target_hit),
+        "num_contacts": int(target_n),
+    }
+
+    obstacles = []
+    no_obstacle_collision = True
+    for k, item in enumerate(flex_collision_models):
+        if k == target_idx:
+            continue
+        hit_k, n_k = _pair(item[0])
+        if hit_k:
+            no_obstacle_collision = False
+        obstacles.append({
+            "object_index": int(k),
+            "asset_index": int(spawned_object_asset_indices[k]) if spawned_object_asset_indices is not None else None,
+            "collision": bool(hit_k),
+            "num_contacts": int(n_k),
+        })
+
+    success = bool(target_hit and no_obstacle_collision)
+    return {
+        "evaluated": True,
+        "target": target_block,
+        "obstacles": obstacles,
+        "no_obstacle_collision": bool(no_obstacle_collision),
+        "success": success,
+        "ee_center_world_m": ee_center.tolist(),
+        "radius_m": float(derived_radius),
+    }
 
 
-def planner_specific_ee_object_pair_check(
+def planner_terminal_ee_check(
     rac,
     planner_path_6,
-    target_obj_collision_obj,
+    flex_collision_models,
+    target_idx,
+    spawned_object_asset_indices,
     center_mode,
     max_radius_m,
 ):
-    """Evaluate EE proxy/object pair collision at the planner's terminal waypoint."""
-    if planner_path_6 is None or len(planner_path_6) == 0 or target_obj_collision_obj is None:
+    """Evaluate the EE proxy / scene pair check at the planner's terminal waypoint."""
+    if planner_path_6 is None or len(planner_path_6) == 0:
         return {
             "evaluated": False,
+            "target": None,
+            "obstacles": [],
+            "no_obstacle_collision": False,
             "success": False,
-            "num_contacts": 0,
             "ee_center_world_m": None,
             "radius_m": None,
         }
     q_last = np.asarray(planner_path_6[-1], dtype=np.float64).reshape(6)
-    ok, ee_center_world, num_contacts, radius_m = ee_object_pair_collision_check(
+    return _evaluate_ee_proxy_against_scene(
         rac,
         q_last,
-        target_obj_collision_obj,
+        flex_collision_models,
+        target_idx,
+        spawned_object_asset_indices,
         center_mode=center_mode,
         max_radius_m=max_radius_m,
     )
-    return {
-        "evaluated": True,
-        "success": bool(ok),
-        "num_contacts": int(num_contacts),
-        "ee_center_world_m": list(ee_center_world),
-        "radius_m": float(radius_m) if radius_m is not None else None,
-    }
 
 
-def save_final_geometric_debug_image(
+def save_final_geometric_debug_image_multi(
     out_path,
     rac,
     dof_result,
-    object_mesh,
+    object_meshes,
+    target_idx,
     ee_center_world,
     ee_radius_m=None,
 ):
-    """Save a static 3D debug image: robot link centers + gripper mesh + object mesh."""
+    """3D debug PNG: link chain + gripper mesh + EE sphere + target (orange) and obstacle (gray) meshes."""
     pose_array = rac.calculate_transform_from_angles(dof_result)
     link_pts = np.asarray([p[0] for p in pose_array[:9]], dtype=np.float64).reshape(-1, 3)
-
-    obj_verts = np.asarray(object_mesh[0], dtype=np.float64)
-    obj_faces = np.asarray(object_mesh[1], dtype=np.int32)
     ee_center = np.asarray(ee_center_world, dtype=np.float64).reshape(3)
 
     fig = plt.figure(figsize=(8, 8))
     ax = fig.add_subplot(111, projection="3d")
 
-    # Object mesh (semi-transparent)
-    tri_polys = [obj_verts[f] for f in obj_faces]
-    mesh_coll = Poly3DCollection(tri_polys, alpha=0.28, facecolor="tab:orange", edgecolor="k", linewidths=0.2)
-    ax.add_collection3d(mesh_coll)
+    obj_pts_for_bounds = []
+    for k, mesh in enumerate(object_meshes):
+        if mesh is None:
+            continue
+        verts = np.asarray(mesh[0], dtype=np.float64)
+        faces = np.asarray(mesh[1], dtype=np.int32)
+        if verts.size == 0 or faces.size == 0:
+            continue
+        is_target = (k == target_idx)
+        face_color = "tab:orange" if is_target else "lightgray"
+        edge_color = "k" if is_target else "dimgray"
+        alpha = 0.32 if is_target else 0.18
+        tri_polys = [verts[f] for f in faces]
+        coll = Poly3DCollection(tri_polys, alpha=alpha, facecolor=face_color, edgecolor=edge_color, linewidths=0.2)
+        ax.add_collection3d(coll)
+        obj_pts_for_bounds.append(verts)
 
-    # Robot kinematic chain (link centers)
     ax.plot(link_pts[:, 0], link_pts[:, 1], link_pts[:, 2], color="tab:blue", linewidth=2.0, marker="o", markersize=3)
 
-    # Gripper mesh at current EE pose
     grip_verts_local, grip_faces = rac.collision_models_["gripper"]
     grip_verts_local = np.asarray(grip_verts_local, dtype=np.float64)
     grip_faces = np.asarray(grip_faces, dtype=np.int32)
@@ -334,7 +353,7 @@ def save_final_geometric_debug_image(
     grip_polys = [grip_verts_world[f] for f in grip_faces]
     grip_coll = Poly3DCollection(grip_polys, alpha=0.35, facecolor="tab:red", edgecolor="k", linewidths=0.15)
     ax.add_collection3d(grip_coll)
-    ax.scatter([ee_center[0]], [ee_center[1]], [ee_center[2]], color="red", s=24, label="EE frame origin")
+    ax.scatter([ee_center[0]], [ee_center[1]], [ee_center[2]], color="red", s=24, label="EE proxy center")
     if ee_radius_m is not None:
         u = np.linspace(0.0, 2.0 * np.pi, 40)
         v = np.linspace(0.0, np.pi, 24)
@@ -343,7 +362,8 @@ def save_final_geometric_debug_image(
         zs = ee_center[2] + ee_radius_m * np.outer(np.ones_like(u), np.cos(v))
         ax.plot_surface(xs, ys, zs, color="magenta", alpha=0.16, linewidth=0, antialiased=True)
 
-    all_pts = np.vstack([obj_verts, grip_verts_world, link_pts, ee_center.reshape(1, 3)])
+    pts_for_bounds = [link_pts, grip_verts_world, ee_center.reshape(1, 3)] + obj_pts_for_bounds
+    all_pts = np.vstack(pts_for_bounds)
     mins = all_pts.min(axis=0)
     maxs = all_pts.max(axis=0)
     center = 0.5 * (mins + maxs)
@@ -355,7 +375,7 @@ def save_final_geometric_debug_image(
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
     ax.set_zlabel("Z (m)")
-    ax.set_title("Final geometric debug: robot + gripper mesh + sphere proxy + object mesh")
+    ax.set_title("Final geometric debug (multi): target=orange, obstacles=gray, EE sphere=magenta")
     ax.legend(loc="upper right")
     fig.tight_layout()
 
@@ -383,17 +403,13 @@ def execute_path_and_time(
     record_rgb=None,
     planner_playback="direct",
 ):
-    """Physically step the arm through path_local; return wall time and sim time."""
     if not path_local:
         return {"label": label, "success": False, "execution_wall_s": None, "execution_sim_s": None, "physics_steps": 0}
     t0 = time.perf_counter()
     n_sub = 0
     for path_id in range(len(path_local)):
         dof_result = path_local[path_id]
-        if planner_playback == "settle":
-            n_hold = _settle_steps_at_waypoint(path_local, path_id)
-        else:
-            n_hold = 1
+        n_hold = _settle_steps_at_waypoint(path_local, path_id) if planner_playback == "settle" else 1
         for _ in range(n_hold):
             gym.set_dof_target_position(env, spj, float(dof_result[0]))
             gym.set_dof_target_position(env, slj, float(dof_result[1]))
@@ -451,11 +467,32 @@ def reset_arm_to_q(gym, sim, env, ur_handle, spj, slj, ej, wj1, wj2, wj3, viewer
         gym.sync_frame_time(sim)
 
 
+def _make_object_collision_model(asset_root, object_collision_files, object_offset, file_idx, scaling):
+    file_path = object_collision_files[file_idx]
+    collision_mesh = obj_reader(asset_root + file_path)
+    collision_mesh.set_scale(scaling)
+    collision_mesh.add_offset(object_offset[file_idx])
+    verts, tris = collision_mesh.get_bounding_box_mesh()
+    temp_center = collision_mesh.get_center()
+    temp_bounding_box = collision_mesh.get_bounding_box()
+    m = fcl.BVHModel()
+    m.beginModel(len(verts), len(tris))
+    m.addSubModel(verts, tris)
+    m.endModel()
+    return collision_mesh, temp_center, temp_bounding_box, m
+
+
+def _sample_random_xy(table_dims):
+    tx = np.random.uniform(0.35, table_dims.x + 0.2)
+    ty = np.random.uniform(-table_dims.y / 2 + 0.1, table_dims.y / 2 - 0.2)
+    return float(tx), float(ty)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="RRTConnect vs NTField benchmark (fixed 0.8x1.0 table, YCB banana).")
-    parser.add_argument("--object_x", type=float, required=True, help="Mustard bottle actor position x (world m)")
-    parser.add_argument("--object_y", type=float, required=True, help="Mustard bottle actor position y (world m)")
-    parser.add_argument("--object_z", type=float, required=True, help="Mustard bottle actor position z (world m)")
+    parser = argparse.ArgumentParser(description="RRTConnect vs NTField benchmark with 3 objects (1 fixed + 2 random).")
+    parser.add_argument("--object_x", type=float, required=True, help="Designated target object x (world m)")
+    parser.add_argument("--object_y", type=float, required=True, help="Designated target object y (world m)")
+    parser.add_argument("--object_z", type=float, required=True, help="Designated target object z (world m)")
     parser.add_argument("--ntfield_checkpoint", type=str, required=True, help="Trajectory NTField Model_Epoch_*.pt")
     parser.add_argument("--ntfield_experiment_dir", type=str, default=None)
     parser.add_argument("--use_viewer", action="store_true")
@@ -464,51 +501,29 @@ def main():
     parser.add_argument("--ntfield_max_steps", type=int, default=200)
     parser.add_argument("--ntfield_tol", type=float, default=0.01)
     parser.add_argument("--ntfield_goal_eps_rad", type=float, default=None)
-    parser.add_argument("--output_json", type=str, default=None, help="Write result JSON to this path")
-    parser.add_argument(
-        "--record_dir",
-        type=str,
-        default=None,
-        help="Directory for rrt.mp4 / ntfield.mp4 (default: output/trajectory_evaluation/benchmark_<timestamp>/)",
-    )
-    parser.add_argument("--video_fps", type=float, default=60.0, help="FPS for saved MP4s")
-    parser.add_argument("--no_video", action="store_true", help="Skip MP4 recording")
-    parser.add_argument(
-        "--planner_playback",
-        type=str,
-        choices=("direct", "settle"),
-        default="direct",
-        help="direct: one sim step per planner waypoint (default). settle: multi-step dwell per waypoint.",
-    )
+    parser.add_argument("--output_json", type=str, default=None)
+    parser.add_argument("--record_dir", type=str, default=None)
+    parser.add_argument("--video_fps", type=float, default=60.0)
+    parser.add_argument("--no_video", action="store_true")
+    parser.add_argument("--planner_playback", type=str, choices=("direct", "settle"), default="direct")
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument(
-        "--ntfield_waypoint_mode",
-        type=str,
-        choices=("full", "two_point"),
-        default="full",
-        help="full: execute all NTField waypoints. two_point: execute only [start, goal].",
-    )
-    parser.add_argument(
-        "--ntfield_fixed_waypoints",
-        type=int,
-        default=0,
-        help="If >0, resample NTField trajectory to this many waypoints (ignored in two_point mode).",
-    )
+    parser.add_argument("--ntfield_waypoint_mode", type=str, choices=("full", "two_point"), default="full")
+    parser.add_argument("--ntfield_fixed_waypoints", type=int, default=0)
     parser.add_argument(
         "--save_final_geometric_debug",
         action="store_true",
-        help="Save a PNG showing final robot configuration, EE collision proxy, and object mesh.",
+        help="Save a PNG showing final robot configuration, EE collision proxy, and all object meshes.",
     )
     parser.add_argument(
         "--final_geometric_debug_path",
         type=str,
         default=None,
-        help="Optional output path for final geometric debug PNG.",
+        help="Optional output path for final geometric debug PNG (defaults to <record_dir>/final_geometric_debug.png).",
     )
     parser.add_argument(
         "--require_ee_object_collision",
         action="store_true",
-        help="If set, require EE proxy/object collision to accept a grasp candidate.",
+        help="If set, mark a planner's success=False unless EE proxy collides with target AND not with obstacles.",
     )
     parser.add_argument(
         "--ee_proxy_radius_m",
@@ -530,8 +545,6 @@ def main():
         help="Cap EE proxy sphere radius in meters after auto-derivation.",
     )
     args, argv_remainder = parser.parse_known_args()
-    # Isaac gymutil parses sys.argv; pass through only unrecognized tokens.
-    # When not using the viewer, inject --headless so Isaac Gym matches headless + camera-sensor capture.
     argv_gym = list(argv_remainder)
     if not args.use_viewer and "--headless" not in argv_gym:
         argv_gym.append("--headless")
@@ -543,22 +556,13 @@ def main():
     if not os.path.isfile(ckpt_abs):
         print(f"Checkpoint not found: {ckpt_abs}")
         sys.exit(1)
-
     if args.ntfield_device != "cpu" and not torch.cuda.is_available():
         print("Warning: CUDA unavailable; NTField using cpu")
-    dev = torch.device(
-        "cpu" if args.ntfield_device == "cpu" or not torch.cuda.is_available() else args.ntfield_device
-    )
-    _, ntfield_fn = load_network_and_function(
-        ckpt_abs, args.ntfield_experiment_dir, dev, dim=6
-    )
+    dev = torch.device("cpu" if args.ntfield_device == "cpu" or not torch.cuda.is_available() else args.ntfield_device)
+    _, ntfield_fn = load_network_and_function(ckpt_abs, args.ntfield_experiment_dir, dev, dim=6)
     nt_model = _ModelShim(ntfield_fn)
     ntfield_device_str = str(dev) if dev.type == "cuda" else "cpu"
-    goal_eps = (
-        float(args.ntfield_goal_eps_rad)
-        if args.ntfield_goal_eps_rad is not None
-        else float(args.ntfield_tol * NTFIELD_SCALE)
-    )
+    goal_eps = float(args.ntfield_goal_eps_rad) if args.ntfield_goal_eps_rad is not None else float(args.ntfield_tol * NTFIELD_SCALE)
 
     _invoke_cwd = os.getcwd()
     os.chdir(HANWEN_GRASPING_ROOT)
@@ -638,7 +642,6 @@ def main():
         ur5e_collision_models.append(m)
 
     object_collision_lib = []
-
     viewer = None
     if not gym_args.headless:
         viewer = gym.create_viewer(sim, gymapi.CameraProperties())
@@ -658,7 +661,6 @@ def main():
     table_asset = gym.create_box(sim, table_dims.x, table_dims.y, table_dims.z, asset_options)
     upper_cover_dims = gymapi.Vec3(table_dims.x, table_dims.y, 0.03)
     upper_cover_asset = gym.create_box(sim, upper_cover_dims.x, upper_cover_dims.y, upper_cover_dims.z, asset_options)
-
     asset_options.fix_base_link = False
     object_assets = [gym.load_asset(sim, asset_root, ob, asset_options) for ob in object_asset_files]
 
@@ -693,8 +695,11 @@ def main():
     object_mesh = []
     flex_collision_models = []
     spj = slj = ej = wj1 = wj2 = wj3 = None
-    target_file_idx = np.array(TARGET_OBJ_INDEX)
+    target_file_idx = np.array(TARGET_OBJ_INDEX, dtype=np.int64)
+    if target_file_idx.size != NUM_OF_OBJECTS or len(set(target_file_idx.tolist())) != NUM_OF_OBJECTS:
+        raise ValueError(f"TARGET_OBJ_INDEX must contain {NUM_OF_OBJECTS} unique object indices.")
     main_cam_handle = None
+    spawned_object_world_xyz = []
 
     for i in range(num_of_envs):
         envs.append(gym.create_env(sim, env_lower, env_upper, row_num_of_envs))
@@ -705,52 +710,70 @@ def main():
         wj1 = gym.find_actor_dof_handle(envs[-1], ur5e_handles[-1], "wrist_1_joint")
         wj2 = gym.find_actor_dof_handle(envs[-1], ur5e_handles[-1], "wrist_2_joint")
         wj3 = gym.find_actor_dof_handle(envs[-1], ur5e_handles[-1], "wrist_3_joint")
-
         gym.create_actor(envs[-1], table_asset, table_pose, "table" + str(i), 0, 1)
+        if ADD_COVER:
+            gym.create_actor(envs[-1], upper_cover_asset, upper_cover_pose, "upper_cover" + str(i), 0, 1)
+
         objs_manager = fcl.DynamicAABBTreeCollisionManager()
         objs_manager.setup()
         obstacle_objs = []
         GT_OBJ_POS_LIST = []
-
         object_scaling_factor = np.ones(NUM_OF_OBJECTS, dtype=np.float64)
 
         for k in range(NUM_OF_OBJECTS):
             object_pose = gymapi.Transform()
-            tx, ty, tz = float(args.object_x), float(args.object_y), float(args.object_z)
+            fk = int(target_file_idx[k])
+            collision_mesh, temp_center, temp_bounding_box, m = _make_object_collision_model(
+                asset_root, object_collision_files, object_offset, fk, object_scaling_factor[k]
+            )
+
+            if k == 0:
+                tx, ty, tz = float(args.object_x), float(args.object_y), float(args.object_z)
+            else:
+                placed = False
+                tx = ty = tz = 0.0
+                for _ in range(MAX_RANDOM_PLACEMENT_ATTEMPTS):
+                    tx_cand, ty_cand = _sample_random_xy(table_dims)
+                    tz_cand = float(table_dims.z + 0.08)
+                    t_cand = fcl.Transform(np.array([tx_cand, ty_cand, tz_cand]))
+
+                    req = fcl.CollisionRequest()
+                    rdata = fcl.CollisionData(request=req)
+                    objs_manager.collide(fcl.CollisionObject(m, t_cand), rdata, fcl.defaultCollisionCallback)
+                    is_collision = bool(rdata.result.is_collision)
+
+                    if not is_collision:
+                        too_close = False
+                        for px, py in GT_OBJ_POS_LIST:
+                            if float(np.hypot(tx_cand - px, ty_cand - py)) <= XY_MIN_SEPARATION:
+                                too_close = True
+                                break
+                        if not too_close:
+                            tx, ty, tz = tx_cand, ty_cand, tz_cand
+                            placed = True
+                            break
+                if not placed:
+                    raise RuntimeError("Failed to place random obstacle objects without overlap.")
+
             object_pose.p = gymapi.Vec3(tx, ty, tz)
-            file_path = object_collision_files[target_file_idx[k]]
-            collision_mesh = obj_reader(asset_root + file_path)
-            collision_mesh.set_scale(object_scaling_factor[k])
-            collision_mesh.add_offset(object_offset[target_file_idx[k]])
-            verts, tris = collision_mesh.get_vertices(), collision_mesh.get_faces()
-            temp_center = collision_mesh.get_center()
-            temp_bounding_box = collision_mesh.get_bounding_box()
-            m = fcl.BVHModel()
-            m.beginModel(len(verts), len(tris))
-            m.addSubModel(verts, tris)
-            m.endModel()
             t = fcl.Transform(np.array([tx, ty, tz]))
             GT_OBJ_POS_LIST.append([tx, ty])
+            spawned_object_world_xyz.append([tx, ty, tz])
+
             object_handles.append(
                 gym.create_actor(
-                    envs[-1],
-                    object_assets[target_file_idx[k]],
-                    object_pose,
-                    "object" + str(k) + str(i),
-                    0,
-                    2 ** (k + 1),
-                    k + 1,
+                    envs[-1], object_assets[fk], object_pose, "object" + str(k) + str(i), 0, 2 ** (k + 1), k + 1
                 )
             )
             gym.set_actor_scale(envs[-1], object_handles[-1], object_scaling_factor[k])
             object_reader_tracker.append(collision_mesh)
             object_status_list.append([temp_center, temp_bounding_box])
             object_collision_lib.append(m)
-            obstacle_objs.append(fcl.CollisionObject(m, t))
-            objs_manager.registerObjects(obstacle_objs)
+            obstacle_obj = fcl.CollisionObject(m, t)
+            obstacle_objs.append(obstacle_obj)
+            objs_manager.registerObjects([obstacle_obj])
             objs_manager.setup()
 
-        # Global camera (same rig as collect_data / new_setup) — used for headless MP4
         main_cam_handle = gym.create_camera_sensor(envs[-1], camera_props)
         main_cam_pos = gymapi.Vec3(3, 0, 0.3)
         gym.set_camera_location(main_cam_handle, envs[-1], main_cam_pos, camera_focus)
@@ -785,7 +808,7 @@ def main():
                 flex_collision_models.append([fcl.CollisionObject(object_collision_lib[ii], tf), 0])
                 temp_obj = object_reader_tracker[ii]
                 temp_obj.set_offset(translation)
-                vertices, faces = temp_obj.get_vertices(), temp_obj.get_faces()
+                vertices, faces = temp_obj.get_bounding_box_mesh()
                 object_mesh.append([vertices, faces])
         gym.simulate(sim)
         gym.fetch_results(sim, True)
@@ -796,13 +819,11 @@ def main():
 
     scene_info = [table_dims.x, table_dims.y, table_dims.z, drawer_height]
     file_path_rac = "./assets/urdf/ur5e/meshes/collision/"
-    rac = RC.robot_arm_configuration(
-        file_path_rac, np.array([ur5e_pose.p.x, ur5e_pose.p.y, ur5e_pose.p.z]), scene_info
-    )
+    rac = RC.robot_arm_configuration(file_path_rac, np.array([ur5e_pose.p.x, ur5e_pose.p.y, ur5e_pose.p.z]), scene_info)
 
-    grasp_file = "./assets/" + "/".join(object_asset_files[target_file_idx[0]].split("/")[:-1]) + "/grasp_dict.npy"
-    grasp_data = np.load(grasp_file, allow_pickle=True)
     target_idx = 0
+    grasp_file = "./assets/" + "/".join(object_asset_files[target_file_idx[target_idx]].split("/")[:-1]) + "/grasp_dict.npy"
+    grasp_data = np.load(grasp_file, allow_pickle=True)
 
     num_grasp = 0
     swept_size = sys.maxsize
@@ -811,10 +832,6 @@ def main():
     init2grasp_path = None
     grasp_target_q = None
     _rrt_plan_s = 0.0
-    ee_pair_collision_success = False
-    ee_pair_collision_contacts = 0
-    ee_pair_collision_center_world = None
-    ee_pair_collision_radius_m = None
     consecutive_path_failures = 0
     MAX_FAIL = 15
 
@@ -828,14 +845,11 @@ def main():
         grasp2init_angels_temp = rac.grasp_verify(target_grasp_pos + [0, 0, 0.01], target_grasp_quat)
         if init2grasp_angels_temp is None or grasp2init_angels_temp is None:
             continue
-        init2grasp_collision = rac.arm_collision_free(
-            init2grasp_angels_temp, plane_obj, object_collision_models, []
-        )
-        grasp2init_collision = rac.arm_collision_free(
-            grasp2init_angels_temp, plane_obj, object_collision_models, []
-        )
+        init2grasp_collision = rac.arm_collision_free(init2grasp_angels_temp, plane_obj, object_collision_models, [])
+        grasp2init_collision = rac.arm_collision_free(grasp2init_angels_temp, plane_obj, object_collision_models, [])
         if not init2grasp_collision or not grasp2init_collision:
             continue
+
         t_rrt0 = time.perf_counter()
         init2grasp_path_temp = RC.get_path2grasp(
             rac,
@@ -846,13 +860,11 @@ def main():
             given_static_model=object_collision_models,
         )
         rrt_planning_wall_s = float(time.perf_counter() - t_rrt0)
-
         if init2grasp_path_temp is None:
             consecutive_path_failures += 1
             continue
-        temp_mod_bbox = rac.modify_grasp_bbox(
-            init2grasp_angels_temp, target_mesh=object_mesh[target_idx], visualize=False
-        )
+
+        temp_mod_bbox = rac.modify_grasp_bbox(init2grasp_angels_temp, target_mesh=object_mesh[target_idx], visualize=False)
         grasp2init_path_temp = RC.get_path2start(
             rac,
             grasp2init_angels_temp,
@@ -865,21 +877,15 @@ def main():
             consecutive_path_failures += 1
             continue
         consecutive_path_failures = 0
+
         swept_volume1_temp, swept_verts1_temp = rac.get_swept_volume(
             init2grasp_path_temp, frame_rate=60, scene_info=scene_info, animation=False, static_vi=False
         )
         swept_volume2_temp, swept_verts2_temp = rac.get_swept_volume(
-            grasp2init_path_temp,
-            w_target=temp_mod_bbox,
-            frame_rate=60,
-            scene_info=scene_info,
-            animation=False,
-            static_vi=False,
+            grasp2init_path_temp, w_target=temp_mod_bbox, frame_rate=60, scene_info=scene_info, animation=False, static_vi=False
         )
         num_grasp += 1
-        swept_center_temp, swept_verts_temp = rac.get_swept_center(
-            swept_verts1_temp + swept_verts2_temp, scene_info, 0.6
-        )
+        swept_center_temp, swept_verts_temp = rac.get_swept_center(swept_verts1_temp + swept_verts2_temp, scene_info, 0.6)
         temp_swept_size = get_swept_volume_size(swept_verts_temp)
         if temp_swept_size < swept_size:
             swept_size = temp_swept_size
@@ -898,8 +904,12 @@ def main():
         "ntfield_waypoint_mode": args.ntfield_waypoint_mode,
         "ntfield_fixed_waypoints": int(args.ntfield_fixed_waypoints),
         "table_dims_m": [TABLE_DIMS_X, TABLE_DIMS_Y, TABLE_DIMS_Z],
-        "object_pose_world_m": [args.object_x, args.object_y, args.object_z],
-        "object": "011_banana",
+        "designated_object_pose_world_m": [args.object_x, args.object_y, args.object_z],
+        "all_object_poses_world_m": spawned_object_world_xyz,
+        "num_objects": NUM_OF_OBJECTS,
+        "target_object_asset_index": int(target_file_idx[0]),
+        "spawned_object_asset_indices": target_file_idx.tolist(),
+        "spawned_object_urdf_files": [object_asset_files[int(i)] for i in target_file_idx.tolist()],
         "q_start_live": q_start_live.tolist(),
         "goal_configuration_grasp_verify": grasp_target_q.tolist() if grasp_target_q is not None else None,
         "ee_object_pair_collision_required": bool(args.require_ee_object_collision),
@@ -910,9 +920,12 @@ def main():
             "radius_m": None,
         },
         "ee_object_pair_collision_selected_grasp": {
-            "success": bool(ee_pair_collision_success),
-            "num_contacts": int(ee_pair_collision_contacts),
-            "ee_center_world_m": ee_pair_collision_center_world,
+            "evaluated": False,
+            "success": False,
+            "target": None,
+            "obstacles": [],
+            "no_obstacle_collision": False,
+            "ee_center_world_m": None,
         },
         "rrtconnect": {},
         "ntfield": {},
@@ -932,12 +945,8 @@ def main():
         sys.exit(1)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if args.record_dir:
-        session_dir = os.path.abspath(args.record_dir)
-    else:
-        session_dir = os.path.join(_PI_VLA_ROOT, "output", "trajectory_evaluation", f"benchmark_{stamp}")
+    session_dir = os.path.abspath(args.record_dir) if args.record_dir else os.path.join(_PI_VLA_ROOT, "output", "trajectory_evaluation", f"multi_benchmark_{stamp}")
     os.makedirs(session_dir, exist_ok=True)
-    output_json_path = os.path.abspath(args.output_json) if args.output_json else os.path.join(session_dir, "result.json")
     mp4_rrt = os.path.join(session_dir, "rrt.mp4")
     mp4_nt = os.path.join(session_dir, "ntfield.mp4")
     result["video_session_dir"] = session_dir
@@ -946,71 +955,49 @@ def main():
     path_rrt = _path_as_6_list(init2grasp_path)
     if grasp_target_q is None:
         grasp_target_q = np.asarray(path_rrt[-1], dtype=np.float64).reshape(6)
-    # Explicit EE/object pair query is evaluated post-planning on the final grasp configuration.
-    if flex_collision_models and target_idx < len(flex_collision_models):
-        ee_pair_collision_success, ee_center_world, ee_pair_collision_contacts, ee_pair_collision_radius_m = ee_object_pair_collision_check(
-            rac,
-            grasp_target_q,
-            flex_collision_models[target_idx][0],
-            center_mode=args.ee_proxy_center_mode,
-            max_radius_m=args.ee_proxy_max_radius_m,
-        )
-        ee_pair_collision_center_world = list(ee_center_world)
-    else:
-        ee_pair_collision_success = False
-        ee_pair_collision_contacts = 0
-        ee_pair_collision_center_world = None
-        ee_pair_collision_radius_m = None
-    # Keep output JSON in sync with the actual post-planning EE/object pair query.
-    result["ee_object_pair_collision_proxy"]["radius_m"] = ee_pair_collision_radius_m
-    result["ee_object_pair_collision_selected_grasp"]["success"] = bool(ee_pair_collision_success)
-    result["ee_object_pair_collision_selected_grasp"]["num_contacts"] = int(ee_pair_collision_contacts)
-    result["ee_object_pair_collision_selected_grasp"]["ee_center_world_m"] = ee_pair_collision_center_world
+
+    selected_grasp_check = _evaluate_ee_proxy_against_scene(
+        rac,
+        grasp_target_q,
+        flex_collision_models,
+        target_idx=target_idx,
+        spawned_object_asset_indices=target_file_idx.tolist(),
+        center_mode=args.ee_proxy_center_mode,
+        max_radius_m=args.ee_proxy_max_radius_m,
+    )
+    result["ee_object_pair_collision_selected_grasp"] = {
+        "evaluated": bool(selected_grasp_check["evaluated"]),
+        "success": bool(selected_grasp_check["success"]),
+        "target": selected_grasp_check["target"],
+        "obstacles": selected_grasp_check["obstacles"],
+        "no_obstacle_collision": bool(selected_grasp_check["no_obstacle_collision"]),
+        "ee_center_world_m": selected_grasp_check["ee_center_world_m"],
+    }
+    result["ee_object_pair_collision_proxy"]["radius_m"] = selected_grasp_check["radius_m"]
 
     result["rrtconnect"]["planning_wall_s_for_get_path2grasp_only"] = _rrt_plan_s
     result["rrtconnect"]["success"] = True
     result["rrtconnect"]["num_waypoints"] = len(path_rrt)
     result["rrtconnect"]["trajectory_waypoints_rad"] = path_rrt
     result["rrtconnect"]["motion"] = joint_metrics(path_rrt, q_start_live, grasp_target_q)
-    if flex_collision_models and target_idx < len(flex_collision_models):
-        result["rrtconnect"]["ee_object_pair_collision_terminal_waypoint"] = planner_specific_ee_object_pair_check(
-            rac,
-            path_rrt,
-            flex_collision_models[target_idx][0],
-            center_mode=args.ee_proxy_center_mode,
-            max_radius_m=args.ee_proxy_max_radius_m,
-        )
-    else:
-        result["rrtconnect"]["ee_object_pair_collision_terminal_waypoint"] = {
-            "evaluated": False,
-            "success": False,
-            "num_contacts": 0,
-            "ee_center_world_m": None,
-            "radius_m": None,
-        }
-    if args.require_ee_object_collision and not ee_pair_collision_success:
+    rrt_terminal_check = planner_terminal_ee_check(
+        rac,
+        path_rrt,
+        flex_collision_models,
+        target_idx=target_idx,
+        spawned_object_asset_indices=target_file_idx.tolist(),
+        center_mode=args.ee_proxy_center_mode,
+        max_radius_m=args.ee_proxy_max_radius_m,
+    )
+    result["rrtconnect"]["ee_object_pair_collision_terminal_waypoint"] = rrt_terminal_check
+    if args.require_ee_object_collision and not rrt_terminal_check["success"]:
         result["rrtconnect"]["success"] = False
         result["rrtconnect"]["ee_object_postcheck_failed"] = True
 
     frames_rrt = [] if want_video else None
     exec_rrt = execute_path_and_time(
-        gym,
-        sim,
-        env,
-        ur,
-        spj,
-        slj,
-        ej,
-        wj1,
-        wj2,
-        wj3,
-        viewer,
-        path_rrt,
-        "rrt",
-        main_cam_handle=main_cam_handle,
-        camera_props=camera_props,
-        record_rgb=frames_rrt,
-        planner_playback=args.planner_playback,
+        gym, sim, env, ur, spj, slj, ej, wj1, wj2, wj3, viewer, path_rrt, "rrt",
+        main_cam_handle=main_cam_handle, camera_props=camera_props, record_rgb=frames_rrt, planner_playback=args.planner_playback
     )
     result["rrtconnect"]["execution"] = exec_rrt
     if want_video and frames_rrt:
@@ -1023,23 +1010,13 @@ def main():
 
     t_nt0 = time.perf_counter()
     path_nt_raw = ntfield_plan(
-        nt_model,
-        q_start_live,
-        grasp_target_q,
-        step_size=args.ntfield_step_size,
-        max_steps=args.ntfield_max_steps,
-        tol=args.ntfield_tol,
-        device=ntfield_device_str,
+        nt_model, q_start_live, grasp_target_q, step_size=args.ntfield_step_size, max_steps=args.ntfield_max_steps, tol=args.ntfield_tol, device=ntfield_device_str
     )
     nt_planning_wall_s = float(time.perf_counter() - t_nt0)
 
     nt_err_pen = None
     if path_nt_raw and len(path_nt_raw) >= 2:
-        nt_err_pen = float(
-            np.linalg.norm(
-                np.asarray(path_nt_raw[-2], dtype=np.float64).reshape(6) - grasp_target_q
-            )
-        )
+        nt_err_pen = float(np.linalg.norm(np.asarray(path_nt_raw[-2], dtype=np.float64).reshape(6) - grasp_target_q))
     nt_has_path = path_nt_raw is not None and len(path_nt_raw) >= 2
     nt_converged = nt_err_pen is not None and nt_err_pen < goal_eps
 
@@ -1062,41 +1039,23 @@ def main():
         result["ntfield"]["trajectory_waypoints_rad"] = path_nt
         result["ntfield"]["num_waypoints_after_postprocess"] = len(path_nt)
         result["ntfield"]["motion"] = joint_metrics(path_nt, q_start_live, grasp_target_q)
-        if flex_collision_models and target_idx < len(flex_collision_models):
-            result["ntfield"]["ee_object_pair_collision_terminal_waypoint"] = planner_specific_ee_object_pair_check(
-                rac,
-                path_nt,
-                flex_collision_models[target_idx][0],
-                center_mode=args.ee_proxy_center_mode,
-                max_radius_m=args.ee_proxy_max_radius_m,
-            )
-        else:
-            result["ntfield"]["ee_object_pair_collision_terminal_waypoint"] = {
-                "evaluated": False,
-                "success": False,
-                "num_contacts": 0,
-                "ee_center_world_m": None,
-                "radius_m": None,
-            }
+        nt_terminal_check = planner_terminal_ee_check(
+            rac,
+            path_nt,
+            flex_collision_models,
+            target_idx=target_idx,
+            spawned_object_asset_indices=target_file_idx.tolist(),
+            center_mode=args.ee_proxy_center_mode,
+            max_radius_m=args.ee_proxy_max_radius_m,
+        )
+        result["ntfield"]["ee_object_pair_collision_terminal_waypoint"] = nt_terminal_check
+        if args.require_ee_object_collision and not nt_terminal_check["success"]:
+            result["ntfield"]["success"] = False
+            result["ntfield"]["ee_object_postcheck_failed"] = True
         frames_nt = [] if want_video else None
         exec_nt = execute_path_and_time(
-            gym,
-            sim,
-            env,
-            ur,
-            spj,
-            slj,
-            ej,
-            wj1,
-            wj2,
-            wj3,
-            viewer,
-            path_nt,
-            "ntfield",
-            main_cam_handle=main_cam_handle,
-            camera_props=camera_props,
-            record_rgb=frames_nt,
-            planner_playback=args.planner_playback,
+            gym, sim, env, ur, spj, slj, ej, wj1, wj2, wj3, viewer, path_nt, "ntfield",
+            main_cam_handle=main_cam_handle, camera_props=camera_props, record_rgb=frames_nt, planner_playback=args.planner_playback
         )
         result["ntfield"]["execution"] = exec_nt
         if want_video and frames_nt:
@@ -1108,38 +1067,43 @@ def main():
         result["ntfield"]["execution"] = None
         result["ntfield"]["ee_object_pair_collision_terminal_waypoint"] = {
             "evaluated": False,
+            "target": None,
+            "obstacles": [],
+            "no_obstacle_collision": False,
             "success": False,
-            "num_contacts": 0,
             "ee_center_world_m": None,
             "radius_m": None,
         }
+        if args.require_ee_object_collision:
+            result["ntfield"]["ee_object_postcheck_failed"] = True
         if want_video:
             result["ntfield"]["video_path"] = None
 
-    if args.save_final_geometric_debug and grasp_target_q is not None and target_idx < len(object_mesh):
+    if args.save_final_geometric_debug and grasp_target_q is not None and len(object_mesh) > 0:
         debug_png = (
             os.path.abspath(args.final_geometric_debug_path)
             if args.final_geometric_debug_path
             else os.path.join(session_dir, "final_geometric_debug.png")
         )
-        ee_center_for_viz = ee_pair_collision_center_world
+        ee_center_for_viz = result["ee_object_pair_collision_selected_grasp"].get("ee_center_world_m")
+        ee_radius_for_viz = result["ee_object_pair_collision_proxy"].get("radius_m")
         if ee_center_for_viz is None:
-            ee_center_for_viz = rac.calculate_transform_from_angles(grasp_target_q)[8][0]
-        save_final_geometric_debug_image(
+            ee_center_for_viz = list(np.asarray(rac.calculate_transform_from_angles(grasp_target_q)[8][0], dtype=np.float64).reshape(3))
+        save_final_geometric_debug_image_multi(
             out_path=debug_png,
             rac=rac,
             dof_result=grasp_target_q,
-            object_mesh=object_mesh[target_idx],
+            object_meshes=object_mesh,
+            target_idx=target_idx,
             ee_center_world=ee_center_for_viz,
-            ee_radius_m=ee_pair_collision_radius_m,
+            ee_radius_m=ee_radius_for_viz,
         )
         result["ee_object_pair_collision_selected_grasp"]["debug_image_path"] = debug_png
 
-    result["result_json_path"] = output_json_path
     print(json.dumps(result, indent=2))
-    with open(output_json_path, "w") as jf:
-        json.dump(result, jf, indent=2)
-    print(f"Wrote {output_json_path}")
+    if args.output_json:
+        with open(args.output_json, "w") as jf:
+            json.dump(result, jf, indent=2)
 
     gym.destroy_sim(sim)
     if viewer is not None:

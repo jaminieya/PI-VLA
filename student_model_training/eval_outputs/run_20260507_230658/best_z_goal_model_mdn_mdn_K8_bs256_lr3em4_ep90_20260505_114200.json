@@ -1,0 +1,29 @@
+{
+  "checkpoint": "/home/hojinsohn/VLM-NT/PI-VLA/student_model_training/best_z_goal_model_mdn_mdn_K8_bs256_lr3em4_ep90_20260505_114200.pth",
+  "model_type": "mdn",
+  "split": "val",
+  "dataset_root": "/home/hojinsohn/VLM-NT/PI-VLA/student_model_training/data/pt_shards_multi",
+  "val_fraction": 0.1,
+  "seed": 42,
+  "batch_size": 256,
+  "thresholds": [
+    0.1,
+    0.2,
+    0.5,
+    1.0
+  ],
+  "metrics": {
+    "mse": 1.4386041664599782,
+    "mae": 12.268734299925848,
+    "cos_distance": 0.011108008102833316,
+    "l2_mean": 0.9733658736686759,
+    "l2_median": 0.9664306044578552,
+    "n_samples": 31511,
+    "accuracy_at_l2_threshold": {
+      "0.1": 0.03230617879470661,
+      "0.2": 0.1470597569102853,
+      "0.5": 0.36035035384468916,
+      "1.0": 0.5066167370124718
+    }
+  }
+}

@@ -44,7 +44,6 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 RUN_NAME="train_config_multi"
 TRAIN_SCRIPT="full_train_multi.py"
 WANDB_ENABLED="true"
-WANDB_RUN_NAME="multi_image_text_prompt_fusion_hybrid_0.5_loc_head2"
 WANDB_LOG_BATCHES="true"
 WANDB_BATCH_LOG_EVERY="10"
 TRAIN_EPOCHS="100"
@@ -59,13 +58,18 @@ TRAIN_INFONCE_WEIGHT="0.0"
 TRAIN_INFONCE_TEMP="0.1"
 TRAIN_MAX_PROMPT_LEN="8"
 
+TS="$(date +%Y%m%d_%H%M%S)"
+if [[ -z "${WANDB_RUN_NAME:-}" ]]; then
+  lr_tag="$(printf "%s" "${TRAIN_LR}" | sed 's/\./p/g; s/-/m/g')"
+  WANDB_RUN_NAME="${TRAIN_LOSS_TYPE}_bs${TRAIN_BATCH_SIZE}_lr${lr_tag}_ep${TRAIN_EPOCHS}_${TS}"
+fi
+
 # Export so full_train_multi.py can read via os.getenv(...)
 export WANDB_ENABLED WANDB_RUN_NAME WANDB_LOG_BATCHES WANDB_BATCH_LOG_EVERY
 export TRAIN_EPOCHS TRAIN_EVAL_EVERY TRAIN_BATCH_SIZE TRAIN_LR
 export TRAIN_LOSS_TYPE TRAIN_LOSS_ALPHA TRAIN_CKPT_NAME TRAIN_PCA_OUTPUT_DIR
 export TRAIN_INFONCE_WEIGHT TRAIN_INFONCE_TEMP TRAIN_MAX_PROMPT_LEN
 
-TS="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="${REPO_ROOT}/PI-VLA/output/runs/${RUN_NAME}_${TS}"
 LOG_FILE="${RUN_DIR}/train.log"
 PID_FILE="${RUN_DIR}/train.pid"

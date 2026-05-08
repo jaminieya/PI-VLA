@@ -1,0 +1,29 @@
+{
+  "checkpoint": "/home/hojinsohn/VLM-NT/PI-VLA/student_model_training/best_z_goal_model_regression_hybrid_contra_bs256_lr3em4_ep40_20260507_201445.pth",
+  "model_type": "regression",
+  "split": "val",
+  "dataset_root": "/home/hojinsohn/VLM-NT/PI-VLA/student_model_training/data/pt_shards_multi",
+  "val_fraction": 0.1,
+  "seed": 42,
+  "batch_size": 256,
+  "thresholds": [
+    0.1,
+    0.2,
+    0.5,
+    1.0
+  ],
+  "metrics": {
+    "mse": 5.378346889672959,
+    "mae": 28.826898077336214,
+    "cos_distance": 0.07107010174567847,
+    "l2_mean": 2.2621290109395975,
+    "l2_median": 2.2057390213012695,
+    "n_samples": 31511,
+    "accuracy_at_l2_threshold": {
+      "0.1": 0.0,
+      "0.2": 0.0,
+      "0.5": 0.0,
+      "1.0": 0.00015867474850052364
+    }
+  }
+}

@@ -11,32 +11,12 @@ from trac_ik_python.trac_ik import IK
 import open3d as o3d
 import cv2
 
-file_dir = os.path.dirname(os.path.abspath(__file__))
-
-
-def _resolve_assets_dir():
-    marker = os.path.join("urdf", "ycb", "object_urdf_grasp.txt")
-    candidates = [
-        os.path.join(file_dir, "assets"),
-        os.path.join(os.path.dirname(file_dir), "assets"),
-        os.path.join(
-            os.path.dirname(os.path.dirname(file_dir)), "starter_code", "assets"
-        ),
-    ]
-    for c in candidates:
-        root = os.path.abspath(c)
-        if os.path.isfile(os.path.join(root, marker)):
-            return root
-    return os.path.abspath(os.path.join(file_dir, "assets"))
-
-
-ASSETS_DIR = _resolve_assets_dir()
-
+file_dir = os.path.dirname(__file__)
 util_dir = os.path.join(file_dir, './util')
 #mcts_dir = os.path.join(file_dir, '../MCTS')
 sys.path.append(util_dir)
 #sys.path.append(mcts_dir)
-# OMPL Python bindings - path: junheelim/config/py-bindings/ompl-1.5.2
+
 _ompl_pybindings = os.path.abspath(os.path.join(file_dir, '..', '..', 'config', 'py-bindings', 'ompl-1.5.2', 'py-bindings'))
 if os.path.exists(_ompl_pybindings):
     sys.path.insert(0, _ompl_pybindings)
@@ -78,25 +58,8 @@ def rotation_concat(quaternion1, quaternion0):
 class robot_arm_configuration:
     
     #create voxel grid represetation for each link
-    def __init__(
-        self,
-        file_path,
-        robot_offset,
-        scene_info,
-        point_cloud=None,
-        target_mesh=None,
-        obstacles_num=0,
-        target_pos=None,
-        ik_urdf_file="ur5e_mimic_real_gripper_linear_motion.urdf",
-    ):
-        with open(
-            os.path.join(
-                ASSETS_DIR,
-                "urdf",
-                "ur5e",
-                ik_urdf_file,
-            )
-        ) as f:
+    def __init__(self, file_path, robot_offset, scene_info, point_cloud=None, target_mesh=None, obstacles_num=0, target_pos=None):
+        with open('./assets/urdf/ur5e/ur5e_mimic_real_gripper_linear_motion.urdf') as f:
             urdf_str = f.read()
         self.ik_solver_ = IK('base_link', 'wrist_3_link', urdf_string = urdf_str)
 
@@ -367,15 +330,7 @@ class robot_arm_configuration:
 
 
         for i in range(obstacles_num):
-            obstacles_mesh = obj_reader(
-                os.path.join(
-                    ASSETS_DIR,
-                    "urdf",
-                    "ycb",
-                    "002_master_chef_can",
-                    "textured_vhacd.obj",
-                )
-            )
+            obstacles_mesh = obj_reader('./assets/urdf/ycb/002_master_chef_can/textured_vhacd.obj')
 
             if i == 0:
                 target_verts, target_tris = target_mesh
@@ -1673,7 +1628,7 @@ def grasp_generation():
     cam_tran = cam_datas.item()["cam_tran"]
 
     scene_info = [0.56, 0.86000001, 0.1, 0.5]
-    rac = robot_arm_configuration(os.path.join(ASSETS_DIR, "urdf", "ur5e", "meshes", "collision") + os.sep, np.array([0.0, 0, 0]), scene_info) # point_cloud=point_cloud
+    rac = robot_arm_configuration('./assets/urdf/ur5e/meshes/collision/', np.array([0.0, 0, 0]), scene_info) # point_cloud=point_cloud
 
     generated_grasp = []
 
@@ -1687,13 +1642,10 @@ def grasp_generation():
 
         # if init2grasp_angels is not None:
         #     rac.check_collision_models(init2grasp_angels)
-    np.save(
-        os.path.join(ASSETS_DIR, "urdf", "ycb", "004_sugar_box", "grasp_dict.npy"),
-        generated_grasp,
-    )
+    np.save("./assets/urdf/ycb/004_sugar_box/grasp_dict.npy", generated_grasp)
         
 def get_matching_mesh(target_pcd, file_idxs, visualize=False):
-    asset_root = ASSETS_DIR + os.sep
+    asset_root = './assets/'
     object_common_prefix = "urdf/ycb/"
     object_asset_files = []
     with open(asset_root + "urdf/ycb/object_urdf_grasp.txt") as f:
@@ -2629,7 +2581,7 @@ def check_MCTS(MCTS_root, MCTS_name, file_path=None):
     # scene_info = [0.70, 1.1000001, 0.1, 0.5]
 
     # rac = robot_arm_configuration(file_path, np.array([0.0, 0, 0]), scene_info, target_mesh=target_mesh, obstacles_num=obstacles_num, target_pos=target_pos) # point_cloud=point_cloud
-    rac = robot_arm_configuration(os.path.join(ASSETS_DIR, "urdf", "ur5e", "meshes", "collision") + os.sep, np.array([0.0, 0, 0]), scene_info) # point_cloud=point_cloud
+    rac = robot_arm_configuration('./assets/urdf/ur5e/meshes/collision/', np.array([0.0, 0, 0]), scene_info) # point_cloud=point_cloud
     rac.target_mesh = target_mesh
     rac.obstacles_num = obstacles_num - 1
     rac.obj_mesh = obj_mesh
@@ -2638,15 +2590,7 @@ def check_MCTS(MCTS_root, MCTS_name, file_path=None):
 
     # pdb.set_trace()
     for i in range(0, len(obj_pos_list)):
-        obstacles_mesh = obj_reader(
-            os.path.join(
-                ASSETS_DIR,
-                "urdf",
-                "ycb",
-                "002_master_chef_can",
-                "textured_vhacd.obj",
-            )
-        )
+        obstacles_mesh = obj_reader('./assets/urdf/ycb/002_master_chef_can/textured_vhacd.obj')
         obstacles_mesh.add_offset([0.0074288357678113605, -0.004507257802105839, 0])
         obstacles_mesh.add_offset(rac.obj_pos_list[i] + [scene_info[2]])
 
@@ -2879,12 +2823,12 @@ def scene_height_check(scene_info, target_idx):
                          scene_info[3] + 0.08]
     # GT_TARGET_POS = [0.8,0.5,1.0]
     # init setup
-    file_path = os.path.join(ASSETS_DIR, "urdf", "ur5e", "meshes", "collision") + os.sep
-    rac = robot_arm_configuration(file_path, np.array([0.0, 0, 0]), scene_info) # point_cloud=point_cloud
+    file_path = './assets/urdf/ur5e/meshes/collision/'
+    rac = robot_arm_configuration('./assets/urdf/ur5e/meshes/collision/', np.array([0.0, 0, 0]), scene_info) # point_cloud=point_cloud
 
     target_obj_pos = copy.deepcopy(GT_TARGET_POS)
 
-    asset_root = ASSETS_DIR + os.sep
+    asset_root = "/home/j0k/Project/Imsa/assets/"
     object_common_prefix = "urdf/ycb/"
     with open(asset_root + "urdf/ycb/object_urdf_grasp.txt") as f:
         for idx, line in enumerate(f):
@@ -2986,7 +2930,7 @@ if __name__ == '__main__':
     # sys.exit(1)
 
     # file paths
-    file_path = os.path.join(ASSETS_DIR, "urdf", "ur5e", "meshes", "collision") + os.sep
+    file_path = '../assets/urdf/ur5e/meshes/collision/'
     test_data_root = 'test_data/'
     grasp_root = '../contact_graspnet/results/'
     # test_name = 'pcd1' # banana

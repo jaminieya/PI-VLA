@@ -22,6 +22,7 @@ import open3d as o3d
 import fcl
 import cv2
 import copy
+from datetime import datetime
 
 import robot_arm_configuration as RC
 
@@ -79,7 +80,7 @@ table_dims = gymapi.Vec3(0.8, 1.0, 0.10)
 piece_width = 0.03
 max_scaling_factor = 0
 fall_height = table_dims.z
-ADD_COVER = False
+ADD_COVER = True
 
 TARGET_OBJ_INDEX = [1, 3, 5]
 MIN_RADIUS = 0.03471716871486391
@@ -563,6 +564,27 @@ def parse_q_ntfield(s):
     if len(parts) != 6:
         raise ValueError(f"Expected 6 comma-separated values, got {len(parts)}")
     return [float(eval(p, {"math": math})) for p in parts]
+
+
+def interpolate_joint_path(q_start, q_goal, num_steps=120):
+    q_start = np.asarray(q_start, dtype=np.float64).reshape(-1)
+    q_goal = np.asarray(q_goal, dtype=np.float64).reshape(-1)
+    num_steps = max(int(num_steps), 2)
+    path = []
+    for i in range(num_steps + 1):
+        alpha = float(i) / float(num_steps)
+        q = (1.0 - alpha) * q_start + alpha * q_goal
+        path.append(q.copy())
+    return path
+
+
+def straight_line_collision_free_path(rac, q_start, q_goal, plane_obj, static_env_models, flex_collision_models, num_steps=120):
+    path = interpolate_joint_path(q_start, q_goal, num_steps=num_steps)
+    for q in path:
+        if not rac.arm_collision_free(q.tolist(), plane_obj, static_env_models, flex_collision_models):
+            return None
+    return path
+
 
 def get_random_loc(x_min, x_max, y_min, y_max, z_min, z_max):
     x_can = np.random.random()*(x_max - x_min) + x_min
@@ -1117,6 +1139,50 @@ if __name__ == '__main__':
             {'name': '--camera_capture_only', 'action': 'store_true', 'help': 'Skip motion planning; fly viewer (logs pose). Keys 1/2/3 copy viewer to diag_left/diag_right/point_cloud_center rig; S saves PNG/npz; close viewer to save again.'},
             {'name': '--rig_cams_anchored_table', 'action': 'store_true', 'help': 'Place the three rig cameras relative to tabletop center each run (re-aims with table_pose); default is fixed env-local Vec3 in script.'},
             {'name': '--save', 'action': 'store_true', 'help': 'Legacy no-op: viewer camera FOV/pos/dir/target log on every camera move when a viewer exists.'},
+            {'name': '--collect_ntfield_metric', 'action': 'store_true',
+             'help': 'After scene settle: sample (q_start near obstacles, q_goal uniform) in FCL and save sampled_points.npy, speed.npy, normal.npy for ntrl-demo/train/train_arm.py (no OMPL/RRT).'},
+            {'name': '--metric_num_samples', 'type': int, 'default': 20000, 'help': 'Target number of accepted pairs for --collect_ntfield_metric.'},
+            {'name': '--metric_output_dir', 'type': str, 'default': None,
+             'help': 'Output directory for metric .npy files (default: output_root/env_<id>_ntfield_metric/).'},
+            {'name': '--metric_seed', 'type': int, 'default': 0, 'help': 'RNG seed for --collect_ntfield_metric.'},
+            {'name': '--metric_max_tries_factor', 'type': int, 'default': 2000,
+             'help': 'Stop after this many proposals per requested sample if undersampled.'},
+            {'name': '--metric_sampler_mode', 'type': str, 'default': 'fcl_uniform',
+             'help': 'q_start sampler for --collect_ntfield_metric: fcl_uniform or ik_mesh.'},
+            {'name': '--metric_ik_pose_trials', 'type': int, 'default': 80,
+             'help': 'For --metric_sampler_mode=ik_mesh: random mesh target poses attempted per sample proposal.'},
+            {'name': '--metric_ik_seed_trials', 'type': int, 'default': 6,
+             'help': 'For --metric_sampler_mode=ik_mesh: IK restarts per pose target.'},
+            {'name': '--metric_ik_surface_offset_min', 'type': float, 'default': 0.002,
+             'help': 'For --metric_sampler_mode=ik_mesh: minimum offset (m) from sampled obstacle surface.'},
+            {'name': '--metric_ik_surface_offset_max', 'type': float, 'default': 0.03,
+             'help': 'For --metric_sampler_mode=ik_mesh: maximum offset (m) from sampled obstacle surface.'},
+            {'name': '--metric_ik_tool_offset_x', 'type': float, 'default': 0.11,
+             'help': 'For --metric_sampler_mode=ik_mesh: IK target->wrist offset x (m), aligned with new_setup.py by default.'},
+            {'name': '--metric_ik_tool_offset_y', 'type': float, 'default': 0.0,
+             'help': 'For --metric_sampler_mode=ik_mesh: IK target->wrist offset y (m).'},
+            {'name': '--metric_ik_tool_offset_z', 'type': float, 'default': 0.08,
+             'help': 'For --metric_sampler_mode=ik_mesh: IK target->wrist offset z (m), aligned with new_setup.py by default.'},
+            {'name': '--metric_ik_urdf_file', 'type': str, 'default': 'ur5e_mimic_real_gripper_test.urdf',
+             'help': 'URDF filename under assets/urdf/ur5e for TRAC-IK in metric collection.'},
+            {'name': '--metric_log_every_tries', 'type': int, 'default': 2000,
+             'help': 'For --collect_ntfield_metric: print progress every N proposals (<=0 disables periodic logs).'},
+            {'name': '--metric_qstart_only', 'action': 'store_true',
+             'help': 'Collect only q_start IK collision-free configurations (skip q_goal sampling and speed/normal outputs).'},
+            {'name': '--metric_save_speed_normal', 'action': 'store_true',
+             'help': 'When q_goal is sampled, also save speed.npy and normal.npy. Disabled by default for faster debug runs.'},
+            {'name': '--metric_visualize_sampling', 'action': 'store_true',
+             'help': 'For --collect_ntfield_metric: visualize sampled q_start/q_goal in viewer during collection (requires not --headless).'},
+            {'name': '--metric_visualize_every_accepted', 'type': int, 'default': 100,
+             'help': 'For --metric_visualize_sampling: render every N accepted samples.'},
+            {'name': '--metric_visualize_hold_steps', 'type': int, 'default': 20,
+             'help': 'For --metric_visualize_sampling: physics/viewer steps to hold q_start then q_goal.'},
+            {'name': '--simple_grasp_collect', 'action': 'store_true',
+             'help': 'Simple mode: one object, sample TRAC-IK grasp candidates (no RRT), choose straight-line collision-reachable q_g from current q_s, and save q_s->q_g path.'},
+            {'name': '--simple_num_candidates', 'type': int, 'default': 100,
+             'help': 'Number of TRAC-IK grasp candidates to test in --simple_grasp_collect mode.'},
+            {'name': '--simple_interp_steps', 'type': int, 'default': 120,
+             'help': 'Interpolation steps for straight-line collision check and saved path in --simple_grasp_collect mode.'},
         ],
     )
     args._session_eval_dir = None
@@ -1329,7 +1395,7 @@ if __name__ == '__main__':
     #*************************************************************************************************#
     ur5e_pose = gymapi.Transform()
     # ur5e_pose.p = gymapi.Vec3(np.random.rand()*0.3 - 0.2, np.random.rand()*0.4 - 0.2, 0.0)
-    ur5e_pose.p = gymapi.Vec3(0, 0, 0)
+    ur5e_pose.p = gymapi.Vec3(0.2, 0, 0)
     ur5e_pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), 0.5*math.pi)
 
     table_pose = gymapi.Transform()
@@ -1433,6 +1499,7 @@ if __name__ == '__main__':
     gripper_location = None
     object_status_list = []
     object_reader_tracker = []
+    num_objects_for_run = 1 if getattr(args, "simple_grasp_collect", False) else NUM_OF_OBJECTS
     for i in range(num_of_envs):
         envs.append(gym.create_env(sim, env_lower, env_upper, row_num_of_envs))
         ur5e_handles.append(gym.create_actor(envs[-1], ur5e_asset, ur5e_pose, "ur5e" + str(i), 0, 32767))
@@ -1477,19 +1544,19 @@ if __name__ == '__main__':
             and _nt_h5_ol is not None
             and _nt_h5_ol.size >= 3
         )
-        target_file_idx = np.random.choice(TARGET_OBJ_INDEX, NUM_OF_OBJECTS, replace=False)
+        target_file_idx = np.random.choice(TARGET_OBJ_INDEX, num_objects_for_run, replace=False)
         if h5_use_fixed:
             # Keep one object consistent with the HDF5 prompt-derived target.
             target_file_idx[-1] = _nt_h5_obj_idx
         object_handles = []
 
         with open("object_name.txt", 'a') as f:
-            for k in range(NUM_OF_OBJECTS):
+            for k in range(num_objects_for_run):
                 f.write(object_asset_files[target_file_idx[k]])
 
-        object_scaling_factor = np.random.randint(0, max_scaling_factor+1, size = NUM_OF_OBJECTS)/10.0 + 1.0
+        object_scaling_factor = np.random.randint(0, max_scaling_factor+1, size = num_objects_for_run)/10.0 + 1.0
         if h5_use_fixed:
-            object_scaling_factor = np.ones(NUM_OF_OBJECTS, dtype=np.float64)
+            object_scaling_factor = np.ones(num_objects_for_run, dtype=np.float64)
 
         # set up objects--------------------------------------------------------------------------------------------------------------------
         # creating manager
@@ -1501,9 +1568,9 @@ if __name__ == '__main__':
                          np.random.uniform(-table_dims.y/2 + 0.1, table_dims.y/2 - 0.2),
                          table_dims.z + 0.08]
 
-        for k in range(NUM_OF_OBJECTS):
+        for k in range(num_objects_for_run):
             object_pose = gymapi.Transform()
-            if h5_use_fixed and k == NUM_OF_OBJECTS - 1:
+            if h5_use_fixed and k == num_objects_for_run - 1:
                 tx = float(_nt_h5_ol[0])
                 ty = float(_nt_h5_ol[1])
                 tz = float(_nt_h5_ol[2])
@@ -1667,11 +1734,12 @@ if __name__ == '__main__':
     #while not gym.query_viewer_has_closed(viewer):
     for t in range(200):
         if not real_position:
-            gym.set_dof_target_position(envs[-1], spj, 0)
-            gym.set_dof_target_position(envs[-1], slj, -math.pi/2)
-            gym.set_dof_target_position(envs[-1], ej,  0)
-            gym.set_dof_target_position(envs[-1], wj1, -math.pi/2)
-            gym.set_dof_target_position(envs[-1], wj2, 0)
+            # Match reference.py initialization pose.
+            gym.set_dof_target_position(envs[-1], spj, 0.7)
+            gym.set_dof_target_position(envs[-1], slj, -2.0)
+            gym.set_dof_target_position(envs[-1], ej,  2.5)
+            gym.set_dof_target_position(envs[-1], wj1, -0.3)
+            gym.set_dof_target_position(envs[-1], wj2, 0.7)
             gym.set_dof_target_position(envs[-1], wj3, 0)
             real_position = True
 
@@ -1715,6 +1783,215 @@ if __name__ == '__main__':
             handle_viewer_camera_input(gym, viewer, envs[-1])
             maybe_log_viewer_camera_on_move(gym, viewer, envs[-1], viewer_cam_cache, camera_props)
             gym.sync_frame_time(sim)
+
+    #*************************************************************************************************#
+    # NTField metric data (train_arm.py): FCL-only pairs, no RRT — same clutter as this Isaac run.
+    #*************************************************************************************************#
+    if getattr(args, "simple_grasp_collect", False):
+        scene_info_simple = [table_dims.x, table_dims.y, table_dims.z, drawer_height]
+        rac_simple = RC.robot_arm_configuration(
+            "./assets/urdf/ur5e/meshes/collision/",
+            np.array([ur5e_pose.p.x, ur5e_pose.p.y, ur5e_pose.p.z], dtype=np.float64),
+            scene_info_simple,
+            ik_urdf_file="ur5e_mimic_real_gripper_test.urdf",
+        )
+
+        dof_states = gym.get_actor_dof_states(envs[-1], ur5e_handles[-1], gymapi.STATE_POS)
+        q_start = np.array(dof_states["pos"][:6], dtype=np.float64)
+        target_idx = 0
+        grasp_file = "./assets/" + "/".join(object_asset_files[target_file_idx[target_idx]].split("/")[:-1]) + "/grasp_dict.npy"
+        grasp_data = np.load(grasp_file, allow_pickle=True)
+
+        candidate_indices = np.arange(len(grasp_data), dtype=np.int64)
+        np.random.shuffle(candidate_indices)
+        max_trials = min(int(args.simple_num_candidates), int(len(candidate_indices)))
+
+        flex_collision_objects = [
+            entry[0] if isinstance(entry, (list, tuple)) and len(entry) > 0 else entry
+            for entry in flex_collision_models
+        ]
+
+        qg_candidates = []
+        for grasp_idx in candidate_indices[:max_trials]:
+            target_grasp_pos = np.array(grasp_data[grasp_idx]["target_pos"], dtype=np.float64)
+            target_grasp_quat = np.array(grasp_data[grasp_idx]["target_quat"], dtype=np.float64)
+            target_grasp_pos[:2] = target_grasp_pos[:2] + np.array(GT_OBJ_POS_LIST[target_idx][:2], dtype=np.float64)
+            qg = rac_simple.grasp_verify(target_grasp_pos, target_grasp_quat)
+            if qg is None:
+                continue
+            qg = np.array(qg[:6], dtype=np.float64)
+            if not rac_simple.arm_collision_free(
+                qg.tolist(), plane_obj, object_collision_models, flex_collision_objects
+            ):
+                continue
+            qg_candidates.append((int(grasp_idx), qg))
+
+        reachable_paths = []
+        for grasp_idx, qg in qg_candidates:
+            path = straight_line_collision_free_path(
+                rac_simple,
+                q_start,
+                qg,
+                plane_obj,
+                object_collision_models,
+                flex_collision_objects,
+                num_steps=int(args.simple_interp_steps),
+            )
+            if path is None:
+                continue
+            dist = float(np.linalg.norm(qg - q_start))
+            reachable_paths.append((dist, grasp_idx, qg, path))
+
+        if not reachable_paths:
+            print(
+                f"[simple_grasp_collect] No reachable q_g found. "
+                f"candidates_tested={max_trials}, ik_collisionfree_candidates={len(qg_candidates)}"
+            )
+            if viewer is not None:
+                gym.destroy_viewer(viewer)
+            gym.destroy_sim(sim)
+            sys.exit(1)
+
+        reachable_paths.sort(key=lambda x: x[0])
+        best_dist, best_grasp_idx, best_qg, best_path = reachable_paths[0]
+        best_path_arr = np.array(best_path, dtype=np.float32)
+
+        run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        simple_out_dir = os.path.join(
+            output_root,
+            "simple_grasp_collect",
+            run_ts,
+        )
+        os.makedirs(simple_out_dir, exist_ok=True)
+        path_file = os.path.join(simple_out_dir, "qs_to_reachable_qg_path.npy")
+        meta_file = os.path.join(simple_out_dir, "meta.npz")
+        np.save(path_file, best_path_arr)
+        np.savez(
+            meta_file,
+            q_start=q_start.astype(np.float32),
+            q_goal=best_qg.astype(np.float32),
+            chosen_grasp_idx=np.array([best_grasp_idx], dtype=np.int32),
+            qg_l2_distance=np.array([best_dist], dtype=np.float32),
+            num_candidates_requested=np.array([int(args.simple_num_candidates)], dtype=np.int32),
+            num_candidates_tested=np.array([max_trials], dtype=np.int32),
+            num_ik_collisionfree_candidates=np.array([len(qg_candidates)], dtype=np.int32),
+            num_reachable_candidates=np.array([len(reachable_paths)], dtype=np.int32),
+        )
+        print(
+            f"[simple_grasp_collect] saved path to {path_file}, meta to {meta_file}. "
+            f"tested={max_trials}, ik_collisionfree={len(qg_candidates)}, reachable={len(reachable_paths)}, "
+            f"chosen_grasp_idx={best_grasp_idx}, path_len={best_path_arr.shape[0]}"
+        )
+
+        if viewer is not None:
+            for q in best_path:
+                gym.set_dof_target_position(envs[-1], spj, float(q[0]))
+                gym.set_dof_target_position(envs[-1], slj, float(q[1]))
+                gym.set_dof_target_position(envs[-1], ej, float(q[2]))
+                gym.set_dof_target_position(envs[-1], wj1, float(q[3]))
+                gym.set_dof_target_position(envs[-1], wj2, float(q[4]))
+                gym.set_dof_target_position(envs[-1], wj3, float(q[5]))
+                gym.simulate(sim)
+                gym.fetch_results(sim, True)
+                gym.step_graphics(sim)
+                gym.draw_viewer(viewer, sim, True)
+                gym.sync_frame_time(sim)
+            gym.destroy_viewer(viewer)
+        gym.destroy_sim(sim)
+        sys.exit(0)
+
+    if getattr(args, "collect_ntfield_metric", False):
+        if getattr(args, "ntfield", False):
+            print("Error: use --collect_ntfield_metric without --ntfield (metric collection skips learned planning).")
+            if viewer is not None:
+                gym.destroy_viewer(viewer)
+            gym.destroy_sim(sim)
+            sys.exit(1)
+        scene_info_metric = [table_dims.x, table_dims.y, table_dims.z, drawer_height]
+        file_path_metric = "./assets/urdf/ur5e/meshes/collision/"
+        rac_metric = RC.robot_arm_configuration(
+            file_path_metric,
+            np.array([ur5e_pose.p.x, ur5e_pose.p.y, ur5e_pose.p.z], dtype=np.float64),
+            scene_info_metric,
+            ik_urdf_file=str(args.metric_ik_urdf_file),
+        )
+        from ntfield_metric_collect_fcl import collect_metric_dataset
+
+        metric_out = getattr(args, "metric_output_dir", None)
+        if metric_out:
+            metric_out = os.path.abspath(metric_out)
+        else:
+            metric_out = os.path.join(output_root, f"env_{env_id}_ntfield_metric")
+        os.makedirs(metric_out, exist_ok=True)
+
+        metric_visualize_cb = None
+        if getattr(args, "metric_visualize_sampling", False):
+            if viewer is None:
+                print("Warning: --metric_visualize_sampling requested but viewer is unavailable (headless).")
+            else:
+                hold_steps = max(int(getattr(args, "metric_visualize_hold_steps", 20)), 1)
+
+                def metric_visualize_cb(q_start, q_goal, accepted, tries):
+                    def _set_q(q):
+                        gym.set_dof_target_position(envs[-1], spj, float(q[0]))
+                        gym.set_dof_target_position(envs[-1], slj, float(q[1]))
+                        gym.set_dof_target_position(envs[-1], ej,  float(q[2]))
+                        gym.set_dof_target_position(envs[-1], wj1, float(q[3]))
+                        gym.set_dof_target_position(envs[-1], wj2, float(q[4]))
+                        gym.set_dof_target_position(envs[-1], wj3, float(q[5]))
+
+                    states_to_show = [q_start]
+                    if q_goal is not None:
+                        states_to_show.append(q_goal)
+
+                    for q in states_to_show:
+                        _set_q(q)
+                        for _ in range(hold_steps):
+                            gym.simulate(sim)
+                            gym.fetch_results(sim, True)
+                            gym.step_graphics(sim)
+                            gym.draw_viewer(viewer, sim, True)
+                            handle_viewer_camera_input(gym, viewer, envs[-1])
+                            maybe_log_viewer_camera_on_move(gym, viewer, envs[-1], viewer_cam_cache, camera_props)
+                            gym.sync_frame_time(sim)
+                    print(
+                        f"[metric_visualize] accepted={accepted}, tries={tries}, "
+                        f"showing {'q_start -> q_goal' if q_goal is not None else 'q_start'}",
+                        flush=True,
+                    )
+
+        collect_metric_dataset(
+            rac_metric,
+            plane_obj,
+            object_collision_models,
+            flex_collision_models,
+            num_samples=int(args.metric_num_samples),
+            output_dir=metric_out,
+            seed=int(args.metric_seed),
+            max_tries_factor=int(args.metric_max_tries_factor),
+            sampler_mode=str(args.metric_sampler_mode),
+            obstacle_meshes=object_mesh,
+            ik_pose_trials=int(args.metric_ik_pose_trials),
+            ik_seed_trials=int(args.metric_ik_seed_trials),
+            ik_surface_offset_min=float(args.metric_ik_surface_offset_min),
+            ik_surface_offset_max=float(args.metric_ik_surface_offset_max),
+            ik_tool_offset_xyz=(
+                float(args.metric_ik_tool_offset_x),
+                float(args.metric_ik_tool_offset_y),
+                float(args.metric_ik_tool_offset_z),
+            ),
+            log_every_tries=int(args.metric_log_every_tries),
+            visualize_callback=metric_visualize_cb,
+            visualize_every_accepted=int(args.metric_visualize_every_accepted),
+            qstart_only=bool(args.metric_qstart_only),
+            save_speed_normal=bool(args.metric_save_speed_normal),
+        )
+        print(f"NTField metric dataset saved under: {metric_out}")
+        print("Train with: cd ntrl-demo && python train/train_arm.py  (set model_train_metric DataPath to this folder or copy the three .npy files into datasets/arm/UR5/).")
+        if viewer is not None:
+            gym.destroy_viewer(viewer)
+        gym.destroy_sim(sim)
+        sys.exit(0)
 
     #*************************************************************************************************#
 

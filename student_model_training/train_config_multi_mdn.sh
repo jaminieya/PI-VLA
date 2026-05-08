@@ -23,8 +23,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-RUN_NAME="train_config_multi_mdn"
-TRAIN_SCRIPT="train_config_multi_mdn.py"
+RUN_NAME="full_train_multi_mdn"
+TRAIN_SCRIPT="full_train_multi_mdn.py"
 
 WANDB_ENABLED="true"
 WANDB_LOG_BATCHES="true"

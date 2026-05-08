@@ -81,58 +81,48 @@ def _write_batch_summary(
     args_ns: argparse.Namespace,
 ) -> Dict[str, Any]:
     n = len(trial_rows)
-    success_n = sum(1 for r in trial_rows if r.get("status") == "Success")
-    err_n = sum(1 for r in trial_rows if r.get("status") == "Error" or "error" in r)
-    dists: List[float] = []
-    for r in trial_rows:
-        v = r.get("ntfield_final_latent_dist")
-        if isinstance(v, (int, float)) and v == v:
-            dists.append(float(v))
-    path_lens = [int(r["path_length"]) for r in trial_rows if isinstance(r.get("path_length"), int)]
-    goal_l2s: List[float] = []
-    for r in trial_rows:
-        g = r.get("latent_goal_l2")
-        if isinstance(g, (int, float)) and g == g:
-            goal_l2s.append(float(g))
-    ee_dists: List[float] = []
-    for r in trial_rows:
-        ev = r.get("ee_to_target_dist_m")
-        if ev is None and isinstance(r.get("success_check"), dict):
-            ev = r["success_check"].get("ee_to_target_dist_m")
-        if isinstance(ev, (int, float)) and ev == ev:
-            ee_dists.append(float(ev))
-    stop_counts: Dict[str, int] = {}
-    for r in trial_rows:
-        s = r.get("planner_stop_reason")
-        if s is not None:
-            stop_counts[str(s)] = stop_counts.get(str(s), 0) + 1
+    ee_dists = [
+        float(r["ee_to_target_distance_m"])
+        for r in trial_rows
+        if isinstance(r.get("ee_to_target_distance_m"), (int, float))
+        and r["ee_to_target_distance_m"] == r["ee_to_target_distance_m"]
+    ]
+    finger_mid_xy_dists = [
+        float(r["finger_midpoint_to_target_xy_distance_m"])
+        for r in trial_rows
+        if isinstance(r.get("finger_midpoint_to_target_xy_distance_m"), (int, float))
+        and r["finger_midpoint_to_target_xy_distance_m"]
+        == r["finger_midpoint_to_target_xy_distance_m"]
+    ]
+    finger_mid_z_diffs = [
+        float(r["finger_midpoint_to_target_z_diff_m"])
+        for r in trial_rows
+        if isinstance(r.get("finger_midpoint_to_target_z_diff_m"), (int, float))
+        and r["finger_midpoint_to_target_z_diff_m"]
+        == r["finger_midpoint_to_target_z_diff_m"]
+    ]
+    err_n = sum(1 for r in trial_rows if r.get("error") is not None)
     aggregate: Dict[str, Any] = {
         "batch_session_dir": session_dir,
         "num_trials": n,
-        "success_count": success_n,
-        "success_rate": float(success_n) / float(n) if n else 0.0,
         "error_count": err_n,
-        "ntfield_final_latent_dist": {
-            "min": min(dists) if dists else None,
-            "max": max(dists) if dists else None,
-            "mean": float(sum(dists) / len(dists)) if dists else None,
-        },
-        "path_length_steps": {
-            "min": min(path_lens) if path_lens else None,
-            "max": max(path_lens) if path_lens else None,
-            "mean": float(sum(path_lens) / len(path_lens)) if path_lens else None,
-        },
-        "latent_goal_l2": {
-            "min": min(goal_l2s) if goal_l2s else None,
-            "max": max(goal_l2s) if goal_l2s else None,
-            "mean": float(sum(goal_l2s) / len(goal_l2s)) if goal_l2s else None,
-        },
-        "ee_to_target_dist_m": {
+        "ee_to_target_distance_m_summary": {
             "min": min(ee_dists) if ee_dists else None,
             "max": max(ee_dists) if ee_dists else None,
             "mean": float(sum(ee_dists) / len(ee_dists)) if ee_dists else None,
         },
-        "planner_stop_reason_counts": stop_counts,
+        "finger_midpoint_to_target_xy_distance_m_summary": {
+            "min": min(finger_mid_xy_dists) if finger_mid_xy_dists else None,
+            "max": max(finger_mid_xy_dists) if finger_mid_xy_dists else None,
+            "mean": float(sum(finger_mid_xy_dists) / len(finger_mid_xy_dists))
+            if finger_mid_xy_dists else None,
+        },
+        "finger_midpoint_to_target_z_diff_m_summary": {
+            "min": min(finger_mid_z_diffs) if finger_mid_z_diffs else None,
+            "max": max(finger_mid_z_diffs) if finger_mid_z_diffs else None,
+            "mean": float(sum(finger_mid_z_diffs) / len(finger_mid_z_diffs))
+            if finger_mid_z_diffs else None,
+        },
         "trials": trial_rows,
         "cli_args": _args_namespace_to_jsonable(args_ns),
     }
@@ -302,9 +292,31 @@ def main() -> None:
     def _ee_to_primary_object_distance_m(
         gym, sim, env, ur, object_handles, viewer,
         spj, slj, ej, wj1, wj2, wj3, settle_steps: int,
-    ) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+    ) -> Tuple[
+        Optional[float],
+        Optional[List[float]],
+        Optional[List[float]],
+        Optional[str],
+        Optional[str],
+        Optional[List[float]],
+        Optional[List[float]],
+        Optional[List[float]],
+    ]:
+        """
+        Returns
+        -------
+        distance_m : EE link to primary object root, or None if unavailable
+        ee_xyz_m   : end-effector (wrist-proxy) position [x,y,z] in metres
+        obj_xyz_m  : primary object root position [x,y,z] in metres
+        ee_link    : rigid body name used for EE distance
+        body_label : primary object root body label
+        finger_midpoint_xyz_m : midpoint of inner fingers when both links exist,
+            else None (same convention as evaluate_ntfield_oracle)
+        left_finger_xyz_m, right_finger_xyz_m : world positions when the
+            corresponding `left_inner_finger` / `right_inner_finger` exists
+        """
         if not object_handles:
-            return None, None, "no_objects"
+            return None, None, None, None, None, None, None, None
         try:
             for _ in range(max(0, int(settle_steps))):
                 dof = gym.get_actor_dof_states(env, ur, gymapi.STATE_POS)["pos"][:6]
@@ -328,12 +340,30 @@ def main() -> None:
                     ee_name = cand
                     break
             if ee_name is None:
-                return None, None, f"no_known_ee_link among {sorted(rb_ur.keys())[:20]}"
+                return None, None, None, None, None, None, None, None
 
             st_ur = gym.get_actor_rigid_body_states(env, ur, gymapi.STATE_POS)
             i_ee  = int(rb_ur[ee_name])
             T_ee  = gymapi.Transform.from_buffer(st_ur["pose"][i_ee])
             p_ee  = np.array([T_ee.p.x, T_ee.p.y, T_ee.p.z], dtype=np.float64)
+
+            finger_mid_xyz: Optional[List[float]] = None
+            left_finger_xyz: Optional[List[float]] = None
+            right_finger_xyz: Optional[List[float]] = None
+            li = rb_ur.get("left_inner_finger")
+            ri = rb_ur.get("right_inner_finger")
+            if li is not None:
+                pl = gymapi.Transform.from_buffer(st_ur["pose"][int(li)]).p
+                left_finger_xyz = [float(pl.x), float(pl.y), float(pl.z)]
+            if ri is not None:
+                pr = gymapi.Transform.from_buffer(st_ur["pose"][int(ri)]).p
+                right_finger_xyz = [float(pr.x), float(pr.y), float(pr.z)]
+            if left_finger_xyz is not None and right_finger_xyz is not None:
+                finger_mid_xyz = [
+                    0.5 * (left_finger_xyz[0] + right_finger_xyz[0]),
+                    0.5 * (left_finger_xyz[1] + right_finger_xyz[1]),
+                    0.5 * (left_finger_xyz[2] + right_finger_xyz[2]),
+                ]
 
             obj       = object_handles[0]
             rb_o      = gym.get_actor_rigid_body_dict(env, obj)
@@ -343,9 +373,18 @@ def main() -> None:
             T_obj     = gymapi.Transform.from_buffer(st_o["pose"][0])
             p_obj     = np.array([T_obj.p.x, T_obj.p.y, T_obj.p.z], dtype=np.float64)
 
-            return float(np.linalg.norm(p_ee - p_obj)), ee_name, body_label
-        except Exception as exc:
-            return None, None, f"ee_measure_error:{exc}"
+            return (
+                float(np.linalg.norm(p_ee - p_obj)),
+                p_ee.reshape(-1).tolist(),
+                p_obj.reshape(-1).tolist(),
+                ee_name,
+                str(body_label),
+                finger_mid_xyz,
+                left_finger_xyz,
+                right_finger_xyz,
+            )
+        except Exception:
+            return None, None, None, None, None, None, None, None
 
     parser = argparse.ArgumentParser(description="PI-VLA integration — latent goal (MDN or CVAE)")
     parser.add_argument("--ntfield_checkpoint",     type=str, required=True)
@@ -702,11 +741,6 @@ def main() -> None:
             cv2.imwrite(os.path.join(trial_dir, "top_view.png"),
                         cv2.cvtColor(rgb_top, cv2.COLOR_RGB2BGR))
 
-            object_location = placed_object_locations[0] if placed_object_locations else [0.0,0.0,float(oz)]
-            with open(os.path.join(trial_dir, "object_location.json"), "w") as f:
-                json.dump({"xyz_m": object_location, "xyz_m_all": placed_object_locations}, f, indent=2)
-
-            # ── Object name for text prompt ──────────────────────────────────
             if args.object_name:
                 infer_object_name = args.object_name.strip()
             else:
@@ -750,17 +784,11 @@ def main() -> None:
             )
 
             prompt_text = f"grasp {infer_object_name.strip().lower()}"
-            summary: Dict[str, Any] = {
-                "session_dir":            trial_dir,
-                "prompt":                 prompt_text,
-                "predicted_video":        None,
-                "true_latent_error":      None,
-                "status":                 "Failure",
-                "planner_stop_reason":    None,
-                "ntfield_final_latent_dist": None,
-                "ee_to_target_dist_m":    None,
-                "success_check":          {},
-            }
+
+            def _sim_object_root_xyz_m(actor_handle):
+                st_o = gym.get_actor_rigid_body_states(env, actor_handle, gymapi.STATE_POS)
+                T_o = gymapi.Transform.from_buffer(st_o["pose"][0])
+                return [float(T_o.p.x), float(T_o.p.y), float(T_o.p.z)]
 
             def ntfield_plan_gradient_with_goal_latent(
                 teacher_network, q_start, z_goal_hat,
@@ -856,7 +884,7 @@ def main() -> None:
                 return [p * NTFIELD_SCALE for p in path_norm], \
                        {"final_latent_dist": final_dist, "stopped": stopped}
 
-            def _record_ntfield_path(path_raw, label, mp4_path, summary_label):
+            def _record_ntfield_path(path_raw, label, mp4_path):
                 if path_raw and len(path_raw) >= 2:
                     reset_arm_to_q(gym, sim, env, ur, spj, slj, ej,
                                    wj1, wj2, wj3, viewer, q_start_live, n_steps=200)
@@ -870,14 +898,10 @@ def main() -> None:
                         planner_playback=args.planner_playback,
                     )
                     _save_mp4_rgb(frames, mp4_path, fps=args.video_fps)
-                    if summary_label == "predicted_latent_goal":
-                        summary["predicted_video"] = mp4_path
                 else:
-                    print(f"[warn] NTField planner returned an empty path ({summary_label}).")
-                    if summary_label == "predicted_latent_goal":
-                        summary["predicted_video"] = None
+                    print(f"[warn] NTField planner returned an empty path ({label}).")
 
-            path_pred, meta_pred = ntfield_plan_gradient_with_goal_latent(
+            path_pred, _ = ntfield_plan_gradient_with_goal_latent(
                 nt_net, q_start_live.reshape(1,-1), latent_goal_pred.reshape(1,-1),
                 step_size=args.ntfield_step_size, max_steps=args.ntfield_max_steps,
                 tol=args.ntfield_tol, device=ntfield_device_str,
@@ -889,35 +913,57 @@ def main() -> None:
                 stagnate_rel_eps=float(args.ntfield_stagnate_rel_eps),
                 stagnate_step_size=stagnate_step,
             )
-            summary["ntfield_final_latent_dist"] = meta_pred["final_latent_dist"]
-            summary["planner_stop_reason"]       = meta_pred["stopped"]
-            if isinstance(meta_pred["stopped"], str) and meta_pred["stopped"].startswith("latent_tol"):
-                summary["status"] = "Success"
-
-            summary["path_length"]    = int(len(path_pred))
-            summary["latent_goal_l2"] = float(
-                np.linalg.norm(np.asarray(latent_goal_pred, dtype=np.float64).ravel())
-            )
-            summary["trial_index"]       = trial_idx
-            summary["batch_session_dir"] = session_dir
-
             mp4_path = os.path.join(trial_dir, "ntfield_trajectory_predicted_latent_goal.mp4")
-            _record_ntfield_path(path_pred, "predicted_latent_goal", mp4_path, "predicted_latent_goal")
+            _record_ntfield_path(path_pred, "predicted_latent_goal", mp4_path)
 
-            ee_m, ee_link, tgt_body = _ee_to_primary_object_distance_m(
+            (
+                ee_m,
+                ee_xyz,
+                tgt_xyz,
+                _ee_ln,
+                _bd,
+                finger_mid_xyz,
+                left_finger_xyz,
+                right_finger_xyz,
+            ) = _ee_to_primary_object_distance_m(
                 gym, sim, env, ur, object_handles, viewer,
                 spj, slj, ej, wj1, wj2, wj3, int(args.ee_settle_steps),
             )
-            summary["ee_to_target_dist_m"] = ee_m
-            thresh = args.ee_success_thresh_m
-            ee_ok  = (isinstance(thresh, (int,float)) and float(thresh) > 0.0
-                      and ee_m is not None and float(ee_m) < float(thresh))
-            summary["success_check"] = {
-                "ee_to_target_dist_m":  ee_m,
-                "ee_link":              ee_link,
-                "target_object_body":   tgt_body,
-                "ee_success_thresh_m":  float(thresh) if isinstance(thresh,(int,float)) else None,
-                "success": bool(ee_ok) if isinstance(thresh,(int,float)) and float(thresh)>0 else None,
+
+            tgt_loc = tgt_xyz
+            other_locs: List[List[float]] = []
+            if len(object_handles) > 1:
+                for ah in object_handles[1:]:
+                    other_locs.append(_sim_object_root_xyz_m(ah))
+            elif placed_object_locations and len(placed_object_locations) > 1:
+                other_locs = [list(map(float, p)) for p in placed_object_locations[1:]]
+
+            if tgt_loc is None and placed_object_locations:
+                tgt_loc = [float(x) for x in placed_object_locations[0]]
+
+            finger_midpoint_to_target_xy_distance_m = None
+            finger_midpoint_to_target_z_diff_m = None
+            if finger_mid_xyz is not None and tgt_loc is not None:
+                fm = np.asarray(finger_mid_xyz, dtype=np.float64).reshape(3)
+                tg = np.asarray(tgt_loc, dtype=np.float64).reshape(3)
+                finger_midpoint_to_target_xy_distance_m = float(
+                    np.hypot(float(fm[0] - tg[0]), float(fm[1] - tg[1]))
+                )
+                # Signed: fingertip midpoint Z minus target reference Z (object root).
+                finger_midpoint_to_target_z_diff_m = float(fm[2] - tg[2])
+
+            summary = {
+                "trial_index": trial_idx,
+                "prompt": prompt_text,
+                "target_object_location_xyz_m": tgt_loc,
+                "other_object_locations_xyz_m": other_locs,
+                "end_effector_location_xyz_m": ee_xyz,
+                "left_finger_location_xyz_m": left_finger_xyz,
+                "right_finger_location_xyz_m": right_finger_xyz,
+                "finger_midpoint_location_xyz_m": finger_mid_xyz,
+                "finger_midpoint_to_target_xy_distance_m": finger_midpoint_to_target_xy_distance_m,
+                "finger_midpoint_to_target_z_diff_m": finger_midpoint_to_target_z_diff_m,
+                "ee_to_target_distance_m": ee_m,
             }
 
             with open(os.path.join(trial_dir, "pipeline_summary.json"), "w") as f:
@@ -928,13 +974,18 @@ def main() -> None:
 
         except Exception as exc:
             err_row: Dict[str, Any] = {
-                "trial_index": trial_idx, "trial_dir": trial_dir,
-                "batch_session_dir": session_dir, "session_dir": trial_dir,
-                "status": "Error", "error": str(exc),
-                "predicted_video": None, "true_latent_error": None,
-                "planner_stop_reason": None, "ntfield_final_latent_dist": None,
-                "path_length": None, "latent_goal_l2": None,
-                "ee_to_target_dist_m": None, "success_check": {},
+                "trial_index": trial_idx,
+                "prompt": None,
+                "target_object_location_xyz_m": None,
+                "other_object_locations_xyz_m": None,
+                "end_effector_location_xyz_m": None,
+                "left_finger_location_xyz_m": None,
+                "right_finger_location_xyz_m": None,
+                "finger_midpoint_location_xyz_m": None,
+                "finger_midpoint_to_target_xy_distance_m": None,
+                "finger_midpoint_to_target_z_diff_m": None,
+                "ee_to_target_distance_m": None,
+                "error": str(exc),
             }
             trial_rows.append(err_row)
             tb = traceback.format_exc()

@@ -21,6 +21,9 @@ This repository combines NTField training, grasping simulation, goal-latent stud
 - `student_model_evaluation/`  
   Student goal-latent inference/evaluation tools and scripts that connect student predictions with NTField planning.
 
+- `student_model_training/`  
+  Student latent-goal training pipelines, preprocessing scripts for `.pt` shards, and train configs (MDN/regression).
+
 - `trajectory_evaluation/`  
   Trajectory-level evaluation and benchmarking utilities (NTField and RRTConnect variants), including demo/collection scripts.
 
@@ -31,6 +34,111 @@ This repository combines NTField training, grasping simulation, goal-latent stud
 3. Run trajectory metrics/benchmarks in `trajectory_evaluation/`.
 4. Use `final_integrate/` scripts for integrated pipeline runs.
 5. Use `goal_embedding_visualization/` to inspect embedding quality.
+
+## Student model + integration quick commands
+
+### Student Model Training (Short)
+
+Before training, prepare data in this order: collect multi-object data with `hanwen_grasping/collect_data/run_multi_obj_collect_10000.sh`, preprocess H5 outputs into `.pt` shards (for example with `student_model_training/preprocess_dataset/preprocess_grasp_multi3_to_pt_shards.py`), then run training scripts below.
+
+Run from `PI-VLA` root:
+
+```bash
+cd student_model_training
+bash train_config_multi_mdn.sh
+```
+
+- `train_config_multi_mdn.sh` launches `full_train_multi_mdn.py` in the `rlgpu` conda env.
+- It saves logs/checkpoints under `output/runs/full_train_multi_mdn_<timestamp>/`.
+- Default MDN config in script: `epochs=90`, `batch_size=256`, `lr=3e-4`, `n_components=8`.
+
+For a regression baseline:
+
+```bash
+cd student_model_training
+bash train_config_multi_regression.sh
+```
+
+- `train_config_multi_regression.sh` launches `full_train_multi_regression.py`.
+- It saves logs/checkpoints under `output/runs/full_train_multi_regression_<timestamp>/`.
+- Default regression config in script: `loss=hybrid`, `epochs=40`, `batch_size=256`, `lr=3e-4`.
+
+### Integration Planning (Short)
+
+Run from `PI-VLA` root (headless by default unless `--use_viewer` is set):
+
+```bash
+python final_integrate/run_integrated_pipeline_latent_multi_obj_mdn.py \
+  --ntfield_checkpoint teacher_model.pt \
+  --latent_checkpoint /path/to/best_z_goal_model_mdn_*.pth \
+  --num_trials 1
+```
+
+- Uses top-view image -> student latent prediction -> NTField gradient planning.
+- Outputs go to `output/final_integrate/<timestamp>/` unless `--output_dir` is provided.
+
+For detailed sanity-check/evaluation run:
+
+```bash
+python final_integrate/run_integrated_pipeline_latent_multi_obj_check.py \
+  --ntfield_checkpoint teacher_model.pt \
+  --latent_checkpoint /path/to/best_z_goal_model_mdn_*.pth \
+  --output_dir output/manual_check_run \
+  --seed 1002
+```
+
+- Writes videos and `pipeline_summary.json` under `<output_dir>/<timestamp>/`.
+- Includes extra checking metrics (for example collision/between-finger checks).
+
+### Multi-Object Evaluation (Short)
+
+Run from `PI-VLA` root. This evaluates multiple object XY placements (12-grid) and saves one `result.json` per run plus `batch_summary.json`.
+
+Student-model benchmark batch:
+
+```bash
+python trajectory_evaluation/multi_comparison/run_student_multi_benchmark_batch.py \
+  --student-checkpoint /path/to/best_z_goal_model_*.pth \
+  --checkpoint teacher_model.pt \
+  --seed 123 \
+  --out-root output/trajectory_evaluation/student_multi_batch
+```
+
+RRT + NTField baseline batch:
+
+```bash
+python trajectory_evaluation/multi_comparison/run_rrt_ntfield_multi_benchmark_batch.py \
+  --checkpoint teacher_model.pt \
+  --seed 123 \
+  --out-root output/trajectory_evaluation/rrt_ntfield_multi_batch
+```
+
+Analyze one or more batch outputs:
+
+```bash
+python trajectory_evaluation/multi_comparison/analyze_batch_results.py \
+  --summary /path/to/student_multi_batch/batch_summary.json \
+  --summary /path/to/rrt_ntfield_multi_batch/batch_summary.json \
+  --labels student baseline
+```
+
+- Use `--no-video` in batch scripts for faster runs.
+- Use `--save-final-geometric-debug` when you want per-run debug images.
+
+### Student Model Evaluation (Short)
+
+Run from `PI-VLA` root to evaluate a trained student checkpoint on pt shards:
+
+```bash
+python student_model_evaluation/evaluate_student_model.py \
+  --checkpoint /path/to/best_z_goal_model_*.pth \
+  --dataset-root student_model_training/data/pt_shards_multi \
+  --split val \
+  --batch-size 256
+```
+
+- Prints JSON metrics including `mse`, `mae`, `cos_distance`, `l2_mean`, and threshold accuracies.
+- Add `--save-json output/student_eval.json` to save results.
 
 ## `ntrl-demo`: trajectory-based NTField training (RRTConnect data)
 
